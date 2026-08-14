@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Local configuration (never commit real secrets/credentials)
+.env
+
+# Runtime output — decision audit log, app logs, risk state
+logs/
+*.log
+*.jsonl
+risk_state.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

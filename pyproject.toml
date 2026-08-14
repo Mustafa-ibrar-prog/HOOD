@@ -1,0 +1,18 @@
+[project]
+name = "hood-options-trader"
+version = "0.1.0"
+description = "Paper/dry-run options trading foundation built on the HOOD (Robinhood) MCP connection."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+# Adds the repo root (not src/) to sys.path so tests can `import src...`
+# without installing the package. This intentionally does NOT add src/
+# itself to sys.path — see src/logging/__init__.py for why that matters.
+pythonpath = ["."]
+testpaths = ["tests"]
