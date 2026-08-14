@@ -241,6 +241,47 @@ def test_naive_now_is_treated_as_utc_instead_of_crashing(paper_settings, now):
     assert snapshot.fetched_at.tzinfo is not None
 
 
+# --- get_underlying_snapshot -----------------------------------------------------------------
+
+
+def test_underlying_snapshot_happy_path(paper_settings, now):
+    client = _happy_client(now)
+    provider = HoodMarketDataProvider(client, paper_settings)
+    snapshot = provider.get_underlying_snapshot(UNDERLYING, now=now)
+
+    assert snapshot.quote.symbol == "AAPL"
+    assert snapshot.quote.last_trade_price == 231.00
+    assert len(snapshot.bars) == 6
+    assert snapshot.ema_fast is not None
+    assert snapshot.rsi is not None
+    assert isinstance(snapshot.higher_highs, bool)
+    assert isinstance(snapshot.breakout_continuation, bool)
+    assert snapshot.fetched_at <= now
+
+
+def test_underlying_snapshot_never_calls_option_tools(paper_settings, now):
+    client = _happy_client(now)
+    provider = HoodMarketDataProvider(client, paper_settings)
+    provider.get_underlying_snapshot(UNDERLYING, now=now)
+    assert set(client.calls) == {"get_equity_quotes", "get_equity_historicals"}
+
+
+def test_underlying_snapshot_raises_on_missing_quote(paper_settings, now):
+    client = _happy_client(now, equity_quote_rows=[])
+    provider = HoodMarketDataProvider(client, paper_settings)
+    with pytest.raises(QuoteUnavailableError):
+        provider.get_underlying_snapshot(UNDERLYING, now=now)
+
+
+def test_underlying_snapshot_degrades_gracefully_without_bars(paper_settings, now):
+    client = _happy_client(now, raise_on={"get_equity_historicals"})
+    provider = HoodMarketDataProvider(client, paper_settings)
+    snapshot = provider.get_underlying_snapshot(UNDERLYING, now=now)
+    assert snapshot.bars == ()
+    assert snapshot.rsi is None
+    assert snapshot.breakout_continuation is False
+
+
 def test_calls_only_read_only_tools_never_order_tools(paper_settings, now):
     client = _happy_client(now)
     provider = HoodMarketDataProvider(client, paper_settings)
@@ -437,6 +478,44 @@ def test_fetched_at_uses_older_of_fetch_time_and_quote_timestamps(paper_settings
     provider = HoodMarketDataProvider(client, paper_settings)
     snapshot = provider.get_market_snapshot(OPTION_ID, UNDERLYING, now=now)
     assert snapshot.fetched_at <= stale_quote_time + timedelta(seconds=1)
+
+
+# --- get_option_expirations -----------------------------------------------------------------
+
+
+def test_option_expirations_returns_sorted_deduplicated_dates(paper_settings, now):
+    client = _happy_client(
+        now,
+        chains=[
+            {"id": "chain-1", "symbol": "AAPL", "expiration_dates": ["2026-09-18", "2026-08-21"]},
+            {"id": "chain-2", "symbol": "AAPL", "expiration_dates": ["2026-08-21", "2026-10-16"]},  # duplicate + new
+        ],
+    )
+    provider = HoodMarketDataProvider(client, paper_settings)
+    from datetime import date
+
+    assert provider.get_option_expirations("AAPL") == [date(2026, 8, 21), date(2026, 9, 18), date(2026, 10, 16)]
+
+
+def test_option_expirations_empty_when_no_chain(paper_settings, now):
+    client = _happy_client(now, chains=[])
+    provider = HoodMarketDataProvider(client, paper_settings)
+    assert provider.get_option_expirations("ZZZZ") == []
+
+
+def test_option_expirations_skips_unparseable_dates(paper_settings, now):
+    client = _happy_client(now, chains=[{"id": "chain-1", "symbol": "AAPL", "expiration_dates": ["not-a-date", "2026-08-21"]}])
+    provider = HoodMarketDataProvider(client, paper_settings)
+    from datetime import date
+
+    assert provider.get_option_expirations("AAPL") == [date(2026, 8, 21)]
+
+
+def test_option_expirations_raises_on_chains_tool_error(paper_settings, now):
+    client = _happy_client(now, raise_on={"get_option_chains"})
+    provider = HoodMarketDataProvider(client, paper_settings)
+    with pytest.raises(HoodToolError):
+        provider.get_option_expirations("AAPL")
 
 
 # --- get_option_chain_candidates -----------------------------------------------------------

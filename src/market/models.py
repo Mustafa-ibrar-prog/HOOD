@@ -114,3 +114,38 @@ class MarketSnapshot:
         if fetched.tzinfo is None:
             fetched = fetched.replace(tzinfo=timezone.utc)
         return (now - fetched).total_seconds()
+
+
+@dataclass(frozen=True)
+class UnderlyingSnapshot:
+    """Equity-only market data for scanning: a quote, recent bars, and
+    locally computed indicators/structure for one underlying symbol — no
+    option contract has been chosen yet. This is what a Strategy uses to
+    judge "is this symbol showing a tradeable setup right now" before it
+    ever picks a specific contract (see get_market_snapshot for that,
+    contract-specific, step).
+    """
+
+    quote: EquityQuote
+    bars: tuple[PriceBar, ...]
+    rsi: float | None
+    rsi_prev: float | None
+    macd_histogram: float | None
+    macd_histogram_prev: float | None
+    ema_fast: float | None
+    ema_slow: float | None
+    vwap: float | None
+    volume_ratio: float | None
+    higher_highs: bool
+    lower_highs: bool
+    breakout_continuation: bool
+    failed_breakout: bool
+    fetched_at: datetime
+
+    @property
+    def data_age_seconds(self) -> float:
+        now = datetime.now(timezone.utc)
+        fetched = self.fetched_at
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        return (now - fetched).total_seconds()

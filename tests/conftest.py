@@ -31,6 +31,12 @@ def paper_settings(tmp_path) -> Settings:
         "DECISION_LOG_FILE": str(tmp_path / "logs" / "decisions.jsonl"),
         "APP_LOG_FILE": str(tmp_path / "logs" / "app.log"),
         "RISK_STATE_FILE": str(tmp_path / "logs" / "risk_state.json"),
+        "PAPER_POSITIONS_FILE": str(tmp_path / "logs" / "paper_positions.json"),
+        "ROBINHOOD_ACCOUNT_NUMBER": "987155785",
+        "SCAN_UNIVERSE": "SPY,AAPL",
+        "MAX_NEW_ENTRIES_PER_CYCLE": "1",
+        "SYNCED_POSITION_PROFIT_TARGET_PCT": "0.50",
+        "SYNCED_POSITION_STOP_LOSS_PCT": "0.50",
     }
     return Settings.from_env(env=env)
 
@@ -43,6 +49,7 @@ def live_settings(tmp_path) -> Settings:
         "DECISION_LOG_FILE": str(tmp_path / "logs" / "decisions.jsonl"),
         "APP_LOG_FILE": str(tmp_path / "logs" / "app.log"),
         "RISK_STATE_FILE": str(tmp_path / "logs" / "risk_state.json"),
+        "PAPER_POSITIONS_FILE": str(tmp_path / "logs" / "paper_positions.json"),
     }
     return Settings.from_env(env=env)
 

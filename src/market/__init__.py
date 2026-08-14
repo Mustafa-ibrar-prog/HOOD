@@ -10,13 +10,14 @@ from src.market.errors import (
 )
 from src.market.hood_client import HoodToolClient
 from src.market.hood_provider import HoodMarketDataProvider
-from src.market.models import EquityQuote, MarketSnapshot, OptionQuote, PriceBar
+from src.market.models import EquityQuote, MarketSnapshot, OptionQuote, PriceBar, UnderlyingSnapshot
 
 __all__ = [
     "EquityQuote",
     "MarketSnapshot",
     "OptionQuote",
     "PriceBar",
+    "UnderlyingSnapshot",
     "MarketDataProvider",
     "NotConfiguredMarketDataProvider",
     "HoodMarketDataProvider",

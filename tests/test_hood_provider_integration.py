@@ -32,6 +32,7 @@ def test_full_monitor_cycle_uses_real_provider_and_never_touches_order_tools(pap
         risk_manager=RiskManager(risk_limits),
         decision_logger=decision_logger,
         execution_gateway=gateway,
+        account_number=paper_settings.account_number,
     )
 
     position = make_position(
@@ -78,6 +79,7 @@ def test_stale_snapshot_from_real_provider_still_yields_safe_hold(paper_settings
         risk_manager=RiskManager(risk_limits),
         decision_logger=decision_logger,
         execution_gateway=gateway,
+        account_number=paper_settings.account_number,
     )
     position = make_position(symbol=UNDERLYING, option_id=OPTION_ID)
 

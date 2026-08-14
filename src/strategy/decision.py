@@ -4,7 +4,7 @@ manager (open trades).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Mapping
 
@@ -61,6 +61,22 @@ class TradeThesis:
     def __post_init__(self) -> None:
         if self.direction.lower() not in {"bullish", "bearish"}:
             raise ValueError("direction must be 'bullish' or 'bearish'")
+
+    def to_dict(self) -> dict[str, Any]:
+        """For persistence (see position_manager/store.py)."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TradeThesis":
+        return cls(
+            setup_name=data["setup_name"],
+            direction=data["direction"],
+            catalyst=data["catalyst"],
+            invalidation=data["invalidation"],
+            profit_target_usd=data.get("profit_target_usd"),
+            stop_loss_usd=data.get("stop_loss_usd"),
+            notes=data.get("notes", ""),
+        )
 
 
 @dataclass(frozen=True)

@@ -92,7 +92,8 @@ Design decisions worth knowing:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from logging import Logger
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -110,7 +111,22 @@ from src.market.errors import (
     QuoteUnavailableError,
 )
 from src.market.hood_client import HoodToolClient
-from src.market.models import EquityQuote, MarketSnapshot, OptionQuote, PriceBar
+from src.market.models import EquityQuote, MarketSnapshot, OptionQuote, PriceBar, UnderlyingSnapshot
+
+
+@dataclass(frozen=True)
+class _LocalIndicators:
+    """Internal bundle of the locally-computed indicators shared by
+    get_market_snapshot and get_underlying_snapshot."""
+
+    rsi: float | None
+    rsi_prev: float | None
+    macd_histogram: float | None
+    macd_histogram_prev: float | None
+    ema_fast: float | None
+    ema_slow: float | None
+    vwap: float | None
+    volume_ratio: float | None
 
 
 class HoodMarketDataProvider(MarketDataProvider):
@@ -166,13 +182,7 @@ class HoodMarketDataProvider(MarketDataProvider):
         underlying_bars = self._fetch_equity_bars(underlying_symbol, start_time, end_time)
         option_bars = self._fetch_option_bars(option_id, start_time, end_time)
 
-        closes = [b.close for b in underlying_bars]
-        rsi_series = indicators.rsi(closes, period=self._rsi_period) if closes else []
-        _, _, histogram_series = indicators.macd(closes) if closes else ([], [], [])
-        ema_fast_series = indicators.ema(closes, period=self._ema_fast_period) if closes else []
-        ema_slow_series = indicators.ema(closes, period=self._ema_slow_period) if closes else []
-        vwap_value = indicators.vwap(underlying_bars) if underlying_bars else None
-        volume_ratio = _compute_volume_ratio(underlying_bars)
+        local = self._compute_local_indicators(underlying_bars)
 
         # Conservative (oldest) of: our fetch time, and each quote's own
         # reported timestamp — see module docstring "Freshness" note.
@@ -183,6 +193,74 @@ class HoodMarketDataProvider(MarketDataProvider):
             underlying=underlying_quote,
             option_bars=tuple(option_bars),
             underlying_bars=tuple(underlying_bars),
+            rsi=local.rsi,
+            rsi_prev=local.rsi_prev,
+            macd_histogram=local.macd_histogram,
+            macd_histogram_prev=local.macd_histogram_prev,
+            ema_fast=local.ema_fast,
+            ema_slow=local.ema_slow,
+            vwap=local.vwap,
+            volume_ratio=local.volume_ratio,
+            fetched_at=fetched_at,
+        )
+
+    def get_underlying_snapshot(self, symbol: str, now: datetime | None = None) -> UnderlyingSnapshot:
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        if not _is_regular_market_hours(now, self._settings):
+            self._logger.warning(
+                "Fetching an underlying snapshot for %s outside regular market hours (%s); "
+                "quotes/bars may reflect the last session, not live trading.",
+                symbol,
+                self._settings.market_timezone,
+            )
+
+        quote = self._fetch_equity_quote(symbol)  # critical — no snapshot without a sane quote
+
+        start_time = _rfc3339(now - timedelta(minutes=self._history_lookback_minutes))
+        end_time = _rfc3339(now)
+        bars = self._fetch_equity_bars(symbol, start_time, end_time)
+
+        local = self._compute_local_indicators(bars)
+        higher_highs, lower_highs = indicators.higher_highs_lower_highs(bars)
+        breakout_continuation = indicators.detect_breakout_continuation(bars)
+        failed_breakout = indicators.detect_failed_breakout(bars)
+
+        fetched_at = min(now, quote.as_of)
+
+        return UnderlyingSnapshot(
+            quote=quote,
+            bars=tuple(bars),
+            rsi=local.rsi,
+            rsi_prev=local.rsi_prev,
+            macd_histogram=local.macd_histogram,
+            macd_histogram_prev=local.macd_histogram_prev,
+            ema_fast=local.ema_fast,
+            ema_slow=local.ema_slow,
+            vwap=local.vwap,
+            volume_ratio=local.volume_ratio,
+            higher_highs=higher_highs,
+            lower_highs=lower_highs,
+            breakout_continuation=breakout_continuation,
+            failed_breakout=failed_breakout,
+            fetched_at=fetched_at,
+        )
+
+    def _compute_local_indicators(self, bars: list[PriceBar]) -> "_LocalIndicators":
+        """Shared by get_market_snapshot (underlying bars) and
+        get_underlying_snapshot — see module docstring "RSI/MACD/EMA/VWAP
+        are computed LOCALLY" for why these aren't fetched from
+        get_equity_technical_indicators."""
+        closes = [b.close for b in bars]
+        rsi_series = indicators.rsi(closes, period=self._rsi_period) if closes else []
+        _, _, histogram_series = indicators.macd(closes) if closes else ([], [], [])
+        ema_fast_series = indicators.ema(closes, period=self._ema_fast_period) if closes else []
+        ema_slow_series = indicators.ema(closes, period=self._ema_slow_period) if closes else []
+        vwap_value = indicators.vwap(bars) if bars else None
+        volume_ratio = _compute_volume_ratio(bars)
+        return _LocalIndicators(
             rsi=_nth_from_end(rsi_series, 1),
             rsi_prev=_nth_from_end(rsi_series, 2),
             macd_histogram=_nth_from_end(histogram_series, 1),
@@ -191,17 +269,21 @@ class HoodMarketDataProvider(MarketDataProvider):
             ema_slow=_nth_from_end(ema_slow_series, 1),
             vwap=vwap_value,
             volume_ratio=volume_ratio,
-            fetched_at=fetched_at,
         )
 
-    def get_option_chain_candidates(self, underlying_symbol: str, **filters: Any) -> list[dict[str, Any]]:
-        try:
-            chains_response = self._client.get_option_chains(underlying_symbol=underlying_symbol)
-        except Exception as exc:  # noqa: BLE001 - normalize any client failure
-            raise HoodToolError(f"get_option_chains failed for {underlying_symbol}: {exc}") from exc
+    def get_option_expirations(self, underlying_symbol: str) -> list[date]:
+        chains = self._fetch_chains(underlying_symbol)
+        expirations: set[date] = set()
+        for chain in chains:
+            for raw in chain.get("expiration_dates") or []:
+                try:
+                    expirations.add(date.fromisoformat(raw))
+                except (TypeError, ValueError):
+                    continue  # an unparseable entry — skip it, don't fabricate a date
+        return sorted(expirations)
 
-        chains_data = _unwrap_data(chains_response, "get_option_chains")
-        chains = chains_data.get("chains") or []
+    def get_option_chain_candidates(self, underlying_symbol: str, **filters: Any) -> list[dict[str, Any]]:
+        chains = self._fetch_chains(underlying_symbol)
         if not chains:
             self._logger.warning("No option chain found for %s", underlying_symbol)
             return []
@@ -213,6 +295,14 @@ class HoodMarketDataProvider(MarketDataProvider):
                 continue
             candidates.extend(self._fetch_all_instruments(chain_id, underlying_symbol, filters))
         return candidates
+
+    def _fetch_chains(self, underlying_symbol: str) -> list[dict[str, Any]]:
+        try:
+            response = self._client.get_option_chains(underlying_symbol=underlying_symbol)
+        except Exception as exc:  # noqa: BLE001 - normalize any client failure
+            raise HoodToolError(f"get_option_chains failed for {underlying_symbol}: {exc}") from exc
+        data = _unwrap_data(response, "get_option_chains")
+        return data.get("chains") or []
 
     # Safety cap on pagination so a malformed/looping cursor can't spin
     # forever — SPY's front-week $1-wide chain alone is >10 pages.

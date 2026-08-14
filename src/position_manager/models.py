@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
+from typing import Any, Mapping
 
 from src.config.constants import CONTRACT_MULTIPLIER
 from src.strategy.decision import TradeThesis
@@ -61,3 +62,41 @@ class OpenPosition:
         elsewhere (see Settings.market_timezone)."""
         expiration_dt = datetime.combine(self.expiration, market_close, tzinfo=now.tzinfo)
         return (expiration_dt - now).total_seconds() / 60
+
+    def to_dict(self) -> dict[str, Any]:
+        """For persistence — see position_manager/store.py (the paper
+        position ledger)."""
+        return {
+            "symbol": self.symbol,
+            "option_id": self.option_id,
+            "option_description": self.option_description,
+            "side": self.side,
+            "quantity": self.quantity,
+            "entry_price": self.entry_price,
+            "entry_time": self.entry_time.isoformat(),
+            "thesis": self.thesis.to_dict(),
+            "profit_target_usd": self.profit_target_usd,
+            "stop_loss_usd": self.stop_loss_usd,
+            "expiration": self.expiration.isoformat(),
+            "contract_multiplier": self.contract_multiplier,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "OpenPosition":
+        entry_time = datetime.fromisoformat(data["entry_time"])
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
+        return cls(
+            symbol=data["symbol"],
+            option_id=data["option_id"],
+            option_description=data["option_description"],
+            side=data["side"],
+            quantity=int(data["quantity"]),
+            entry_price=float(data["entry_price"]),
+            entry_time=entry_time,
+            thesis=TradeThesis.from_dict(data["thesis"]),
+            profit_target_usd=float(data["profit_target_usd"]),
+            stop_loss_usd=float(data["stop_loss_usd"]),
+            expiration=date.fromisoformat(data["expiration"]),
+            contract_multiplier=int(data.get("contract_multiplier", CONTRACT_MULTIPLIER)),
+        )

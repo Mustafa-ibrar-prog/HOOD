@@ -6,7 +6,11 @@ inside a request/response agent process, which can't reliably fire on a
 wall-clock cadence anyway. Instead:
 
   - `run_once()` performs exactly one evaluate-and-log cycle for one open
-    position, right now.
+    position, right now — and, for an EXIT/TARGET_EXIT/STOP_EXIT decision,
+    routes a sell-to-close order through the (paper-only) execution
+    gateway. See src/execution/gateway.py: that gateway physically cannot
+    place a real order while TRADING_MODE=paper, so this is always a
+    simulated fill, never a live one.
   - `is_within_monitoring_window()` tells an external scheduler (a cron
     job, a Routine/trigger, a supervised process — see README.md) whether
     now is a sensible time to call run_once() at all.
@@ -19,23 +23,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from src.config.constants import TRADING_WEEKDAYS
 from src.config.settings import Settings
-from src.execution.gateway import ExecutionGateway
+from src.execution.gateway import ExecutionGateway, new_ref_id
+from src.execution.orders import OrderLeg, OrderRequest, OrderResult
 from src.logging.decision_logger import DecisionLogger
 from src.market.data_provider import MarketDataProvider
 from src.market.errors import MarketDataError
+from src.market.models import MarketSnapshot
 from src.position_manager.evaluator import PositionEvaluator, PositionSnapshot
 from src.position_manager.models import OpenPosition
 from src.risk.manager import RiskManager
-from src.strategy.decision import POSITION_MONITOR_DECISIONS, Decision, DecisionResult
+from src.strategy.decision import EXIT_DECISIONS, POSITION_MONITOR_DECISIONS, Decision, DecisionResult
 
 
 def is_within_monitoring_window(now: datetime, settings: Settings) -> bool:
-    """True if `now` (expected in the market's local time) falls on a
-    trading weekday and within regular market hours. Pure/testable — no
-    dependency on wall-clock time."""
+    """True if `now` falls on a trading weekday and within regular market
+    hours, in the configured market timezone (Settings.market_timezone).
+
+    `now` may be either:
+      - naive (no tzinfo): assumed to already BE local market time, used
+        as-is. This matches how this codebase's own tests construct `now`
+        directly as e.g. datetime(2026, 8, 14, 11, 0).
+      - timezone-aware (e.g. datetime.now(timezone.utc), which is what
+        run_trading_cycle defaults to): converted to the configured market
+        timezone first. A UTC `now` is NOT treated as already-local — that
+        was a real bug caught during live verification (comparing a raw
+        UTC clock against ET boundary times silently produces the wrong
+        answer most of the year, since US markets are never UTC-aligned).
+    """
+    if now.tzinfo is not None:
+        now = now.astimezone(ZoneInfo(settings.market_timezone))
     if now.weekday() not in TRADING_WEEKDAYS:
         return False
     return settings.market_open_time <= now.time() <= settings.market_close_time
@@ -44,7 +64,8 @@ def is_within_monitoring_window(now: datetime, settings: Settings) -> bool:
 @dataclass
 class MonitorResult:
     decision_result: DecisionResult
-    acted: bool  # True if an exit-type decision was routed to the execution gateway
+    acted: bool  # True if an exit-type decision resulted in a simulated fill
+    order_result: OrderResult | None = None  # set when `acted` is True
 
 
 class PositionMonitor:
@@ -57,6 +78,7 @@ class PositionMonitor:
         risk_manager: RiskManager,
         decision_logger: DecisionLogger,
         execution_gateway: ExecutionGateway,
+        account_number: str,
     ):
         self._settings = settings
         self._market_data = market_data
@@ -64,12 +86,21 @@ class PositionMonitor:
         self._risk_manager = risk_manager
         self._decision_logger = decision_logger
         self._execution_gateway = execution_gateway
+        self._account_number = account_number
 
-    def run_once(self, position: OpenPosition, now: datetime) -> MonitorResult:
+    def run_once(self, position: OpenPosition, now: datetime, *, simulate_exit: bool = True) -> MonitorResult:
         """Evaluate one open position exactly once: fetch data, score
         evidence, decide, log — always — and, only for exit-type decisions,
         hand the *intent* to the execution gateway (which itself refuses to
-        do anything but simulate while TRADING_MODE=paper)."""
+        do anything but simulate while TRADING_MODE=paper).
+
+        `simulate_exit=False` decides and logs only, without submitting a
+        simulated closing order — for positions this system is watching
+        but did not itself open (e.g. synced read-only from the real
+        Robinhood account via hood_sync.py). Even with simulate_exit=True
+        the order is never real (see PaperExecutionGateway), but skipping
+        it here keeps the paper order-audit log limited to trades this
+        system's own paper-entry/exit lifecycle actually owns."""
 
         try:
             snapshot_market = self._market_data.get_market_snapshot(position.option_id, position.symbol, now=now)
@@ -141,16 +172,36 @@ class PositionMonitor:
         )
 
         acted = False
-        if result.decision in (Decision.EXIT, Decision.TARGET_EXIT, Decision.STOP_EXIT):
-            # Routing to the gateway is intentionally NOT implemented beyond
-            # logging the intent here — building the real close-order path
-            # (sizing the closing leg, choosing a limit price, calling the
-            # paper gateway) is future work. See README "still needs to be
-            # built" section. This keeps run_once() honest about what it
-            # does today: decide and log, not execute.
-            acted = False
+        order_result = None
+        if result.decision in EXIT_DECISIONS and simulate_exit:
+            close_order = _build_closing_order(position, snapshot_market, result, self._account_number)
+            order_result = self._execution_gateway.submit_order(close_order)
+            # submit_order already writes its own audit-log entry (see
+            # PaperExecutionGateway) — nothing further to log here.
+            acted = order_result.status == "simulated_fill"
 
-        return MonitorResult(decision_result=result, acted=acted)
+        return MonitorResult(decision_result=result, acted=acted, order_result=order_result)
+
+
+def _build_closing_order(
+    position: OpenPosition, snapshot: MarketSnapshot, result: DecisionResult, account_number: str
+) -> OrderRequest:
+    """A long call/put is always closed with a sell. Priced at the current
+    bid — a marketable sell-to-close limit, the realistic fill assumption
+    for a paper simulation (never sent to a real order tool; see
+    src/execution/gateway.py)."""
+    leg = OrderLeg(option_id=position.option_id, side="sell", position_effect="close", ratio_quantity=1)
+    return OrderRequest(
+        account_number=account_number,
+        legs=(leg,),
+        quantity=str(position.quantity),
+        type="limit",
+        price=f"{snapshot.option.bid_price:.2f}",
+        time_in_force="gfd",
+        market_hours="regular_hours",
+        ref_id=new_ref_id(),
+        reason=f"{result.decision.value}: {result.reason}",
+    )
 
 
 def _build_momentum_evidence(position: OpenPosition, snapshot):

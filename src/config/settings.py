@@ -86,6 +86,18 @@ def _get_time(env: Mapping[str, str], key: str, default: str) -> time:
         raise ConfigError(f"{key}={raw!r} must be HH:MM 24-hour time") from exc
 
 
+def _get_optional_str(env: Mapping[str, str], key: str) -> str | None:
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw.strip()
+
+
+def _get_str_tuple(env: Mapping[str, str], key: str, default: str) -> tuple[str, ...]:
+    raw = _get_str(env, key, default)
+    return tuple(s.strip().upper() for s in raw.split(",") if s.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable, validated configuration snapshot.
@@ -123,6 +135,21 @@ class Settings:
     decision_log_file: str
     app_log_file: str
     risk_state_file: str
+    paper_positions_file: str
+
+    # --- Brokerage account / scanning ------------------------------------------
+    # account_number is intentionally never auto-selected from get_accounts by
+    # code — per that tool's own guidance, an ambiguous choice must come from
+    # the user. This is the one place it's configured, explicitly.
+    account_number: str | None
+    scan_universe: tuple[str, ...]
+    max_new_entries_per_cycle: int
+
+    # --- Defaults applied to positions synced from the real Robinhood account
+    # (opened by the user outside this system, so there's no known thesis or
+    # trader-set target/stop to sync) — see position_manager/hood_sync.py.
+    synced_position_profit_target_pct: float
+    synced_position_stop_loss_pct: float
 
     def __post_init__(self) -> None:
         if self.trading_mode not in VALID_TRADING_MODES:
@@ -140,6 +167,12 @@ class Settings:
             raise ConfigError("MAX_SPREAD_PCT must be between 0 and 1 (exclusive)")
         if not 0 < self.max_extended_move_pct < 1:
             raise ConfigError("MAX_EXTENDED_MOVE_PCT must be between 0 and 1 (exclusive)")
+        if self.max_new_entries_per_cycle < 0:
+            raise ConfigError("MAX_NEW_ENTRIES_PER_CYCLE must be >= 0")
+        if self.synced_position_profit_target_pct <= 0:
+            raise ConfigError("SYNCED_POSITION_PROFIT_TARGET_PCT must be > 0")
+        if self.synced_position_stop_loss_pct <= 0:
+            raise ConfigError("SYNCED_POSITION_STOP_LOSS_PCT must be > 0")
 
     @property
     def is_paper(self) -> bool:
@@ -181,6 +214,12 @@ class Settings:
             decision_log_file=_get_str(env, "DECISION_LOG_FILE", "logs/decisions.jsonl"),
             app_log_file=_get_str(env, "APP_LOG_FILE", "logs/app.log"),
             risk_state_file=_get_str(env, "RISK_STATE_FILE", "logs/risk_state.json"),
+            paper_positions_file=_get_str(env, "PAPER_POSITIONS_FILE", "logs/paper_positions.json"),
+            account_number=_get_optional_str(env, "ROBINHOOD_ACCOUNT_NUMBER"),
+            scan_universe=_get_str_tuple(env, "SCAN_UNIVERSE", "SPY,QQQ,AAPL,MSFT,NVDA"),
+            max_new_entries_per_cycle=_get_int(env, "MAX_NEW_ENTRIES_PER_CYCLE", 1),
+            synced_position_profit_target_pct=_get_float(env, "SYNCED_POSITION_PROFIT_TARGET_PCT", 0.50),
+            synced_position_stop_loss_pct=_get_float(env, "SYNCED_POSITION_STOP_LOSS_PCT", 0.50),
         )
 
 
