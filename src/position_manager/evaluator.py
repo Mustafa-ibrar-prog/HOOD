@@ -19,6 +19,20 @@ price-driven:
   - Hard stops (max loss, thesis invalidation, expiration risk) always take
     priority over momentum reasoning — those are risk controls, not
     opinions.
+
+DYNAMIC / TRAILING EXIT (deterministic, price-only — independent of the
+momentum-evidence engine above): once a position's unrealized gain reaches
+EvaluatorConfig.trailing_arm_fraction of the distance from entry to its
+profit target, trailing protection "arms". From that point on, if price
+gives back EvaluatorConfig.trailing_giveback_fraction of the gain made from
+entry to the position's peak-price-so-far, the position exits immediately
+— it does not wait for the original target, and it does not require any
+momentum-evidence signal to fire. Example, straight from the requirement:
+entry $0.95, target $1.15 (a $0.20 range). With the default 0.5/0.3
+fractions: price reaching $1.05 arms trailing (50% of the way to target);
+if price then falls back to $1.02 (giving back 30% of the $0.10 gained
+from entry to that $1.05 peak), the position exits there rather than
+waiting for $1.15. See _evaluate_trailing_exit() below.
 """
 
 from __future__ import annotations
@@ -38,8 +52,19 @@ class PositionSnapshot:
     option_price: float  # current mid/last price per contract
     momentum: MomentumEvidence
     minutes_to_expiration: float
+    # Highest option price observed for this position across every cycle
+    # so far, INCLUDING this one (i.e. already max()'d with option_price by
+    # the caller — see position_manager/peak_tracker.py). Defaults to
+    # option_price when the caller has no cross-cycle memory, which safely
+    # degrades the trailing-exit check to a same-cycle no-op rather than
+    # crashing.
+    peak_price: float | None = None
     thesis_invalidated: bool = False
     thesis_invalidation_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.peak_price is None:
+            object.__setattr__(self, "peak_price", self.option_price)
 
 
 @dataclass(frozen=True)
@@ -53,6 +78,12 @@ class EvaluatorConfig:
     # Inside this many minutes of expiration-day close, expiration risk
     # rules override ordinary momentum-based holding.
     expiration_buffer_minutes: float = 30.0
+    # Dynamic/trailing exit — see module docstring. Both come from
+    # Settings.trailing_arm_fraction / trailing_giveback_fraction in normal
+    # use (see orchestrator.py); the defaults here match Settings' own
+    # defaults so a bare EvaluatorConfig() is still sensible in tests.
+    trailing_arm_fraction: float = 0.5
+    trailing_giveback_fraction: float = 0.3
 
 
 class PositionEvaluator:
@@ -122,7 +153,20 @@ class PositionEvaluator:
                 evidence=base_evidence,
             )
 
-        # --- 4. Insufficient evidence: fail safe, never guess ------------------------
+        # --- 4. Dynamic/trailing exit: deterministic, price-only ---------------------
+        # Independent of momentum evidence on purpose (runs even when momentum
+        # data is INSUFFICIENT_DATA below) — see module docstring for the
+        # worked example. A pure price-structure signal, not an opinion.
+        trailing_triggered, trailing_reason = _evaluate_trailing_exit(position, snapshot, self.config)
+        if trailing_triggered:
+            return DecisionResult(
+                decision=Decision.EXIT,
+                reason=trailing_reason,
+                confidence=0.85,
+                evidence={**base_evidence, "peak_price": snapshot.peak_price},
+            )
+
+        # --- 5. Insufficient evidence: fail safe, never guess ------------------------
         if assessment.state is MomentumState.INSUFFICIENT_DATA:
             return DecisionResult(
                 decision=Decision.HOLD,
@@ -131,7 +175,7 @@ class PositionEvaluator:
                 evidence=base_evidence,
             )
 
-        # --- 5. Profitable position, momentum-driven early exit ----------------------
+        # --- 6. Profitable position, momentum-driven early exit ----------------------
         # This is the core "don't wait for the target, but don't exit on a
         # pause either" rule: act on WEAKENING/REVERSING with enough
         # corroborating signals, regardless of whether the target was hit.
@@ -148,7 +192,7 @@ class PositionEvaluator:
                     evidence=base_evidence,
                 )
 
-        # --- 6. Profit target reached ------------------------------------------------
+        # --- 7. Profit target reached ------------------------------------------------
         if pnl_usd >= position.profit_target_usd:
             if assessment.state is MomentumState.STRENGTHENING:
                 return DecisionResult(
@@ -171,9 +215,51 @@ class PositionEvaluator:
                 evidence=base_evidence,
             )
 
-        # --- 7. Default: hold ----------------------------------------------------------
+        # --- 8. Default: hold ----------------------------------------------------------
         hold_reason = (
             f"No exit condition met (P&L ${pnl_usd:.2f}, momentum {assessment.state.value.lower()}); "
             "maintaining position"
         )
         return DecisionResult(decision=Decision.HOLD, reason=hold_reason, confidence=0.6, evidence=base_evidence)
+
+
+def _target_price(position: OpenPosition) -> float:
+    """Per-contract price that corresponds to position.profit_target_usd
+    (a whole-position dollar figure) — needed because the trailing engine
+    reasons in price terms, the same terms the requirement's example used
+    ($0.95 entry, $1.15 target)."""
+    per_contract_target_gain = position.profit_target_usd / (position.quantity * position.contract_multiplier)
+    return position.entry_price + per_contract_target_gain
+
+
+def _evaluate_trailing_exit(
+    position: OpenPosition, snapshot: PositionSnapshot, config: EvaluatorConfig
+) -> tuple[bool, str]:
+    """Deterministic, price-only dynamic exit. See module docstring for the
+    worked example. Returns (should_exit, reason); reason is only
+    meaningful when should_exit is True."""
+    peak_price = snapshot.peak_price if snapshot.peak_price is not None else snapshot.option_price
+    gain_to_peak = peak_price - position.entry_price
+    if gain_to_peak <= 0:
+        return False, ""  # never been profitable — nothing to trail
+
+    target_price = _target_price(position)
+    target_range = target_price - position.entry_price
+    if target_range <= 0:
+        return False, ""  # degenerate config; nothing sensible to arm against
+
+    arm_price = position.entry_price + config.trailing_arm_fraction * target_range
+    if peak_price < arm_price:
+        return False, ""  # not armed yet — hasn't gained enough to trail
+
+    trigger_price = peak_price - config.trailing_giveback_fraction * gain_to_peak
+    if snapshot.option_price <= trigger_price:
+        giveback_usd = (peak_price - snapshot.option_price) * position.quantity * position.contract_multiplier
+        return True, (
+            f"Trailing exit: price peaked at ${peak_price:.2f} (armed at ${arm_price:.2f}, "
+            f"{config.trailing_arm_fraction:.0%} of the way to the ${target_price:.2f} target) and has "
+            f"since given back ${giveback_usd:.2f} to ${snapshot.option_price:.2f} — "
+            f"{config.trailing_giveback_fraction:.0%} of the peak gain — exiting now rather than "
+            "waiting for the original target or a reversal"
+        )
+    return False, ""

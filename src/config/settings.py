@@ -136,6 +136,9 @@ class Settings:
     app_log_file: str
     risk_state_file: str
     paper_positions_file: str
+    pending_orders_file: str
+    live_bot_positions_file: str
+    peak_prices_file: str
 
     # --- Brokerage account / scanning ------------------------------------------
     # account_number is intentionally never auto-selected from get_accounts by
@@ -150,6 +153,29 @@ class Settings:
     # trader-set target/stop to sync) — see position_manager/hood_sync.py.
     synced_position_profit_target_pct: float
     synced_position_stop_loss_pct: float
+
+    # --- Live execution (see src/execution/gateway.py). Unused while
+    # TRADING_MODE=paper.
+    pending_order_expiry_minutes: int
+    # False (default): submit_order() always stops at a pending approval —
+    # a human (or the agent, per the operational runbook) must take a
+    # separate, explicit action to actually place it.
+    # True: the execution layer places an order the instant it clears every
+    # deterministic risk check, with no conversational approval step —
+    # RiskManager + PositionEvaluator's rules are the only gate. Only takes
+    # effect together with TRADING_MODE=live and LIVE_TRADING_CONFIRMED=true.
+    live_auto_execute: bool
+
+    # --- Dynamic/trailing exit (see position_manager/evaluator.py) ------------
+    # Once an open position's unrealized gain reaches this fraction of the
+    # distance from entry to its profit target, trailing protection "arms".
+    # 0.5 with entry=$0.95/target=$1.15 arms at $1.05 (the documented
+    # example).
+    trailing_arm_fraction: float
+    # Once armed, an EXIT triggers if price gives back this fraction of the
+    # gain made from entry to the position's peak price so far — rather
+    # than waiting for the original target or a momentum-evidence signal.
+    trailing_giveback_fraction: float
 
     def __post_init__(self) -> None:
         if self.trading_mode not in VALID_TRADING_MODES:
@@ -173,6 +199,12 @@ class Settings:
             raise ConfigError("SYNCED_POSITION_PROFIT_TARGET_PCT must be > 0")
         if self.synced_position_stop_loss_pct <= 0:
             raise ConfigError("SYNCED_POSITION_STOP_LOSS_PCT must be > 0")
+        if self.pending_order_expiry_minutes <= 0:
+            raise ConfigError("PENDING_ORDER_EXPIRY_MINUTES must be > 0")
+        if not 0 < self.trailing_arm_fraction < 1:
+            raise ConfigError("TRAILING_ARM_FRACTION must be between 0 and 1 (exclusive)")
+        if not 0 < self.trailing_giveback_fraction < 1:
+            raise ConfigError("TRAILING_GIVEBACK_FRACTION must be between 0 and 1 (exclusive)")
 
     @property
     def is_paper(self) -> bool:
@@ -215,11 +247,18 @@ class Settings:
             app_log_file=_get_str(env, "APP_LOG_FILE", "logs/app.log"),
             risk_state_file=_get_str(env, "RISK_STATE_FILE", "logs/risk_state.json"),
             paper_positions_file=_get_str(env, "PAPER_POSITIONS_FILE", "logs/paper_positions.json"),
+            pending_orders_file=_get_str(env, "PENDING_ORDERS_FILE", "logs/pending_orders.json"),
+            live_bot_positions_file=_get_str(env, "LIVE_BOT_POSITIONS_FILE", "logs/live_bot_positions.json"),
+            peak_prices_file=_get_str(env, "PEAK_PRICES_FILE", "logs/peak_prices.json"),
             account_number=_get_optional_str(env, "ROBINHOOD_ACCOUNT_NUMBER"),
             scan_universe=_get_str_tuple(env, "SCAN_UNIVERSE", "SPY,QQQ,AAPL,MSFT,NVDA"),
             max_new_entries_per_cycle=_get_int(env, "MAX_NEW_ENTRIES_PER_CYCLE", 1),
             synced_position_profit_target_pct=_get_float(env, "SYNCED_POSITION_PROFIT_TARGET_PCT", 0.50),
             synced_position_stop_loss_pct=_get_float(env, "SYNCED_POSITION_STOP_LOSS_PCT", 0.50),
+            pending_order_expiry_minutes=_get_int(env, "PENDING_ORDER_EXPIRY_MINUTES", 15),
+            live_auto_execute=_get_bool(env, "LIVE_AUTO_EXECUTE", False),
+            trailing_arm_fraction=_get_float(env, "TRAILING_ARM_FRACTION", 0.5),
+            trailing_giveback_fraction=_get_float(env, "TRAILING_GIVEBACK_FRACTION", 0.3),
         )
 
 

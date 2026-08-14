@@ -1,32 +1,41 @@
-# HOOD Options Trading System (Paper Mode)
+# HOOD Options Trading System
 
 An automated options trading system built on top of the HOOD (Robinhood)
-MCP connection, running end-to-end in **paper mode**:
+MCP connection:
 
 ```
-MARKET SCAN → FIND SETUP → PAPER ENTRY → MONITOR EVERY ~5 MINUTES →
-HOLD / EARLY EXIT / TARGET EXIT / STOP → LOG EVERYTHING → SYNC WITH ROBINHOOD
+MARKET SCAN → FIND SETUP → ENTRY → MONITOR EVERY ~5 MINUTES →
+HOLD / EARLY EXIT (momentum OR trailing-stop) / TARGET EXIT / STOP →
+LOG EVERYTHING → SYNC WITH ROBINHOOD
 ```
 
-Nothing in this codebase places, modifies, or cancels a real order —
-`src/execution/gateway.py` physically refuses to do anything but simulate
-while `TRADING_MODE=paper`, which is the only mode this system runs in
-today. See "How the ~5-minute cadence actually works" below for an honest
-account of what "automated" means on this platform (agent-mediated, not a
-headless daemon — real decisions against real data, but not a fire-and-
-forget background process).
+**Today, this system runs in `TRADING_MODE=paper` only** — the real `.env`
+in this deployment has `TRADING_MODE=paper` and no recurring live loop has
+been started. Live execution (real, real-money orders) **is implemented**
+in `src/execution/gateway.py`, but is a separate, deliberate opt-in gated by
+two independent switches (`TRADING_MODE=live` and
+`LIVE_TRADING_CONFIRMED=true`) that are both off by default and off in the
+real deployment right now. See "The execution layer" and "Going live" below
+for exactly how it works and what flipping it on would mean. See "How the
+~5-minute cadence actually works" for an honest account of what "automated"
+means on this platform (agent-mediated, not a headless daemon).
 
 ## Safety model, in one paragraph
 
 `TRADING_MODE` defaults to `paper`. `src/execution/gateway.py` is the single
-choke point every order-related action must pass through: in paper mode it
+choke point every order-related action must pass through. In paper mode it
 returns a `PaperExecutionGateway` that only ever simulates a fill and writes
-it to the audit log; in any other mode `get_execution_gateway()` raises
-immediately, on purpose, because the live path (`LiveExecutionGateway`) is
-an intentional stub whose methods unconditionally raise
-`LiveTradingDisabledError`. Turning on real trading later requires a human
-to deliberately implement that class — it does not happen by flipping an
-environment variable. See "Before live trading" below.
+it to the audit log — it can never call a real order tool, period. In live
+mode it returns a `LiveExecutionGateway`, which still can't construct at all
+unless `LIVE_TRADING_CONFIRMED=true` is *also* set (a second, independent
+switch), and which routes every single order — every entry AND every exit —
+through exactly one method, `_place_pending()`, the only place in this
+entire codebase that calls `place_option_order`. Whether that method runs
+immediately (deterministic risk rules only — see `LIVE_AUTO_EXECUTE`) or
+waits for a separate, explicit confirmation step is the one behavior
+`LIVE_AUTO_EXECUTE` controls; either way, every order is written to the
+audit log the moment it's proposed, decided, and (if it happens) placed —
+see "The execution layer" below.
 
 ## Project layout
 
@@ -35,13 +44,16 @@ src/
   config/            Settings (env-driven) + shared constants
   market/            Market data (verified live against real HOOD responses), indicators, scanning support
   strategy/          Decision model, momentum-evidence scoring, scanning framework + a concrete strategy
-  position_manager/  Open-position model, evaluator, monitor (now submits simulated exit orders), paper ledger, real-position sync
+  position_manager/  Open-position model, evaluator (+ dynamic/trailing exit engine), monitor, paper ledger, real-position sync
   risk/              The 11-rule risk-control framework + persisted daily state (UNCHANGED throughout this build)
-  execution/         Order shapes + the paper/live execution gateway (safety boundary, UNCHANGED)
+  execution/         Order shapes + the paper/live execution gateway (the safety boundary — see below)
   logging/           Structured decision/audit logging + general app logging
   orchestrator.py    Ties one full cycle together: scan → entry → monitor → exit → log → sync
-  live_bridge.py     The manual live-data bridge + runbook for actually running a cycle (see below)
-tests/               One test module per src package, 232 tests total
+  live_bridge.py     The manual live-data bridge + runbook for running a cycle, and the live-order confirmation bridge (see below)
+tests/               One test module per src package, 270 tests total
+scripts/             run_cycle.py (paper/live cycle driver), verify_live_readiness.py
+                     (account preflight), confirm_pending_order.py / reject_pending_order.py
+                     (the live-order confirmation bridge — see below)
 .env.example         All configuration variables, documented
 ```
 
@@ -124,24 +136,48 @@ tests/               One test module per src package, 232 tests total
   (rounded to the cent) and `to_dict`/`from_dict` for persistence.
 - **`evaluator.py`** — `PositionEvaluator`, the core HOLD/EXIT/TARGET_EXIT/
   STOP_EXIT decision tree: thesis invalidation and hard stop-loss always win;
-  expiration risk is checked next; then insufficient-data fails safe to
-  HOLD; then a profitable position with corroborated weakening/reversing
-  evidence EXITs *regardless of whether the profit target was reached*;
-  reaching the target only forces `TARGET_EXIT` if momentum isn't still
-  strengthening (if it is, the position HOLDs past the target too). This is
-  the exact behavior from the spec's $0.95→$1.05 example.
+  expiration risk is checked next; **then a deterministic, price-only
+  dynamic/trailing exit check** (see below); then insufficient-data fails
+  safe to HOLD; then a profitable position with corroborated
+  weakening/reversing momentum evidence EXITs *regardless of whether the
+  profit target was reached*; reaching the target only forces `TARGET_EXIT`
+  if momentum isn't still strengthening (if it is, the position HOLDs past
+  the target too). This is the exact behavior from the spec's $0.95→$1.05
+  example.
+  > **Dynamic/trailing exit**: once a position's unrealized gain reaches
+  > `TRAILING_ARM_FRACTION` (default 0.5) of the distance from entry to its
+  > profit-target price, trailing protection "arms". From then on, if price
+  > gives back `TRAILING_GIVEBACK_FRACTION` (default 0.3) of the gain made
+  > from entry to the position's peak price so far, it exits immediately —
+  > independent of the momentum-evidence engine, and even when there isn't
+  > enough momentum data to classify the move at all. Worked example, straight
+  > from the requirement: entry $0.95, target $1.15 (a $0.20 range) — price
+  > reaching $1.05 arms it (50% of the way to target); price then falling
+  > back to $1.02 (giving back 30% of the $0.10 gained) exits there, rather
+  > than waiting for $1.15. See `_evaluate_trailing_exit()`.
+- **`peak_tracker.py`** — `PeakPriceStore`, a tiny JSON-file-backed
+  option_id → highest-price-seen ledger that gives the trailing-exit check
+  real memory across cycles (needed because real, Robinhood-synced
+  positions are rebuilt fresh every cycle — see `hood_sync.py` — with no
+  natural place of their own to carry state forward). Fails closed on a
+  corrupted file, like every other store in this codebase.
 - **`monitor.py`** — `PositionMonitor.run_once()` performs one
-  fetch-evaluate-log cycle for one position, and — for an
-  EXIT/TARGET_EXIT/STOP_EXIT decision — builds and submits a sell-to-close
-  `OrderRequest` through the (paper-only) execution gateway; `acted=True`
-  and an `order_result` come back when the simulated fill happens. Pass
+  fetch-evaluate-log cycle for one position — updating its peak price via
+  `PeakPriceStore` first — and, for an EXIT/TARGET_EXIT/STOP_EXIT decision,
+  builds and submits a sell-to-close `OrderRequest` through whichever
+  execution gateway this cycle is running with (paper: always a simulated
+  fill; live: a pending approval, or an immediate placement under
+  `LIVE_AUTO_EXECUTE` — see "The execution layer"). `acted=True` and an
+  `order_result` come back only once the position is actually closed
+  (`simulated_fill` or `placed`), never for a live `pending_approval`. Pass
   `simulate_exit=False` to decide-and-log only without submitting an order
-  — used for positions synced read-only from the real account, which this
-  system doesn't own the lifecycle of. **There is no timer or scheduler in
-  this code** — `is_within_monitoring_window()` just tells a caller whether
-  now is a sensible time to act, converting to the configured market
-  timezone itself (a real bug, caught during live verification, made a raw
-  UTC `now` compare against ET boundary times directly — fixed).
+  at all — used for real positions this system doesn't consider its own to
+  act on (see `LiveBotPositionsStore` below). **There is no timer or
+  scheduler in this code** — `is_within_monitoring_window()` just tells a
+  caller whether now is a sensible time to act, converting to the
+  configured market timezone itself (a real bug, caught during live
+  verification, made a raw UTC `now` compare against ET boundary times
+  directly — fixed).
 - **`store.py`** — `PaperPositionStore`, the JSON-backed ledger of positions
   *this system* opened via simulated paper entries — the only record of
   them, since Robinhood has no knowledge of a simulated trade. Fails closed
@@ -161,14 +197,21 @@ tests/               One test module per src package, 232 tests total
 `run_trading_cycle()` is **one** cycle: sync real positions (read-only) →
 monitor this system's paper positions (HOLD/EXIT/TARGET_EXIT/STOP, with a
 simulated closing order on exit) → monitor real positions (decide + log
-only, never act) → scan for a setup and paper-enter it if risk controls
-allow → log everything, including an explicit `NO_TRADE` when nothing
-happened and why. No scheduler here either — see below for what actually
-drives the ~5-minute cadence.
+always; propose an exit order only in live mode, and only for a real
+position this system itself opened — see `LiveBotPositionsStore`) → scan for
+a setup and enter it if risk controls allow → log everything, including an
+explicit `NO_TRADE` when nothing happened and why. `CycleReport.
+pending_approvals` lists any live orders (entries or exits) proposed this
+cycle that are waiting on a decision. No scheduler here either — see below
+for what actually drives the ~5-minute cadence.
 
 ### `src/live_bridge.py`
 `StaticHoodClient` + the manual runbook for actually running a cycle
 against real data — see "How the ~5-minute cadence actually works" below.
+Also `StaticLiveOrderPlacer`, the equivalent bridge for the live-order
+confirmation flow (see "The execution layer" below) — unlike
+`StaticHoodClient`, it wraps a response from a REAL `place_option_order`
+call that already happened, never a call it makes itself.
 
 ### `src/risk/` — unchanged throughout this build, on purpose
 - **`models.py`** — `RiskLimits` (built from `Settings`).
@@ -197,15 +240,69 @@ against real data — see "How the ~5-minute cadence actually works" below.
   cycles. A corrupted state file **fails closed** (raises) rather than
   silently resetting counters, which would quietly bypass the daily limits.
 
-### `src/execution/` — unchanged throughout this build, on purpose
-- **`orders.py`** — `OrderRequest`/`OrderLeg`/`OrderResult`/`SimulatedFill`,
-  shaped to mirror `place_option_order`'s parameters so a future real bridge
-  is a thin pass-through, not a redesign.
-- **`gateway.py`** — the safety boundary described above:
-  `assert_paper_mode()`, `PaperExecutionGateway` (simulates fills, logs
-  everything, never calls an MCP tool), `LiveExecutionGateway` (every
-  method unconditionally raises), and `get_execution_gateway()` (the only
-  supported way to obtain a gateway; refuses outside paper mode).
+### `src/execution/` — the execution layer
+
+`src/risk/` (unchanged, see below) decides whether a trade is ALLOWED;
+`src/execution/` decides what actually HAPPENS to an allowed trade. That
+split is deliberate: strategy/evaluator code produces a structured
+BUY/HOLD/EXIT decision, `RiskManager` deterministically enforces every
+control against it, and only then does this layer ever build or submit an
+order — nothing here re-decides whether a trade should happen.
+
+- **`orders.py`** — `OrderRequest`/`OrderLeg`/`OrderResult`/`SimulatedFill`/
+  `LiveFill`, shaped to mirror `place_option_order`'s real, verified
+  parameters (`account_number`, `legs[option_id, side, position_effect,
+  ratio_quantity]`, `quantity`, `type`, `price`, `stop_price`,
+  `time_in_force`, `market_hours`, `ref_id`) so the execution bridge is a
+  thin pass-through, not a redesign. Documents exactly which order types
+  are verified available (`limit`, `market`, `stop_limit`, `stop_market`)
+  and which one this codebase actually ever builds (`limit`, single-leg,
+  always — see the module docstring for the full breakdown).
+- **`gateway.py`** — the safety boundary. `PaperExecutionGateway` simulates
+  fills and logs everything; it can never call a real order tool, in any
+  mode. `LiveExecutionGateway` refuses to even construct unless
+  `TRADING_MODE=live` **and** `LIVE_TRADING_CONFIRMED=true`. Its
+  `submit_order()` always creates a `PendingLiveOrder` first (full audit
+  trail no matter what happens next), then either:
+    - stops there (`status="pending_approval"`) — the default — waiting for
+      a separate, explicit `confirm_and_place()` call, **or**
+    - (only if `LIVE_AUTO_EXECUTE=true` **and** a `LiveOrderPlacer` was
+      injected) immediately calls `_place_pending()` itself, with no
+      separate step — `RiskManager` + `PositionEvaluator`'s deterministic
+      checks (already run before `submit_order` was ever reached) are the
+      only gate. `_place_pending()` is the **one and only** method in this
+      codebase that calls `place_option_order` — both paths funnel through
+      it, so there's exactly one implementation of "what happens when a
+      live order is placed" to audit. `get_execution_gateway()` is the only
+      supported way to obtain a gateway (paper by default; live requires an
+      explicit `PendingOrderStore`, so a caller can't get a live-capable
+      gateway by accident).
+- **`pending.py`** — `PendingLiveOrder` (id, order, status
+  `awaiting_approval`/`approved`/`rejected`/`expired`/`placed`/`failed`,
+  timestamps, `decided_by`) + `PendingOrderStore`, a JSON-backed ledger
+  (fails closed on corruption, like every other store here). A pending
+  order past `PENDING_ORDER_EXPIRY_MINUTES` can never be placed —
+  `confirm_and_place()` re-checks expiry and refuses a stale proposal
+  rather than filling it against a quote that's moved on.
+- **`live_positions.py`** — `LiveBotPositionsStore`: tracks which real
+  (Robinhood-synced) positions *this system itself* opened via a confirmed
+  live order, so the position monitor only ever proposes an exit for its
+  own trades — never for something the user holds for reasons of their own
+  that this bot knows nothing about. Updated automatically by
+  `_place_pending()` (added on a confirmed entry, removed on a confirmed
+  exit).
+- **`live_client.py`** — `LiveOrderPlacer`, the typed seam (same pattern as
+  `market/hood_client.py`'s `HoodToolClient`) for whatever actually has the
+  ability to call `place_option_order` / `review_option_order` /
+  `cancel_option_order` / `get_accounts` / `get_portfolio` — deliberately
+  separate from `HoodToolClient`, which explicitly excludes order-placement
+  methods.
+- **`preflight.py`** — `verify_account_preflight()`: checks a real
+  `get_accounts` + `get_portfolio` response for `agentic_allowed=true`,
+  `option_level_2`/`option_level_3`, active account state, and sufficient
+  buying power — every field defensively parsed, anything missing or
+  ambiguous is a FAILING check, never a skipped one. Must pass before the
+  first live order is ever proposed (`scripts/verify_live_readiness.py`).
 
 ### `src/logging/`
 - **`app_logger.py`** — general diagnostic logging (stdlib `logging`,
@@ -226,7 +323,13 @@ Copy `.env.example` to `.env` and adjust. Key variables:
 
 | Variable | Purpose |
 |---|---|
-| `TRADING_MODE` | `paper` (default, enforced) or `live` (parses, but execution still refuses — see below) |
+| `TRADING_MODE` | `paper` (default, enforced) or `live` (implemented — see "The execution layer" — but off in this deployment's real `.env`) |
+| `LIVE_TRADING_CONFIRMED` | Second, independent switch `LiveExecutionGateway` also requires before it will even construct. Default `false`. |
+| `LIVE_AUTO_EXECUTE` | `false` (default): every live order stops at a pending approval. `true`: an order is placed the instant it clears every deterministic risk check, no conversational per-trade approval. Only matters together with the two switches above. |
+| `PENDING_ORDERS_FILE` / `PENDING_ORDER_EXPIRY_MINUTES` | Live pending-order ledger path and how long a proposal stays approvable (default 15 min) |
+| `LIVE_BOT_POSITIONS_FILE` | Tracks which real positions this system itself opened live, for exit-proposal ownership |
+| `PEAK_PRICES_FILE` | Cross-cycle peak-price memory for the trailing-exit engine |
+| `TRAILING_ARM_FRACTION` / `TRAILING_GIVEBACK_FRACTION` | Dynamic/trailing exit thresholds (defaults 0.5 / 0.3 — see the worked example above) |
 | `MAX_TRADES_PER_DAY` | Default 4 |
 | `MAX_DAILY_LOSS_USD` | Realized+unrealized daily loss cap |
 | `MAX_POSITION_SIZE_USD` | Per-trade capital cap |
@@ -249,15 +352,18 @@ pip install -e ".[dev]"   # installs pytest only
 pytest
 ```
 
-232 tests currently pass, covering everything above plus: the real,
+270 tests currently pass, covering everything above plus: the real,
 live-verified HOOD response parsing (including edge cases — invalid
 symbols/contracts silently omitted from results, pagination, a bug where
 that omission was almost mishandled as "use whatever row came back"), the
 concrete momentum-breakout strategy, the paper-position ledger, real-
-position sync, the monitor's simulated order submission, and the full
-orchestrator cycle end-to-end — plus two real timezone bugs caught only by
-running the system against actual live data (see below) and fixed with
-regression tests.
+position sync, the monitor's simulated order submission, the dynamic/
+trailing exit engine (including the exact $0.95/$1.05/$1.15 worked
+example), and the full live-execution architecture — pending orders,
+confirm/reject, the auto-execute path, preflight checks, and the guarantee
+that `place_option_order` is reachable from exactly one method in the whole
+codebase — plus two real timezone bugs caught only by running the system
+against actual live data (see below) and fixed with regression tests.
 
 ## HOOD MCP tools this codebase actually calls
 
@@ -278,10 +384,15 @@ screeners instead of/alongside `MomentumBreakoutStrategy`), `get_portfolio`
 / `get_pnl_trade_history` (a future enhancement could reconcile daily P&L
 against the real account instead of locally-tracked risk state).
 
-**Order execution (exclusively for the future `LiveExecutionGateway`, once
-explicitly built and approved):** `review_option_order`,
-`place_option_order`, `cancel_option_order`. **Not called anywhere in this
-codebase, and never will be while `TRADING_MODE=paper`.**
+**Order execution (implemented, but only reachable through
+`LiveExecutionGateway._place_pending()` — never called anywhere else in this
+codebase, and never called at all while `TRADING_MODE=paper`, which is the
+mode this deployment's real `.env` is in today):** `place_option_order`. Its
+schema was verified live (account requirements, leg/type/price rules,
+idempotent `ref_id`). `review_option_order` and `get_portfolio` are wired
+into the `LiveOrderPlacer`/preflight seam but not yet called by any code
+path in this build. `cancel_option_order` is deliberately not wired to
+anything — see `LiveExecutionGateway.cancel_order()`.
 
 ## How the ~5-minute cadence actually works
 
@@ -307,9 +418,13 @@ agent:
    the order `HoodMarketDataProvider` needs them), record each response on
    a `StaticHoodClient`, then call `src.orchestrator.run_trading_cycle()`
    against it.
-3. Never calls `place_option_order` / `review_option_order` /
-   `cancel_option_order` — `TRADING_MODE` stays `paper`, and the execution
-   gateway refuses regardless.
+3. In this deployment, `TRADING_MODE` stays `paper` throughout, so the
+   execution gateway never calls `place_option_order` /
+   `review_option_order` / `cancel_option_order` regardless. If a future
+   session runs this with `TRADING_MODE=live` and `LIVE_TRADING_CONFIRMED=
+   true`, a proposed live order still can't be placed inside this same
+   step — see "The live-order confirmation bridge" below for why, and what
+   the agent does instead.
 
 This was validated against real, live data during development (not just
 mocks): a full cycle correctly synced the real account's positions (zero,
@@ -325,6 +440,28 @@ fire-and-forget background daemon: each firing takes the agent's active
 participation, following the runbook, and there is no code in this
 repository that can run the system unattended without that.
 
+### The live-order confirmation bridge
+
+`place_option_order` has a real, irreversible side effect, so — unlike
+market data — it can't be "recorded ahead of time and replayed." The flow,
+only relevant once `TRADING_MODE=live` and `LIVE_TRADING_CONFIRMED=true`:
+
+1. A cycle's `submit_order()` creates a `PendingLiveOrder` (never calls
+   `place_option_order` itself) — see `PendingOrderStore`.
+2. Under `LIVE_AUTO_EXECUTE=false` (the default), that pending order just
+   sits there until a separate, explicit action decides it — either
+   `scripts/confirm_pending_order.py` (after the agent makes a REAL
+   `place_option_order` call with that pending order's exact parameters and
+   records the real response) or `scripts/reject_pending_order.py`. Under
+   `LIVE_AUTO_EXECUTE=true`, this is what happens immediately: nothing
+   waits for a message-and-reply round trip, but the mechanics — a real
+   tool call, then a script that processes its real response — are the
+   same, because Python still can't call `place_option_order` itself.
+3. Either way, `LiveExecutionGateway._place_pending()` is the one method
+   that ever calls it, and it always updates `PendingOrderStore`,
+   `LiveBotPositionsStore`, and the decision/audit log from what actually
+   happened — never a fabricated result.
+
 ## What's still not built
 
 1. A bearish (long-put) strategy — `MomentumBreakoutStrategy` is calls-only;
@@ -333,44 +470,57 @@ repository that can run the system unattended without that.
    scoped future work.
 2. Daily-loss/portfolio reconciliation against the real account
    (`get_portfolio` / `get_pnl_trade_history`) — `RiskStateStore` currently
-   tracks the day's P&L purely from this system's own paper fills, not
-   cross-checked against Robinhood's own numbers.
+   tracks the day's P&L purely from this system's own fills, not
+   cross-checked against Robinhood's own numbers. `get_portfolio` is wired
+   into the preflight check's buying-power test, but not (yet) into
+   ongoing daily-loss reconciliation.
 3. A truly unattended, headless automation path. As explained above, this
    platform's architecture means live tool calls are agent-mediated — a
    different platform/integration with a persistent, credentialed bridge
    process would be a materially different (and far larger) undertaking,
-   not a small addition to this codebase.
-4. Multi-cycle, multi-session soak testing in paper mode across varied real
+   not a small addition to this codebase. Concretely: even with
+   `LIVE_AUTO_EXECUTE=true`, an order still requires the agent to make a
+   real tool call and feed its response back into a script — there is no
+   in-process path from "cycle ran" to "order placed."
+4. An explicit kill switch (env var or file check) the user can flip to
+   force every gateway back to paper/refuse instantly, independent of the
+   rest of the config.
+5. A monitoring/alerting story for when the external ~5-minute trigger stops
+   firing (e.g. the scheduler dies) while a live position is open — silence
+   from the scheduler must not mean silence from risk controls.
+6. Multi-cycle, multi-session soak testing in paper mode across varied real
    market conditions (trending, choppy, low-liquidity, earnings volatility)
    — this build has been validated end-to-end against real data for one
    quiet-market snapshot, not battle-tested over time.
+7. `scripts/verify_live_readiness.py` has been built and unit-tested but
+   never actually run against a real `get_accounts`/`get_portfolio` pull in
+   this deployment — do that, and read its output, before ever proposing a
+   live order for real.
 
-## What needs to happen before live trading can safely be enabled
+## Going live: what this deployment has and hasn't done
 
-This is a one-way door and should be treated as such:
+Live execution **is built and tested** (see "The execution layer" and "The
+live-order confirmation bridge" above) — 270 tests pass, including the
+guarantee that `place_option_order` is reachable from exactly one method.
+**No live order has been proposed or placed by this build, and none will be
+until a human deliberately does all of the following:**
 
-1. Everything above, validated in paper mode across enough sessions and
-   market conditions (trending, choppy, low-liquidity) to trust the
-   HOLD/EXIT/TARGET_EXIT/STOP_EXIT calls and that every risk control
-   actually fires when it should.
-2. A human deliberately implements `LiveExecutionGateway` — it does not
-   happen automatically. That implementation must call `review_option_order`
-   before `place_option_order` and require explicit confirmation, per that
-   tool's own documented workflow, and must respect `agentic_allowed`/
-   `option_level` account checks before ever attempting an order.
-3. `get_execution_gateway()` is deliberately updated to return a live
-   gateway only under `TRADING_MODE=live` **and** `LIVE_TRADING_CONFIRMED=true`
-   **and** the user's own explicit, in-the-moment go-ahead for that trading
-   session — not just because the `.env` file says so once.
-4. A real daily-loss and position-count reconciliation against the live
-   account (not just local state) before every new order, so a restarted
-   process can't silently forget it already hit the day's limit.
-5. An explicit kill switch (env var or file check) the user can flip to
-   force every gateway back to paper/refuse instantly, independent of the
-   rest of the config.
-6. A monitoring/alerting story for when the external ~5-minute trigger stops
-   firing (e.g. the scheduler dies) while a live position is open — silence
-   from the scheduler must not mean silence from risk controls.
+1. Run `scripts/verify_live_readiness.py` against a real, fresh
+   `get_accounts` + `get_portfolio` pull and confirm it passes.
+2. Set `TRADING_MODE=live` and `LIVE_TRADING_CONFIRMED=true` in `.env`
+   (both are `false`/`paper` in this deployment's real `.env` right now).
+3. Decide, deliberately, whether `LIVE_AUTO_EXECUTE` should be `true`
+   (no conversational per-trade approval — an order is placed the instant
+   it clears `RiskManager`/`PositionEvaluator`'s checks) or stay `false`
+   (every order needs a separate, explicit confirm/reject action first).
+   This is a real, materially different risk posture, not a cosmetic
+   toggle — treat it as its own decision, not a default to inherit.
+4. Only then start a recurring live cycle — and even so, every cycle still
+   only ever *proposes* orders; whether they're placed immediately or held
+   for confirmation follows directly from step 3's choice.
 
-None of this exists yet, on purpose. Paper mode is the only mode this
-codebase can run in today.
+This is a one-way door and should be treated as such: soak-test in paper
+mode across varied market conditions first (see "What's still not built"
+above), and treat `LIVE_AUTO_EXECUTE=true` as something to turn on only
+after the gated (`false`) mode has actually been exercised against real
+account activity, not as the first live setting ever tried.

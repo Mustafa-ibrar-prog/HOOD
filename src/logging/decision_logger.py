@@ -21,6 +21,7 @@ from src.logging.app_logger import get_app_logger
 
 if TYPE_CHECKING:
     from src.execution.orders import OrderRequest, OrderResult
+    from src.execution.pending import PendingLiveOrder
     from src.risk.manager import RiskCheckResult
     from src.strategy.decision import Decision
 
@@ -127,6 +128,42 @@ class DecisionLogger:
                 "account_number": account_number,
                 "order_id": order_id,
                 "reason": f"paper-mode cancel of {order_id}",
+            }
+        )
+
+    def log_pending_live_order(self, pending: "PendingLiveOrder") -> None:
+        """Every state transition of a live pending order (proposed,
+        rejected, expired, failed) gets its own audit-log line — "placed"
+        instead goes through log_live_order_placed, which also carries the
+        real order result. Silence between "proposed" and a final state
+        would be exactly the kind of gap the "log everything" requirement
+        exists to prevent."""
+        self._write(
+            {
+                "kind": "pending_live_order",
+                "timestamp": _utcnow_iso(),
+                "pending_order_id": pending.id,
+                "status": pending.status,
+                "order": pending.order,
+                "decision_context": dict(pending.decision_context),
+                "decided_by": pending.decided_by,
+                "reason": pending.error or f"pending live order {pending.status}",
+            }
+        )
+
+    def log_live_order_placed(self, pending: "PendingLiveOrder", result: "OrderResult") -> None:
+        """A REAL order was actually submitted via place_option_order.
+        Distinct from log_simulated_order on purpose — these lines must
+        never be mistaken for a paper fill when reading the audit log."""
+        self._write(
+            {
+                "kind": "live_order_placed",
+                "timestamp": _utcnow_iso(),
+                "pending_order_id": pending.id,
+                "decided_by": pending.decided_by,
+                "order": pending.order,
+                "result": result,
+                "reason": f"LIVE order placed: {pending.order.reason}",
             }
         )
 

@@ -12,17 +12,30 @@ during market hours is achieved by an external, real scheduling mechanism
 invoking this function repeatedly (see the project's operational docs /
 README.md for what that is in this deployment).
 
-TRADING_MODE stays paper end-to-end. Every "entry" and "exit" performed
+In TRADING_MODE=paper (the default), every "entry" and "exit" performed
 here is a simulated fill from PaperExecutionGateway (see
 src/execution/gateway.py, which physically refuses to do anything else
-while TRADING_MODE=paper). Nothing in this module calls
-place_option_order, review_option_order, or cancel_option_order.
+while TRADING_MODE=paper).
+
+In TRADING_MODE=live, this module still never places a real order itself —
+every submit_order() call (entries AND exits) only ever creates a
+PendingLiveOrder awaiting explicit human approval (see CycleReport.
+pending_approvals) and returns immediately. Nothing in this module calls
+place_option_order, review_option_order, or cancel_option_order — the only
+method in the whole codebase that can is
+LiveExecutionGateway.confirm_and_place(), invoked separately, after a human
+approves a specific pending order (see scripts/confirm_pending_order.py).
 
 One cycle, in order:
   1. SYNC WITH ROBINHOOD (read-only): pull the account's real open option
-     positions via hood_sync.py. These are monitored (decided, logged)
-     but never paper-order-simulated — this system doesn't own their
-     lifecycle (see PositionMonitor.run_once(simulate_exit=False)).
+     positions via hood_sync.py. These are always monitored and logged. In
+     paper mode no order is ever proposed for them — this system doesn't
+     own their lifecycle. In live mode, an exit order is only ever
+     PROPOSED (pending approval, never automatic) for a real position this
+     system itself opened via a previously-confirmed live order (tracked
+     in LiveBotPositionsStore); a position the user opened manually is
+     still decided and logged, but this system will never suggest closing
+     it. See PositionMonitor.run_once(simulate_exit=...).
   2. MONITOR this system's own paper positions (from PaperPositionStore):
      HOLD / EARLY EXIT / TARGET EXIT / STOP, each a real evaluator call
      against real (or supplementary-degraded) market data. An exit-type
@@ -46,19 +59,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from typing import TYPE_CHECKING
+
 from src.config.settings import Settings
 from src.execution.gateway import ExecutionGateway, get_execution_gateway, new_ref_id
+from src.execution.live_positions import LiveBotPositionsStore
 from src.execution.orders import OrderLeg, OrderRequest
+from src.execution.pending import PendingOrderStore
 from src.logging.decision_logger import DecisionLogger
 from src.market.data_provider import MarketDataProvider
 from src.market.errors import MarketDataError
 from src.market.hood_client import HoodToolClient
 from src.market.models import PriceBar
-from src.position_manager.evaluator import PositionEvaluator
+from src.position_manager.evaluator import EvaluatorConfig, PositionEvaluator
 from src.position_manager.hood_sync import sync_open_positions_from_hood
 from src.position_manager.models import OpenPosition
 from src.position_manager.monitor import MonitorResult, PositionMonitor, is_within_monitoring_window
+from src.position_manager.peak_tracker import PeakPriceStore
 from src.position_manager.store import PaperPositionStore
+
+if TYPE_CHECKING:
+    from src.execution.live_client import LiveOrderPlacer
 from src.risk.manager import RiskDecision, RiskManager
 from src.risk.models import RiskLimits
 from src.risk.store import DailyRiskState, RiskStateStore
@@ -83,6 +104,12 @@ class CycleReport:
     scan_candidate_count: int = 0
     real_positions_synced: int = 0
     errors: list[str] = field(default_factory=list)
+    # Live mode only (see src/execution/gateway.py): ids of PendingLiveOrder
+    # records created this cycle, awaiting explicit human approval. An
+    # empty list here does NOT mean "nothing happened" — check `ran` and
+    # the other counts too; it specifically means no live order proposal
+    # is waiting on a human right now.
+    pending_approvals: list[str] = field(default_factory=list)
 
 
 def run_trading_cycle(
@@ -91,7 +118,14 @@ def run_trading_cycle(
     market_data: MarketDataProvider,
     hood_client: HoodToolClient,
     now: datetime | None = None,
+    live_order_placer: "LiveOrderPlacer | None" = None,
 ) -> CycleReport:
+    """`live_order_placer` only matters when settings.is_live and
+    settings.live_auto_execute are both true (see
+    src/execution/gateway.py). It has no effect otherwise, and is None in
+    every normal invocation of this function today — nothing in this
+    Python process can supply a real one (see live_client.py's docstring);
+    it exists as an injection seam for tests and for a future bridge."""
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -118,13 +152,22 @@ def run_trading_cycle(
         )
 
     decision_logger = DecisionLogger(path=settings.decision_log_file, app_log_file=settings.app_log_file)
-    # get_execution_gateway refuses outright unless TRADING_MODE=paper —
-    # this is the same hard stop the rest of the codebase relies on.
-    execution_gateway = get_execution_gateway(settings, decision_logger)
+    # get_execution_gateway returns a PaperExecutionGateway (never places a
+    # real order) unless TRADING_MODE=live AND LIVE_TRADING_CONFIRMED=true,
+    # in which case it returns a LiveExecutionGateway. Whether THAT places
+    # an order immediately (settings.live_auto_execute, with a
+    # live_order_placer available) or stops at a pending approval is that
+    # class's own concern — see src/execution/gateway.py.
+    bot_positions_store = LiveBotPositionsStore(Path(settings.live_bot_positions_file))
+    pending_store = PendingOrderStore(Path(settings.pending_orders_file)) if settings.is_live else None
+    execution_gateway = get_execution_gateway(
+        settings, decision_logger, pending_store, bot_positions_store, live_order_placer
+    )
     risk_manager = RiskManager(RiskLimits.from_settings(settings))
     risk_store = RiskStateStore(Path(settings.risk_state_file))
     risk_state = risk_store.load(today=now.date())
     paper_store = PaperPositionStore(Path(settings.paper_positions_file))
+    peak_price_store = PeakPriceStore(Path(settings.peak_prices_file))
 
     report = CycleReport(ran=True)
 
@@ -140,11 +183,17 @@ def run_trading_cycle(
     monitor = PositionMonitor(
         settings=settings,
         market_data=market_data,
-        evaluator=PositionEvaluator(),
+        evaluator=PositionEvaluator(
+            EvaluatorConfig(
+                trailing_arm_fraction=settings.trailing_arm_fraction,
+                trailing_giveback_fraction=settings.trailing_giveback_fraction,
+            )
+        ),
         risk_manager=risk_manager,
         decision_logger=decision_logger,
         execution_gateway=execution_gateway,
         account_number=settings.account_number,
+        peak_price_store=peak_price_store,
     )
 
     # --- 2. MONITOR this system's own paper positions -------------------------------
@@ -161,14 +210,34 @@ def run_trading_cycle(
             paper_store.remove_position(position.option_id)
             report.exits.append(position.option_id)
 
-    # Real positions: decide and log only — this system did not open them
-    # and never simulates a paper order for them (simulate_exit=False).
+    # Real positions: decide and log always. Whether an exit order is ever
+    # actually PROPOSED for one depends on mode and ownership:
+    #   - paper mode: never (simulate_exit=False) — this system did not
+    #     open these positions and never fakes a paper order for them.
+    #   - live mode: only for positions THIS SYSTEM itself opened via a
+    #     previously-confirmed live order (tracked in bot_positions_store —
+    #     see live_positions.py). Even then "propose" means submit_order()
+    #     creates a pending approval, never a real order by itself. A
+    #     position the user opened manually is decided and logged like any
+    #     other, but this system will never suggest closing it.
     for position in real_positions:
         report.monitored_real_count += 1
+        owns_position = settings.is_live and bot_positions_store.contains(position.option_id)
         try:
-            monitor.run_once(position, now=now, simulate_exit=False)
+            result = monitor.run_once(position, now=now, simulate_exit=owns_position)
         except MarketDataError as exc:
             report.errors.append(f"monitor failed for real position {position.option_id}: {exc}")
+            continue
+        if result.order_result is not None and result.order_result.status == "pending_approval":
+            report.pending_approvals.append(result.order_result.extra["pending_order_id"])
+        elif result.decision_result.decision in EXIT_DECISIONS and result.acted:
+            # live_auto_execute placed a REAL closing order immediately —
+            # bot_positions_store bookkeeping already happened inside
+            # LiveExecutionGateway._place_pending(); this system's own
+            # daily trade-count/loss bookkeeping happens here, same as the
+            # paper-position loop above.
+            risk_state.record_exit(position.symbol, now, realized_pnl_usd=_realized_pnl(position, result))
+            report.exits.append(position.option_id)
 
     # --- 3. MARKET SCAN → FIND SETUP → PAPER ENTRY -----------------------------------
     scan_universe_label = ",".join(settings.scan_universe) or "(empty universe)"
@@ -210,15 +279,44 @@ def run_trading_cycle(
                 )
                 continue
 
-            new_position = _open_paper_position(candidate, settings, execution_gateway, now)
-            if new_position is None:
-                continue
+            order_result = _submit_entry_order(candidate, settings, execution_gateway, now)
 
-            paper_store.add_position(new_position)
-            risk_state.record_trade_opened(new_position.size_usd)
-            entries_this_cycle += 1
-            report.new_entries.append(new_position.option_id)
-            currently_open = currently_open + [new_position]
+            if order_result.status == "simulated_fill":
+                new_position = _position_from_fill(candidate, order_result, now)
+                paper_store.add_position(new_position)
+                risk_state.record_trade_opened(new_position.size_usd)
+                entries_this_cycle += 1
+                report.new_entries.append(new_position.option_id)
+                currently_open = currently_open + [new_position]
+            elif order_result.status == "placed":
+                # live_auto_execute placed a REAL order immediately — no
+                # separate approval step happened. The resulting position
+                # isn't tracked in any local ledger here: it'll show up on
+                # the NEXT cycle via hood_sync's real get_option_positions
+                # read (bot_positions_store already recorded its provenance
+                # inside LiveExecutionGateway._place_pending). Trade-count
+                # bookkeeping happens now, because the trade genuinely did.
+                # currently_open is intentionally not updated with a
+                # synthetic position here — the real sync on the next cycle
+                # is the source of truth, and duplicate/cooldown protection
+                # only needs to prevent a second entry on the SAME symbol
+                # within this same scan loop, which entries_this_cycle
+                # already bounds (MAX_NEW_ENTRIES_PER_CYCLE).
+                risk_size_usd = float(order_result.request.price or 0) * float(order_result.request.quantity) * 100
+                risk_state.record_trade_opened(risk_size_usd)
+                entries_this_cycle += 1
+                report.new_entries.append(candidate.option_id)
+            elif order_result.status == "pending_approval":
+                # Live mode, approval required: no position exists yet —
+                # nothing to add to any ledger and no trade-count/
+                # daily-loss bookkeeping happens here. That's deferred
+                # until confirm_and_place() actually places the order (see
+                # scripts/confirm_pending_order.py), so a proposal that's
+                # never approved never consumes a day's trade slot.
+                entries_this_cycle += 1
+                report.pending_approvals.append(order_result.extra["pending_order_id"])
+            # else: rejected/error — nothing to do; already logged by the
+            # execution gateway itself.
     else:
         skip_reasons = [c.message for c in (trade_count_check, cutoff_check) if not c.passed]
         if settings.max_new_entries_per_cycle <= 0:
@@ -299,9 +397,15 @@ def _underlying_move_pct(bars: tuple[PriceBar, ...]) -> float:
     return (last.close - first.close) / first.close
 
 
-def _open_paper_position(
+def _submit_entry_order(
     candidate: SetupCandidate, settings: Settings, execution_gateway: ExecutionGateway, now: datetime
-) -> OpenPosition | None:
+) -> "object":
+    """Submits a BUY-to-open order for a scanner candidate through whichever
+    gateway this cycle is running with. In paper mode that's always an
+    immediate simulated fill; in live mode it's always a pending approval —
+    see src/execution/gateway.py. Never returns an OpenPosition directly:
+    the caller decides what (if anything) to do with each possible
+    OrderResult.status."""
     leg = OrderLeg(option_id=candidate.option_id, side="buy", position_effect="open", ratio_quantity=1)
     order = OrderRequest(
         account_number=settings.account_number,
@@ -313,11 +417,17 @@ def _open_paper_position(
         market_hours="regular_hours",
         ref_id=new_ref_id(),
         reason=f"BUY: {candidate.thesis.catalyst}",
+        chain_symbol=candidate.underlying_symbol,
+        underlying_type="equity",
     )
-    order_result = execution_gateway.submit_order(order)
-    if order_result.status != "simulated_fill" or order_result.simulated_fill is None:
-        return None
+    return execution_gateway.submit_order(order)
 
+
+def _position_from_fill(candidate: SetupCandidate, order_result, now: datetime) -> OpenPosition:
+    """Builds the paper-ledger OpenPosition from a CONFIRMED simulated
+    fill. Only ever called when order_result.status == "simulated_fill" —
+    see the call site in run_trading_cycle."""
+    assert order_result.simulated_fill is not None
     return OpenPosition(
         symbol=candidate.underlying_symbol,
         option_id=candidate.option_id,

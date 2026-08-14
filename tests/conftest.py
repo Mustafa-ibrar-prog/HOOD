@@ -55,6 +55,25 @@ def live_settings(tmp_path) -> Settings:
 
 
 @pytest.fixture
+def live_confirmed_settings(tmp_path) -> Settings:
+    """Both independent live-trading switches on — the only Settings
+    LiveExecutionGateway will actually construct against."""
+    env = {
+        "TRADING_MODE": "live",
+        "LIVE_TRADING_CONFIRMED": "true",
+        "LOG_DIR": str(tmp_path / "logs"),
+        "DECISION_LOG_FILE": str(tmp_path / "logs" / "decisions.jsonl"),
+        "APP_LOG_FILE": str(tmp_path / "logs" / "app.log"),
+        "RISK_STATE_FILE": str(tmp_path / "logs" / "risk_state.json"),
+        "PAPER_POSITIONS_FILE": str(tmp_path / "logs" / "paper_positions.json"),
+        "PENDING_ORDERS_FILE": str(tmp_path / "logs" / "pending_orders.json"),
+        "LIVE_BOT_POSITIONS_FILE": str(tmp_path / "logs" / "live_bot_positions.json"),
+        "PENDING_ORDER_EXPIRY_MINUTES": "15",
+    }
+    return Settings.from_env(env=env)
+
+
+@pytest.fixture
 def risk_limits(paper_settings) -> RiskLimits:
     return RiskLimits.from_settings(paper_settings)
 

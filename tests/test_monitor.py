@@ -306,3 +306,51 @@ def test_run_once_with_simulate_exit_false_decides_but_never_submits_an_order(
     records = decision_logger.read_all()
     assert any(r["kind"] == "decision" and r["decision"] == "STOP_EXIT" for r in records)  # still logged
     assert not any(r["kind"] == "simulated_order" for r in records)
+
+
+def test_run_once_remembers_peak_price_across_cycles_and_trailing_exits(
+    paper_settings, risk_limits, decision_logger, gateway, tmp_path
+):
+    """A PeakPriceStore gives the trailing-exit engine (evaluator.py) real
+    cross-cycle memory: peaking at $1.05 on one cycle, then pulling back to
+    $1.02 on the NEXT cycle, must trigger a trailing EXIT — the worked
+    example from the requirement, exercised through the monitor rather
+    than the evaluator directly."""
+    from src.market.models import OptionQuote
+    from src.position_manager.peak_tracker import PeakPriceStore
+
+    position = make_position(entry_price=0.95, profit_target_usd=20.0, stop_loss_usd=15.0)
+    peak_store = PeakPriceStore(tmp_path / "peaks.json")
+
+    def _snapshot_at(mid: float):
+        half_spread = 0.02
+        return make_market_snapshot(
+            option=OptionQuote(
+                instrument_id=position.option_id,
+                bid_price=mid - half_spread,
+                ask_price=mid + half_spread,
+                last_trade_price=mid,
+                previous_close=0.90,
+                volume=500,
+                open_interest=1000,
+                as_of=datetime.now(timezone.utc),
+            )
+        )
+
+    monitor = PositionMonitor(
+        settings=paper_settings,
+        market_data=_FakeFreshDataProvider(_snapshot_at(1.05)),
+        evaluator=PositionEvaluator(),
+        risk_manager=RiskManager(risk_limits),
+        decision_logger=decision_logger,
+        execution_gateway=gateway,
+        account_number=paper_settings.account_number,
+        peak_price_store=peak_store,
+    )
+    first = monitor.run_once(position, now=datetime.now(timezone.utc))
+    assert first.decision_result.decision is not Decision.EXIT
+
+    monitor._market_data = _FakeFreshDataProvider(_snapshot_at(1.02))
+    second = monitor.run_once(position, now=datetime.now(timezone.utc))
+    assert second.decision_result.decision is Decision.EXIT
+    assert "Trailing exit" in second.decision_result.reason

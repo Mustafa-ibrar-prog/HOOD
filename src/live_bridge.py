@@ -53,10 +53,37 @@ market hours):
 This is real automation in the sense that matters: every decision is
 computed by the same tested Python logic (evaluator, risk manager,
 strategy, orchestrator) against real, live, just-fetched market data — it
-is not a code-level fake, and it never touches order placement. It is
-agent-mediated rather than a headless daemon, because that is what this
-platform's architecture allows; pretending otherwise would be the "fake
-scheduler" this project was explicitly told not to build.
+is not a code-level fake. In TRADING_MODE=paper it never touches order
+placement at all. It is agent-mediated rather than a headless daemon,
+because that is what this platform's architecture allows; pretending
+otherwise would be the "fake scheduler" this project was explicitly told
+not to build.
+
+THE LIVE-ORDER CONFIRMATION BRIDGE (TRADING_MODE=live only — see
+src/execution/gateway.py's module docstring for the full design):
+
+place_option_order is different from every read-only tool above: it has a
+real, irreversible side effect, so it can't be "recorded ahead of time and
+replayed" the way market data is — it must be called for real, exactly
+once, at the moment a human has actually approved a specific pending order.
+The flow:
+  1. A trading cycle's submit_order() created a PendingLiveOrder (never
+     called place_option_order itself) — see PendingOrderStore.
+  2. A human reviews that specific pending order (symbol, contract, price,
+     reason, quantity, expiry) and explicitly approves or rejects it.
+  3. On approval, the agent reads that pending order's exact parameters
+     (account_number, legs, quantity, type, price, ref_id) and calls the
+     REAL mcp__HOOD__place_option_order tool with those exact parameters —
+     reusing the SAME ref_id (idempotency).
+  4. The agent records that real response with a StaticLiveOrderPlacer and
+     runs scripts/confirm_pending_order.py, which calls
+     LiveExecutionGateway.confirm_and_place() to do the bookkeeping
+     (mark the pending order "placed", update LiveBotPositionsStore,
+     update the daily risk-state trade count, write the audit log) against
+     what actually happened — never fabricating a result.
+On rejection, scripts/reject_pending_order.py calls
+LiveExecutionGateway.reject_pending() instead; no order tool is ever
+called for a rejected proposal.
 """
 
 from __future__ import annotations
@@ -148,3 +175,80 @@ class StaticHoodClient:
                 f"{method}({key!r}) was never recorded on this StaticHoodClient — "
                 "fetch it live and call the matching record_* method first"
             ) from exc
+
+
+class StaticLiveOrderPlacer:
+    """A LiveOrderPlacer (src/execution/live_client.py) built from real
+    tool-call responses the agent already fetched — see this module's
+    "LIVE-ORDER CONFIRMATION BRIDGE" docstring section above.
+
+    Unlike StaticHoodClient, `place_option_order` here does NOT mean "look
+    up a pre-recorded response for these exact arguments" — the real order
+    was already placed for real, for real money, by the agent's own tool
+    call, before this object was even constructed. Calling
+    place_option_order on this class just returns that already-happened
+    result; it never places anything itself. If no result was recorded,
+    it raises rather than silently returning nothing, because a caller
+    (LiveExecutionGateway.confirm_and_place) treats a return value here as
+    proof an order was actually placed.
+    """
+
+    def __init__(self) -> None:
+        self._accounts: dict[str, Any] | None = None
+        self._portfolio: dict[str, dict[str, Any]] = {}
+        self._review_result: dict[str, Any] | None = None
+        self._place_result: dict[str, Any] | None = None
+
+    def record_accounts(self, response: dict[str, Any]) -> None:
+        self._accounts = response
+
+    def record_portfolio(self, account_number: str, response: dict[str, Any]) -> None:
+        self._portfolio[account_number] = response
+
+    def record_review_option_order(self, response: dict[str, Any]) -> None:
+        self._review_result = response
+
+    def record_place_option_order(self, response: dict[str, Any]) -> None:
+        """`response` must be the REAL return value of a REAL
+        place_option_order call the agent already made — never a
+        hand-constructed or guessed value."""
+        self._place_result = response
+
+    # --- LiveOrderPlacer protocol --------------------------------------------------------
+
+    def get_accounts(self) -> dict[str, Any]:
+        if self._accounts is None:
+            raise KeyError("get_accounts() was never recorded — fetch it live and call record_accounts() first")
+        return self._accounts
+
+    def get_portfolio(self, account_number: str) -> dict[str, Any]:
+        try:
+            return self._portfolio[account_number]
+        except KeyError as exc:
+            raise KeyError(
+                f"get_portfolio({account_number!r}) was never recorded — fetch it live and "
+                "call record_portfolio() first"
+            ) from exc
+
+    def review_option_order(self, **kwargs: Any) -> dict[str, Any]:
+        if self._review_result is None:
+            raise KeyError(
+                "review_option_order() was never recorded — fetch it live and call "
+                "record_review_option_order() first"
+            )
+        return self._review_result
+
+    def place_option_order(self, **kwargs: Any) -> dict[str, Any]:
+        if self._place_result is None:
+            raise KeyError(
+                "place_option_order() was never recorded on this StaticLiveOrderPlacer — "
+                "this must be the REAL response from a REAL call the agent already made; "
+                "record it with record_place_option_order() before calling confirm_and_place()"
+            )
+        return self._place_result
+
+    def cancel_option_order(self, account_number: str, order_id: str) -> dict[str, Any]:
+        raise NotImplementedError(
+            "cancel_option_order is not wired to anything in this codebase — see "
+            "LiveExecutionGateway.cancel_order()"
+        )

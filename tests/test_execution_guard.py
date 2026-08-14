@@ -1,8 +1,12 @@
-"""These tests exist to prove one thing above all else: this codebase
-cannot place a real order while TRADING_MODE=paper, and cannot place one at
-all yet regardless of TRADING_MODE, because live execution isn't built."""
+"""These tests exist to prove the core safety property of this codebase:
+place_option_order is never reachable except through
+LiveExecutionGateway._place_pending() (exercised via confirm_and_place() /
+submit_order()'s auto-execute path in tests/test_live_execution.py), and
+PaperExecutionGateway can never place anything real, in any mode."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +18,7 @@ from src.execution.gateway import (
     get_execution_gateway,
 )
 from src.execution.orders import OrderLeg, OrderRequest
+from src.execution.pending import PendingOrderStore
 from src.logging.decision_logger import DecisionLogger
 
 
@@ -68,14 +73,37 @@ def test_paper_gateway_refuses_if_settings_somehow_say_live(live_settings, decis
         gateway.submit_order(sample_order)
 
 
-def test_live_gateway_always_refuses_submit_regardless_of_mode(sample_order):
-    gateway = LiveExecutionGateway()
+def test_live_gateway_refuses_to_construct_without_trading_mode_live(live_confirmed_settings, decision_logger, tmp_path):
+    from dataclasses import replace
+
+    paper_again = replace(live_confirmed_settings, trading_mode="paper")
     with pytest.raises(LiveTradingDisabledError):
-        gateway.submit_order(sample_order)
+        LiveExecutionGateway(paper_again, decision_logger, PendingOrderStore(tmp_path / "pending.json"))
 
 
-def test_live_gateway_always_refuses_cancel():
-    gateway = LiveExecutionGateway()
+def test_live_gateway_refuses_to_construct_without_live_trading_confirmed(live_settings, decision_logger, tmp_path):
+    # live_settings has TRADING_MODE=live but LIVE_TRADING_CONFIRMED is not
+    # set — the second, independent switch must also block construction.
+    with pytest.raises(LiveTradingDisabledError):
+        LiveExecutionGateway(live_settings, decision_logger, PendingOrderStore(tmp_path / "pending.json"))
+
+
+def test_live_gateway_submit_order_never_places_only_creates_pending(
+    live_confirmed_settings, decision_logger, sample_order
+):
+    pending_store = PendingOrderStore(Path(live_confirmed_settings.pending_orders_file))
+    gateway = LiveExecutionGateway(live_confirmed_settings, decision_logger, pending_store)
+    result = gateway.submit_order(sample_order)
+    assert result.status == "pending_approval"
+    assert result.live_fill is None
+    pending = pending_store.get(result.extra["pending_order_id"])
+    assert pending is not None
+    assert pending.status == "awaiting_approval"
+
+
+def test_live_gateway_cancel_order_is_not_implemented(live_confirmed_settings, decision_logger):
+    pending_store = PendingOrderStore(Path(live_confirmed_settings.pending_orders_file))
+    gateway = LiveExecutionGateway(live_confirmed_settings, decision_logger, pending_store)
     with pytest.raises(LiveTradingDisabledError):
         gateway.cancel_order("ACC123", "order-1")
 

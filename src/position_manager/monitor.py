@@ -6,11 +6,12 @@ inside a request/response agent process, which can't reliably fire on a
 wall-clock cadence anyway. Instead:
 
   - `run_once()` performs exactly one evaluate-and-log cycle for one open
-    position, right now — and, for an EXIT/TARGET_EXIT/STOP_EXIT decision,
-    routes a sell-to-close order through the (paper-only) execution
-    gateway. See src/execution/gateway.py: that gateway physically cannot
-    place a real order while TRADING_MODE=paper, so this is always a
-    simulated fill, never a live one.
+    position, right now — and, for an EXIT/TARGET_EXIT/STOP_EXIT decision
+    (when `simulate_exit` is True), routes a sell-to-close order through
+    whichever execution gateway this cycle is running with. See
+    src/execution/gateway.py: in paper mode that's always an immediate
+    simulated fill; in live mode it's always a pending approval — the
+    order is never actually placed here, or anywhere in this module.
   - `is_within_monitoring_window()` tells an external scheduler (a cron
     job, a Routine/trigger, a supervised process — see README.md) whether
     now is a sensible time to call run_once() at all.
@@ -35,6 +36,7 @@ from src.market.errors import MarketDataError
 from src.market.models import MarketSnapshot
 from src.position_manager.evaluator import PositionEvaluator, PositionSnapshot
 from src.position_manager.models import OpenPosition
+from src.position_manager.peak_tracker import PeakPriceStore
 from src.risk.manager import RiskManager
 from src.strategy.decision import EXIT_DECISIONS, POSITION_MONITOR_DECISIONS, Decision, DecisionResult
 
@@ -79,6 +81,7 @@ class PositionMonitor:
         decision_logger: DecisionLogger,
         execution_gateway: ExecutionGateway,
         account_number: str,
+        peak_price_store: PeakPriceStore | None = None,
     ):
         self._settings = settings
         self._market_data = market_data
@@ -87,6 +90,12 @@ class PositionMonitor:
         self._decision_logger = decision_logger
         self._execution_gateway = execution_gateway
         self._account_number = account_number
+        # Cross-cycle memory for the trailing-exit engine (see
+        # evaluator.py). None is accepted for callers that don't need
+        # persisted trailing behavior (most existing tests): peak then
+        # degrades to max(entry_price, this cycle's price) only, which is a
+        # safe same-cycle no-op for the trailing check, never a crash.
+        self._peak_price_store = peak_price_store
 
     def run_once(self, position: OpenPosition, now: datetime, *, simulate_exit: bool = True) -> MonitorResult:
         """Evaluate one open position exactly once: fetch data, score
@@ -95,12 +104,14 @@ class PositionMonitor:
         do anything but simulate while TRADING_MODE=paper).
 
         `simulate_exit=False` decides and logs only, without submitting a
-        simulated closing order — for positions this system is watching
-        but did not itself open (e.g. synced read-only from the real
-        Robinhood account via hood_sync.py). Even with simulate_exit=True
-        the order is never real (see PaperExecutionGateway), but skipping
-        it here keeps the paper order-audit log limited to trades this
-        system's own paper-entry/exit lifecycle actually owns."""
+        closing order at all — for positions this system is watching but
+        does not consider its own to act on (e.g. synced read-only from the
+        real Robinhood account via hood_sync.py and, in live mode, not
+        previously opened by this system — see orchestrator.py's use of
+        LiveBotPositionsStore). With simulate_exit=True, the order still
+        never places a real trade by itself: in paper mode it's a simulated
+        fill (see PaperExecutionGateway); in live mode it's a pending
+        approval awaiting a human (see LiveExecutionGateway)."""
 
         try:
             snapshot_market = self._market_data.get_market_snapshot(position.option_id, position.symbol, now=now)
@@ -149,11 +160,20 @@ class PositionMonitor:
             )
             return MonitorResult(decision_result=result, acted=False)
 
+        option_price = snapshot_market.option.mid_price
+        if self._peak_price_store is not None:
+            peak_price = self._peak_price_store.update_peak(
+                position.option_id, option_price, floor=position.entry_price
+            )
+        else:
+            peak_price = max(position.entry_price, option_price)
+
         position_snapshot = PositionSnapshot(
             position=position,
-            option_price=snapshot_market.option.mid_price,
+            option_price=option_price,
             momentum=_build_momentum_evidence(position, snapshot_market),
             minutes_to_expiration=position.minutes_to_expiration(now),
+            peak_price=peak_price,
         )
         result = self._evaluator.evaluate(position_snapshot)
 
@@ -177,8 +197,20 @@ class PositionMonitor:
             close_order = _build_closing_order(position, snapshot_market, result, self._account_number)
             order_result = self._execution_gateway.submit_order(close_order)
             # submit_order already writes its own audit-log entry (see
-            # PaperExecutionGateway) — nothing further to log here.
-            acted = order_result.status == "simulated_fill"
+            # PaperExecutionGateway / LiveExecutionGateway) — nothing
+            # further to log here. `acted` means "actually filled" — a
+            # live pending_approval is not acted yet, on purpose; see
+            # order_result.status in the returned MonitorResult for the
+            # caller to notice a pending approval exists.
+            acted = order_result.status in ("simulated_fill", "placed")
+
+        if acted and self._peak_price_store is not None:
+            # Position is actually closed — its peak no longer means
+            # anything, and leaving it would misattribute a stale peak to
+            # a future position that happens to reuse the same option_id
+            # (e.g. after expiration/reissue). Not done for a live
+            # "pending_approval" result: nothing has closed yet.
+            self._peak_price_store.remove(position.option_id)
 
         return MonitorResult(decision_result=result, acted=acted, order_result=order_result)
 
