@@ -24,14 +24,14 @@ from their MCP schemas:
   - get_option_chains            <- mcp__HOOD__get_option_chains
   - get_option_instruments       <- mcp__HOOD__get_option_instruments
 
-Response *shapes* (the JSON field names each tool returns) were not
-inspectable from the tool schemas available in this session — those
-schemas describe request parameters, not response payloads. The parsing
-in hood_provider.py documents its assumed response shape at each call
-site and raises a clear HoodToolError if a real response doesn't match
-that shape, rather than guessing at a value. Verify/adjust those assumed
-shapes against a real HOOD MCP response before relying on this in a live
-session.
+Response *shapes* (the JSON field names each tool returns) have been
+VERIFIED against live, read-only calls for all six methods above — SPY as
+the underlying, a SPY $780 call expiring 2026-08-21 as the option contract
+— not guessed. hood_provider.py's parsers document the verified shape at
+each call site and raise a clear HoodToolError if a real response doesn't
+match it, rather than guessing at a value. If Robinhood changes a response
+shape, re-verify with the same kind of live read-only call and update the
+parser + its regression test (tests/test_hood_provider.py) together.
 """
 
 from __future__ import annotations

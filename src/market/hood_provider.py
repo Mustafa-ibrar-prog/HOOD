@@ -2,6 +2,12 @@
 injected HoodToolClient — see hood_client.py for why this is a seam rather
 than a direct import).
 
+Response shapes below were VERIFIED against live, read-only calls (SPY
+underlying; a SPY $780 call expiring 2026-08-21 for the option contract)
+made during development of this module — not guessed. Every HOOD read-only
+tool used here wraps its payload as {"data": {...}, "guide": "..."}; the
+inner shape differs per tool and is documented at each parser below.
+
 Design decisions worth knowing:
 
 - Quotes are CRITICAL. If get_equity_quotes or get_option_quotes fails, or
@@ -18,19 +24,21 @@ Design decisions worth knowing:
   rather than aborting the whole snapshot. Downstream, an empty bar list
   naturally flows into MomentumEvidence as missing indicator data, which
   strategy/evidence.py already treats as INSUFFICIENT_DATA — a safe HOLD,
-  never a guess.
+  never a guess. Confirmed live: option bars carry NO volume field at all
+  (per that tool's own guide text) — this provider defaults a bar's volume
+  to 0 in that case rather than fabricating a number; volume_ratio is only
+  ever computed from underlying (equity) bars, which do carry volume.
 
 - RSI/MACD/EMA/VWAP are computed LOCALLY from the fetched OHLCV bars,
   using the same tested functions in market/indicators.py, rather than by
-  calling mcp__HOOD__get_equity_technical_indicators. This was a deliberate
-  choice: that tool's *response* shape wasn't inspectable in this session
-  (only its request parameters were), so parsing it would mean guessing at
-  field names for numbers that directly drive exit decisions. Computing
-  from real, fetched OHLCV bars is still genuine data (never fabricated),
-  reuses code that already has its own indicator tests, and avoids that
-  risk. Swapping in get_equity_technical_indicators as the primary source
-  (falling back to local computation on failure) is a reasonable future
-  enhancement once its response shape is confirmed against a live call.
+  calling mcp__HOOD__get_equity_technical_indicators. That tool's response
+  shape has still not been verified in this codebase (only the six tools
+  this module actually calls have been) — computing from real, fetched
+  OHLCV bars is still genuine data (never fabricated) and reuses code that
+  already has its own indicator tests. Swapping in
+  get_equity_technical_indicators as the primary source (falling back to
+  local computation on failure) remains a reasonable future enhancement
+  once its response shape is verified the same way this module's tools were.
 
 - "Incomplete candle data": bars the tool marks `interpolated=True` were
   synthesized to fill a gap and carry no new information (per
@@ -44,6 +52,18 @@ Design decisions worth knowing:
   informational only. It does not change the risk manager's staleness
   math (Settings.stale_data_max_seconds / RiskManager.check_data_freshness
   are unchanged, per the task's "keep existing risk controls unchanged").
+
+- Freshness uses the tools' OWN timestamps, not just "when we called the
+  API". get_equity_quotes returns venue_last_trade_time (and
+  venue_last_non_reg_trade_time); get_option_quotes returns updated_at.
+  Each quote's `as_of` is set from that real timestamp — picking, for the
+  equity quote, whichever of the regular/non-regular trade timestamps is
+  actually more recent (matching that tool's own documented guidance) —
+  rather than the wall-clock time of our fetch. MarketSnapshot.fetched_at
+  is then the OLDEST (most conservative) of: our own fetch time, the
+  underlying quote's as_of, and the option quote's as_of, so a quote that
+  Robinhood itself hasn't refreshed recently is correctly flagged as stale
+  even if our own tool call just returned quickly.
 """
 
 from __future__ import annotations
@@ -123,6 +143,10 @@ class HoodMarketDataProvider(MarketDataProvider):
         vwap_value = indicators.vwap(underlying_bars) if underlying_bars else None
         volume_ratio = _compute_volume_ratio(underlying_bars)
 
+        # Conservative (oldest) of: our fetch time, and each quote's own
+        # reported timestamp — see module docstring "Freshness" note.
+        fetched_at = min(now, underlying_quote.as_of, option_quote.as_of)
+
         return MarketSnapshot(
             option=option_quote,
             underlying=underlying_quote,
@@ -136,7 +160,7 @@ class HoodMarketDataProvider(MarketDataProvider):
             ema_slow=_nth_from_end(ema_slow_series, 1),
             vwap=vwap_value,
             volume_ratio=volume_ratio,
-            fetched_at=now,
+            fetched_at=fetched_at,
         )
 
     def get_option_chain_candidates(self, underlying_symbol: str, **filters: Any) -> list[dict[str, Any]]:
@@ -145,7 +169,8 @@ class HoodMarketDataProvider(MarketDataProvider):
         except Exception as exc:  # noqa: BLE001 - normalize any client failure
             raise HoodToolError(f"get_option_chains failed for {underlying_symbol}: {exc}") from exc
 
-        chains = chains_response.get("chains") or []
+        chains_data = _unwrap_data(chains_response, "get_option_chains")
+        chains = chains_data.get("chains") or []
         if not chains:
             self._logger.warning("No option chain found for %s", underlying_symbol)
             return []
@@ -160,7 +185,12 @@ class HoodMarketDataProvider(MarketDataProvider):
             except Exception as exc:  # noqa: BLE001
                 self._logger.warning("get_option_instruments failed for chain %s (%s): %s", chain_id, underlying_symbol, exc)
                 continue
-            candidates.extend(instruments_response.get("instruments") or [])
+            try:
+                instruments_data = _unwrap_data(instruments_response, "get_option_instruments")
+            except HoodToolError as exc:
+                self._logger.warning("Could not parse get_option_instruments response for chain %s: %s", chain_id, exc)
+                continue
+            candidates.extend(instruments_data.get("instruments") or [])
         return candidates
 
     # --- Internal fetch helpers -----------------------------------------------------------
@@ -188,7 +218,7 @@ class HoodMarketDataProvider(MarketDataProvider):
             self._logger.warning("get_equity_historicals failed for %s: %s; continuing without underlying bars", symbol, exc)
             return []
         try:
-            bars = _parse_bars(response)
+            bars = _parse_bars(response, "get_equity_historicals")
         except HoodToolError as exc:
             self._logger.warning("Could not parse equity bars for %s: %s; continuing without underlying bars", symbol, exc)
             return []
@@ -203,7 +233,7 @@ class HoodMarketDataProvider(MarketDataProvider):
             self._logger.warning("get_option_historicals failed for %s: %s; continuing without option bars", option_id, exc)
             return []
         try:
-            bars = _parse_bars(response)
+            bars = _parse_bars(response, "get_option_historicals")
         except HoodToolError as exc:
             self._logger.warning("Could not parse option bars for %s: %s; continuing without option bars", option_id, exc)
             return []
@@ -212,52 +242,135 @@ class HoodMarketDataProvider(MarketDataProvider):
 
 # --- Parsing helpers ----------------------------------------------------------------------
 #
-# Assumed response shapes are documented at each parser below. They are the
-# best-effort interpretation of each tool's documented behavior (only
-# request schemas were inspectable in this session) — verify against a real
-# response before depending on this in a live session. A shape mismatch
-# raises a clear HoodToolError rather than silently fabricating a value.
+# Shapes documented at each parser were verified against real, read-only
+# HOOD MCP responses (see module docstring). A shape mismatch raises a
+# clear HoodToolError rather than silently fabricating a value.
+
+
+def _unwrap_data(response: Any, context: str) -> dict[str, Any]:
+    """Every HOOD read-only tool used here wraps its payload as
+    {"data": {...}, "guide": "..."} — confirmed for get_equity_quotes,
+    get_equity_historicals, get_option_chains, get_option_instruments,
+    get_option_quotes, and get_option_historicals."""
+    if not isinstance(response, dict) or not isinstance(response.get("data"), dict):
+        raise HoodToolError(f"{context}: expected a top-level 'data' object, got {type(response).__name__}")
+    return response["data"]
+
+
+def _pick_most_recent_price(*candidates: tuple[Any, Any]) -> tuple[float | None, datetime | None]:
+    """Each candidate is (price, timestamp). Returns the price paired with
+    the latest parseable timestamp — matching get_equity_quotes' own
+    guidance to prefer whichever of last_trade_price /
+    last_non_reg_trade_price is actually more recent. Candidates missing
+    either a parseable price or timestamp are ignored, not guessed."""
+    best_price: float | None = None
+    best_time: datetime | None = None
+    for price_raw, ts_raw in candidates:
+        price = _to_float(price_raw)
+        ts = _parse_datetime(ts_raw)
+        if price is None or ts is None:
+            continue
+        if best_time is None or ts > best_time:
+            best_price, best_time = price, ts
+    return best_price, best_time
 
 
 def _parse_equity_quote(response: dict[str, Any], symbol: str) -> EquityQuote:
-    """Assumed shape: {"quotes": [{"symbol": "...", "last_trade_price": ...,
-    "previous_close": ...}, ...], "closes_error": ...}."""
-    quotes = response.get("quotes") if isinstance(response, dict) else None
-    if not quotes:
+    """Verified shape (get_equity_quotes):
+    {"data": {"results": [{
+        "quote": {"symbol", "last_trade_price", "venue_last_trade_time",
+                  "last_non_reg_trade_price", "venue_last_non_reg_trade_time",
+                  "previous_close", "adjusted_previous_close",
+                  "bid_price", "ask_price", "has_traded", "state", ...},
+        "close": {"price", "date", "interpolated", "source", ...}
+    }, ...]}}.
+    """
+    data = _unwrap_data(response, "get_equity_quotes")
+    results = data.get("results") or []
+    row = next(
+        (r for r in results if str((r.get("quote") or {}).get("symbol", "")).upper() == symbol.upper()),
+        results[0] if results else None,
+    )
+    if row is None:
         raise QuoteUnavailableError(f"No quote returned for {symbol}")
 
-    row = next((q for q in quotes if str(q.get("symbol", "")).upper() == symbol.upper()), quotes[0])
+    quote = row.get("quote") or {}
+    close = row.get("close")
+
+    state = quote.get("state")
+    if quote.get("has_traded") is False or state not in (None, "active"):
+        raise QuoteUnavailableError(
+            f"Quote for {symbol} is not usable (has_traded={quote.get('has_traded')!r}, state={state!r})"
+        )
+
     try:
-        last = _to_float(row.get("last_trade_price"))
-        previous_close = _to_float(row.get("previous_close"))
+        last_price, as_of = _pick_most_recent_price(
+            (quote.get("last_trade_price"), quote.get("venue_last_trade_time")),
+            (quote.get("last_non_reg_trade_price"), quote.get("venue_last_non_reg_trade_time")),
+        )
+        previous_close = _to_float(close.get("price")) if close else None
+        if previous_close is None:
+            previous_close = _to_float(quote.get("previous_close"))
+            if previous_close is None:
+                previous_close = _to_float(quote.get("adjusted_previous_close"))
     except (TypeError, ValueError) as exc:
         raise HoodToolError(f"Could not parse equity quote for {symbol}: {exc}") from exc
 
-    if last is None:
-        raise QuoteUnavailableError(f"Quote for {symbol} has no last_trade_price")
+    if last_price is None:
+        raise QuoteUnavailableError(f"Quote for {symbol} has no usable last-trade price/timestamp")
 
     try:
-        return EquityQuote(symbol=symbol, last_trade_price=last, previous_close=previous_close, as_of=datetime.now(timezone.utc))
+        return EquityQuote(
+            symbol=symbol,
+            last_trade_price=last_price,
+            previous_close=previous_close,
+            as_of=as_of or datetime.now(timezone.utc),
+        )
     except ValueError as exc:
         raise InvalidQuoteError(f"Equity quote for {symbol} failed validation: {exc}") from exc
 
 
 def _parse_option_quote(response: dict[str, Any], option_id: str) -> OptionQuote:
-    """Assumed shape: {"quotes": [{"instrument_id": "...", "bid_price": ...,
-    "ask_price": ..., "last_trade_price": ..., "previous_close": ...,
-    "volume": ..., "open_interest": ...}, ...], "closes_error": ...}."""
-    quotes = response.get("quotes") if isinstance(response, dict) else None
-    if not quotes:
+    """Verified shape (get_option_quotes):
+    {"data": {"results": [{
+        "quote": {"instrument_id", "bid_price", "ask_price", "mark_price",
+                  "adjusted_mark_price", "previous_close_price",
+                  "previous_close_date", "volume", "open_interest",
+                  "updated_at", "implied_volatility", "delta", ...},
+        "close": {"price", "date", "interpolated", "source", ...}
+    }, ...]}}.
+
+    Options have no "last_trade_price" field at all — mark_price is the
+    tool's own documented "current price" (its guide text says so
+    explicitly). It is stored in OptionQuote.last_trade_price, the closest
+    existing field for "the current reference price" — PositionEvaluator
+    itself uses OptionQuote.mid_price (bid/ask average), not this field,
+    for P&L math.
+    """
+    data = _unwrap_data(response, "get_option_quotes")
+    results = data.get("results") or []
+    row = next(
+        (r for r in results if (r.get("quote") or {}).get("instrument_id") == option_id),
+        results[0] if results else None,
+    )
+    if row is None:
         raise OptionContractNotFoundError(f"No quote returned for option contract {option_id}")
 
-    row = next((q for q in quotes if str(q.get("instrument_id", "")) == option_id), quotes[0])
+    quote = row.get("quote") or {}
+    close = row.get("close")
+
     try:
-        bid = _to_float(row.get("bid_price"))
-        ask = _to_float(row.get("ask_price"))
-        last = _to_float(row.get("last_trade_price"))
-        previous_close = _to_float(row.get("previous_close"))
-        volume = _to_int(row.get("volume"))
-        open_interest = _to_int(row.get("open_interest"))
+        bid = _to_float(quote.get("bid_price"))
+        ask = _to_float(quote.get("ask_price"))
+        mark = _to_float(quote.get("mark_price"))
+        if mark is None:
+            mark = _to_float(quote.get("adjusted_mark_price"))
+        previous_close = _to_float(quote.get("previous_close_price"))
+        if previous_close is None and close:
+            previous_close = _to_float(close.get("price"))
+        volume = _to_int(quote.get("volume"))
+        open_interest = _to_int(quote.get("open_interest"))
+        as_of = _parse_datetime(quote.get("updated_at"))
     except (TypeError, ValueError) as exc:
         raise HoodToolError(f"Could not parse option quote for {option_id}: {exc}") from exc
 
@@ -269,54 +382,52 @@ def _parse_option_quote(response: dict[str, Any], option_id: str) -> OptionQuote
             instrument_id=option_id,
             bid_price=bid,
             ask_price=ask,
-            last_trade_price=last,
+            last_trade_price=mark,
             previous_close=previous_close,
             volume=volume,
             open_interest=open_interest,
-            as_of=datetime.now(timezone.utc),
+            as_of=as_of or datetime.now(timezone.utc),
         )
     except ValueError as exc:
         raise InvalidQuoteError(f"Option quote for {option_id} failed validation: {exc}") from exc
 
 
-def _parse_bars(response: dict[str, Any]) -> list[PriceBar]:
-    """Assumed shape: {"bars": [{"start_time"|"begins_at": ..., "open": ...,
-    "high": ..., "low": ..., "close": ..., "volume": ..., "interpolated":
-    bool}, ...]}, or {"results": [{"symbol"|"instrument_id": ..., "bars":
-    [...]}]} for the multi-symbol variant (this provider only ever
-    requests one symbol/instrument at a time, so the first result is used).
+def _parse_bars(response: dict[str, Any], context: str) -> list[PriceBar]:
+    """Verified shape (get_equity_historicals / get_option_historicals):
+    {"data": {"results": [{
+        "symbol" | "instrument_id": ..., "interval", "bounds",
+        "bars": [{"begins_at", "open_price", "high_price", "low_price",
+                  "close_price", "volume" (equity bars only — option bars
+                  carry no volume field at all), "interpolated" (omitted
+                  when false), "session"}, ...]
+    }]}}. This provider only ever requests one symbol/instrument at a
+    time, so the first result is used.
 
     Individual unusable rows (missing OHLC, unparseable timestamp, or a
     high<low violation) are skipped rather than failing the whole fetch —
     that is the "incomplete candle data" handling for malformed rows; a
     fully unparseable *response* still raises HoodToolError.
     """
-    if not isinstance(response, dict):
-        raise HoodToolError(f"Expected a dict response for historicals, got {type(response).__name__}")
-
-    raw_bars = response.get("bars")
-    if raw_bars is None:
-        results = response.get("results") or []
-        raw_bars = results[0].get("bars", []) if results else []
-
+    data = _unwrap_data(response, context)
+    results = data.get("results") or []
+    raw_bars = results[0].get("bars") if results else []
     if not isinstance(raw_bars, list):
-        raise HoodToolError(f"Expected a list of bars, got {type(raw_bars).__name__}")
+        raise HoodToolError(f"{context}: expected a list of bars, got {type(raw_bars).__name__}")
 
     bars: list[PriceBar] = []
     for raw in raw_bars:
         if not isinstance(raw, dict):
             continue  # an unusable row — skip it, don't fabricate a value
 
-        start_raw = raw.get("start_time") or raw.get("begins_at") or raw.get("timestamp")
-        start_time = _parse_datetime(start_raw)
+        start_time = _parse_datetime(raw.get("begins_at"))
         try:
-            open_ = _to_float(raw.get("open"))
-            high = _to_float(raw.get("high"))
-            low = _to_float(raw.get("low"))
-            close = _to_float(raw.get("close"))
-            volume = _to_int(raw.get("volume")) or 0
+            open_ = _to_float(raw.get("open_price"))
+            high = _to_float(raw.get("high_price"))
+            low = _to_float(raw.get("low_price"))
+            close = _to_float(raw.get("close_price"))
+            volume = _to_int(raw.get("volume")) or 0  # absent entirely on option bars
         except (TypeError, ValueError) as exc:
-            raise HoodToolError(f"Could not parse a price bar: {exc}") from exc
+            raise HoodToolError(f"{context}: could not parse a price bar: {exc}") from exc
 
         if start_time is None or None in (open_, high, low, close):
             continue  # missing data on this row — skip it, don't fabricate a value
