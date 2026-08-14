@@ -25,6 +25,7 @@ from src.config.settings import Settings
 from src.execution.gateway import ExecutionGateway
 from src.logging.decision_logger import DecisionLogger
 from src.market.data_provider import MarketDataProvider
+from src.market.errors import MarketDataError
 from src.position_manager.evaluator import PositionEvaluator, PositionSnapshot
 from src.position_manager.models import OpenPosition
 from src.risk.manager import RiskManager
@@ -71,8 +72,13 @@ class PositionMonitor:
         do anything but simulate while TRADING_MODE=paper)."""
 
         try:
-            snapshot_market = self._market_data.get_market_snapshot(position.option_id, position.symbol)
-        except NotImplementedError as exc:
+            snapshot_market = self._market_data.get_market_snapshot(position.option_id, position.symbol, now=now)
+        except (NotImplementedError, MarketDataError) as exc:
+            # NotImplementedError: no provider wired up at all (e.g. the
+            # NotConfiguredMarketDataProvider default). MarketDataError: a
+            # real provider was wired up and a fetch was attempted, but
+            # critical data (a quote) was unavailable, invalid, or the tool
+            # call itself failed. Either way: hold, don't act blind.
             result = DecisionResult(
                 decision=Decision.HOLD,
                 reason=f"No market data available this cycle ({exc}); holding rather than acting blind",

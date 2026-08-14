@@ -18,7 +18,7 @@ class _FakeFreshDataProvider(MarketDataProvider):
     def __init__(self, snapshot):
         self._snapshot = snapshot
 
-    def get_market_snapshot(self, option_id, underlying_symbol):
+    def get_market_snapshot(self, option_id, underlying_symbol, now=None):
         return self._snapshot
 
     def get_option_chain_candidates(self, underlying_symbol, **filters):
