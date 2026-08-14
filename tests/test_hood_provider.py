@@ -125,6 +125,7 @@ class FakeHoodToolClient:
         option_bars=None,
         chains=None,
         instruments=None,
+        instrument_pages=None,
         raise_on=None,
     ):
         self.equity_quote_rows = equity_quote_rows
@@ -133,8 +134,10 @@ class FakeHoodToolClient:
         self.option_bars = option_bars if option_bars is not None else []
         self.chains = chains if chains is not None else []
         self.instruments = instruments if instruments is not None else []
+        self.instrument_pages = instrument_pages  # list[list[dict]]; overrides `instruments` when set
         self.raise_on = raise_on or set()
         self.calls: list[str] = []
+        self.instrument_cursors_requested: list[str | None] = []
 
     def _maybe_raise(self, name):
         self.calls.append(name)
@@ -163,7 +166,15 @@ class FakeHoodToolClient:
 
     def get_option_instruments(self, chain_symbol=None, chain_id=None, ids=None, expiration_dates=None, strike_price=None, type=None, state=None, tradability=None, cursor=None):
         self._maybe_raise("get_option_instruments")
-        return {"data": {"instruments": self.instruments}, "guide": "..."}
+        self.instrument_cursors_requested.append(cursor)
+        if self.instrument_pages is not None:
+            page_index = int(cursor) if cursor else 0
+            page = self.instrument_pages[page_index] if page_index < len(self.instrument_pages) else []
+            next_url = None
+            if page_index + 1 < len(self.instrument_pages):
+                next_url = f"http://example.test/options/instruments/?chain_id={chain_id}&cursor={page_index + 1}"
+            return {"data": {"instruments": page, "next": next_url}, "guide": "..."}
+        return {"data": {"instruments": self.instruments, "next": None}, "guide": "..."}
 
 
 def _happy_client(now: datetime, **overrides) -> FakeHoodToolClient:
@@ -218,6 +229,16 @@ def test_happy_path_assembles_full_snapshot(paper_settings, now):
     assert snapshot.vwap is not None
     assert snapshot.volume_ratio is not None
     assert snapshot.fetched_at <= now  # conservative: quote-timestamp-derived, never later than fetch
+
+
+def test_naive_now_is_treated_as_utc_instead_of_crashing(paper_settings, now):
+    """A caller-supplied naive datetime must not blow up the min() comparison
+    against tz-aware quote timestamps."""
+    client = _happy_client(now)
+    provider = HoodMarketDataProvider(client, paper_settings)
+    naive_now = now.replace(tzinfo=None)
+    snapshot = provider.get_market_snapshot(OPTION_ID, UNDERLYING, now=naive_now)
+    assert snapshot.fetched_at.tzinfo is not None
 
 
 def test_calls_only_read_only_tools_never_order_tools(paper_settings, now):
@@ -453,3 +474,47 @@ def test_option_chain_candidates_skips_chain_on_instruments_tool_error(paper_set
     )
     provider = HoodMarketDataProvider(client, paper_settings)
     assert provider.get_option_chain_candidates("AAPL") == []
+
+
+def test_option_chain_candidates_follows_pagination_across_pages(paper_settings, now):
+    """Verified live: a broad get_option_instruments query returns a "next"
+    URL when more contracts remain. Reading only the first page would
+    silently drop most of a liquid underlying's chain."""
+    page_1 = [{"id": f"opt-{i}", "strike_price": f"{i}.0000"} for i in range(50)]
+    page_2 = [{"id": f"opt-{i}", "strike_price": f"{i}.0000"} for i in range(50, 75)]
+    client = _happy_client(
+        now,
+        chains=[{"id": "chain-1", "symbol": "AAPL"}],
+        instrument_pages=[page_1, page_2],
+    )
+    provider = HoodMarketDataProvider(client, paper_settings)
+
+    candidates = provider.get_option_chain_candidates("AAPL")
+
+    assert len(candidates) == 75
+    assert client.instrument_cursors_requested == [None, "1"]  # first page, then followed the cursor
+
+
+def test_option_chain_candidates_stops_at_max_pages_safety_cap(paper_settings, now):
+    pages = [[{"id": f"opt-{page}"}] for page in range(10)]  # far more pages than the cap
+    client = _happy_client(now, chains=[{"id": "chain-1", "symbol": "AAPL"}], instrument_pages=pages)
+    provider = HoodMarketDataProvider(client, paper_settings)
+    provider._MAX_INSTRUMENT_PAGES = 3  # instance override, avoids constructing 25+ pages in a test
+
+    candidates = provider.get_option_chain_candidates("AAPL")
+
+    assert len(candidates) == 3
+    assert len(client.instrument_cursors_requested) == 3
+
+
+def test_option_chain_candidates_single_page_response_stops_immediately(paper_settings, now):
+    """The common case (no "next", or next=None) must not loop at all."""
+    client = _happy_client(
+        now,
+        chains=[{"id": "chain-1", "symbol": "AAPL"}],
+        instruments=[{"id": "opt-a"}],
+    )
+    provider = HoodMarketDataProvider(client, paper_settings)
+    candidates = provider.get_option_chain_candidates("AAPL")
+    assert candidates == [{"id": "opt-a"}]
+    assert client.instrument_cursors_requested == [None]

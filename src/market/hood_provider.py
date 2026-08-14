@@ -63,7 +63,31 @@ Design decisions worth knowing:
   is then the OLDEST (most conservative) of: our own fetch time, the
   underlying quote's as_of, and the option quote's as_of, so a quote that
   Robinhood itself hasn't refreshed recently is correctly flagged as stale
-  even if our own tool call just returned quickly.
+  even if our own tool call just returned quickly. A naive (tz-less) `now`
+  passed in is treated as UTC rather than crashing that comparison.
+
+- An unresolved symbol/instrument_id is silently OMITTED from a response's
+  results — confirmed live by requesting a real symbol/contract alongside
+  a deliberately invalid one; the invalid one simply doesn't appear, there
+  is no null/error placeholder for it. The quote parsers therefore never
+  fall back to "just use whatever row came back": a row must actually
+  match the requested symbol/instrument_id, or the request is treated as
+  unavailable. (An earlier version of this module *did* fall back to the
+  first row when nothing matched, which — proven by this same live check —
+  would have silently handed back a different symbol's price mislabeled
+  as the requested one's.) Historicals calls surface the same situation
+  differently: an unresolved instrument_id is listed in a top-level
+  "not_found" array (confirmed live) rather than omitted silently; this
+  provider logs it for diagnostics even though it still degrades to an
+  empty (supplementary) bar list either way.
+
+- get_option_instruments paginates (confirmed live: a broad, unfiltered
+  query against SPY's chain did not fit on one page) via a "next" URL
+  containing a `cursor` query parameter. get_option_chain_candidates()
+  follows it to completion (capped at _MAX_INSTRUMENT_PAGES pages, with a
+  warning if the cap is hit) rather than silently returning only the
+  first page, which would otherwise under-report a liquid underlying's
+  chain with no signal that anything was missing.
 """
 
 from __future__ import annotations
@@ -71,6 +95,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from logging import Logger
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from src.config.constants import TRADING_WEEKDAYS
@@ -116,6 +141,12 @@ class HoodMarketDataProvider(MarketDataProvider):
         self, option_id: str, underlying_symbol: str, now: datetime | None = None
     ) -> MarketSnapshot:
         now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            # Defensive: a naive `now` would otherwise raise TypeError when
+            # compared against the tz-aware quote timestamps below (min()
+            # can't mix naive and aware datetimes). Treat naive as UTC,
+            # matching MarketSnapshot.data_age_seconds' own convention.
+            now = now.replace(tzinfo=timezone.utc)
 
         if not _is_regular_market_hours(now, self._settings):
             self._logger.warning(
@@ -180,18 +211,53 @@ class HoodMarketDataProvider(MarketDataProvider):
             chain_id = chain.get("id")
             if not chain_id:
                 continue
+            candidates.extend(self._fetch_all_instruments(chain_id, underlying_symbol, filters))
+        return candidates
+
+    # Safety cap on pagination so a malformed/looping cursor can't spin
+    # forever — SPY's front-week $1-wide chain alone is >10 pages.
+    _MAX_INSTRUMENT_PAGES = 25
+
+    def _fetch_all_instruments(self, chain_id: str, underlying_symbol: str, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        """Follows get_option_instruments' pagination to completion.
+
+        Verified live: a broad query (no strike filter) returns a top-level
+        "next" field — a full URL containing a `cursor` query parameter —
+        whenever more contracts remain; it is None/absent on the last page.
+        The previous implementation read only the first page, which for a
+        liquid underlying like SPY silently dropped most of the chain with
+        no signal that anything was missing.
+        """
+        call_filters = {k: v for k, v in filters.items() if k != "cursor"}  # we manage cursor ourselves
+        instruments: list[dict[str, Any]] = []
+        cursor: str | None = None
+
+        for page in range(1, self._MAX_INSTRUMENT_PAGES + 1):
             try:
-                instruments_response = self._client.get_option_instruments(chain_id=chain_id, **filters)
+                response = self._client.get_option_instruments(chain_id=chain_id, cursor=cursor, **call_filters)
             except Exception as exc:  # noqa: BLE001
                 self._logger.warning("get_option_instruments failed for chain %s (%s): %s", chain_id, underlying_symbol, exc)
-                continue
+                break
             try:
-                instruments_data = _unwrap_data(instruments_response, "get_option_instruments")
+                data = _unwrap_data(response, "get_option_instruments")
             except HoodToolError as exc:
                 self._logger.warning("Could not parse get_option_instruments response for chain %s: %s", chain_id, exc)
-                continue
-            candidates.extend(instruments_data.get("instruments") or [])
-        return candidates
+                break
+
+            instruments.extend(data.get("instruments") or [])
+            cursor = _extract_cursor(data.get("next"))
+            if cursor is None:
+                break
+            if page == self._MAX_INSTRUMENT_PAGES:
+                self._logger.warning(
+                    "Stopped paginating get_option_instruments for chain %s after %d pages; "
+                    "more contracts may exist (%d collected so far)",
+                    chain_id,
+                    page,
+                    len(instruments),
+                )
+
+        return instruments
 
     # --- Internal fetch helpers -----------------------------------------------------------
 
@@ -222,6 +288,7 @@ class HoodMarketDataProvider(MarketDataProvider):
         except HoodToolError as exc:
             self._logger.warning("Could not parse equity bars for %s: %s; continuing without underlying bars", symbol, exc)
             return []
+        _warn_if_not_found(response, self._logger, f"get_equity_historicals ({symbol})")
         return _drop_interpolated(bars, self._logger, f"equity bars for {symbol}")
 
     def _fetch_option_bars(self, option_id: str, start_time: str, end_time: str) -> list[PriceBar]:
@@ -237,6 +304,7 @@ class HoodMarketDataProvider(MarketDataProvider):
         except HoodToolError as exc:
             self._logger.warning("Could not parse option bars for %s: %s; continuing without option bars", option_id, exc)
             return []
+        _warn_if_not_found(response, self._logger, f"get_option_historicals ({option_id})")
         return _drop_interpolated(bars, self._logger, f"option bars for {option_id}")
 
 
@@ -245,6 +313,21 @@ class HoodMarketDataProvider(MarketDataProvider):
 # Shapes documented at each parser were verified against real, read-only
 # HOOD MCP responses (see module docstring). A shape mismatch raises a
 # clear HoodToolError rather than silently fabricating a value.
+
+
+def _extract_cursor(next_url: Any) -> str | None:
+    """Verified live shape: get_option_instruments' "next" field, when
+    present, is a full URL whose query string contains a `cursor` param —
+    e.g. "...?chain_id=...&cursor=cD02OTEuMDAwMA%3D%3D&...". Returns None
+    for anything else (absent, null, unparseable, or no cursor param)."""
+    if not next_url or not isinstance(next_url, str):
+        return None
+    try:
+        query = urlsplit(next_url).query
+    except ValueError:
+        return None
+    values = parse_qs(query).get("cursor")
+    return values[0] if values else None
 
 
 def _unwrap_data(response: Any, context: str) -> dict[str, Any]:
@@ -287,10 +370,13 @@ def _parse_equity_quote(response: dict[str, Any], symbol: str) -> EquityQuote:
     """
     data = _unwrap_data(response, "get_equity_quotes")
     results = data.get("results") or []
-    row = next(
-        (r for r in results if str((r.get("quote") or {}).get("symbol", "")).upper() == symbol.upper()),
-        results[0] if results else None,
-    )
+    # Confirmed live: a symbol the API can't resolve is silently OMITTED
+    # from results entirely (no null/error placeholder) — it does not come
+    # back at all, even alongside other symbols that did resolve. Falling
+    # back to "just use whatever row is there" would silently hand back a
+    # different symbol's quote mislabeled as this one's, so a request for
+    # `symbol` is unavailable unless a row actually matches it.
+    row = next((r for r in results if str((r.get("quote") or {}).get("symbol", "")).upper() == symbol.upper()), None)
     if row is None:
         raise QuoteUnavailableError(f"No quote returned for {symbol}")
 
@@ -349,10 +435,13 @@ def _parse_option_quote(response: dict[str, Any], option_id: str) -> OptionQuote
     """
     data = _unwrap_data(response, "get_option_quotes")
     results = data.get("results") or []
-    row = next(
-        (r for r in results if (r.get("quote") or {}).get("instrument_id") == option_id),
-        results[0] if results else None,
-    )
+    # Same reasoning as _parse_equity_quote: an instrument_id the API can't
+    # resolve is silently omitted from results, not returned as an error
+    # entry — confirmed live by requesting a real contract alongside a
+    # deliberately invalid UUID (only the real one came back). No
+    # results[0] fallback: that would silently return a different
+    # contract's quote mislabeled as this one's.
+    row = next((r for r in results if (r.get("quote") or {}).get("instrument_id") == option_id), None)
     if row is None:
         raise OptionContractNotFoundError(f"No quote returned for option contract {option_id}")
 
@@ -459,6 +548,19 @@ def _drop_interpolated(bars: list[PriceBar], logger: Logger, label: str) -> list
     if dropped:
         logger.warning("%s: dropped %d interpolated (gap-filled) bar(s) out of %d", label, dropped, len(bars))
     return real_bars
+
+
+def _warn_if_not_found(response: Any, logger: Logger, label: str) -> None:
+    """Confirmed live: a requested instrument_id/symbol the historicals
+    tools can't resolve is listed in a top-level "not_found" array rather
+    than raising an error — surfacing it here distinguishes "this contract
+    doesn't exist" from "this contract exists but has no bars in range",
+    both of which otherwise look identical (an empty bar list)."""
+    if not isinstance(response, dict):
+        return
+    not_found = response.get("data", {}).get("not_found") if isinstance(response.get("data"), dict) else None
+    if not_found:
+        logger.warning("%s: not resolved by upstream (not_found=%s)", label, not_found)
 
 
 def _to_float(value: Any) -> float | None:
