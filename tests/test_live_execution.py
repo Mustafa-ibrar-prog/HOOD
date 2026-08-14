@@ -209,6 +209,103 @@ def test_preflight_fails_when_buying_power_below_max_position_size():
     assert any("buying_power" in f for f in result.failures)
 
 
+# --- Regression tests using REAL captured response shapes (verified live, ---
+# --- 2026-08-14, account 987155785) — get_accounts/get_portfolio wrap ------
+# --- their payload in "data", and buying_power is a NESTED object, not a --
+# --- flat value; an earlier version of this module guessed wrong on both. -
+
+
+_REAL_ACCOUNTS_RESPONSE = {
+    "data": {
+        "accounts": [
+            {
+                "account_number": "926045832",
+                "type": "margin",
+                "brokerage_account_type": "individual",
+                "is_default": True,
+                "agentic_allowed": False,
+                "option_level": "option_level_2",
+                "state": "active",
+                "deactivated": False,
+                "permanently_deactivated": False,
+            },
+            {
+                "account_number": "595851775",
+                "type": "cash",
+                "brokerage_account_type": "ira_roth",
+                "is_default": False,
+                "agentic_allowed": False,
+                "option_level": "",
+                "state": "active",
+                "deactivated": False,
+                "permanently_deactivated": False,
+            },
+            {
+                "account_number": "987155785",
+                "type": "cash",
+                "brokerage_account_type": "individual",
+                "nickname": "Agentic",
+                "is_default": False,
+                "agentic_allowed": True,
+                "option_level": "option_level_2",
+                "state": "active",
+                "deactivated": False,
+                "permanently_deactivated": False,
+            },
+        ]
+    }
+}
+
+
+def _real_portfolio_response(buying_power: str) -> dict:
+    return {
+        "data": {
+            "total_value": "100",
+            "cash": "100",
+            "buying_power": {"buying_power": buying_power, "unleveraged_buying_power": buying_power, "display_currency": "USD"},
+        }
+    }
+
+
+def test_preflight_real_shape_finds_the_agentic_account_and_skips_the_others():
+    result = verify_account_preflight(
+        accounts_response=_REAL_ACCOUNTS_RESPONSE,
+        portfolio_response=_real_portfolio_response("1000.0000"),
+        account_number="987155785",
+        max_position_size_usd=250.0,
+    )
+    assert result.ok
+    assert result.buying_power_usd == 1000.0
+
+
+def test_preflight_real_shape_rejects_the_non_agentic_default_account():
+    """926045832 is the default account but agentic_allowed=false — must
+    fail even though it otherwise looks fine (option_level_2, active)."""
+    result = verify_account_preflight(
+        accounts_response=_REAL_ACCOUNTS_RESPONSE,
+        portfolio_response=_real_portfolio_response("1000.0000"),
+        account_number="926045832",
+        max_position_size_usd=250.0,
+    )
+    assert not result.ok
+    assert any("agentic_allowed" in f for f in result.failures)
+
+
+def test_preflight_real_shape_nested_buying_power_below_max_position_size_fails():
+    """The exact real scenario this caught: $100 buying power against a
+    $250 MAX_POSITION_SIZE_USD, parsed from the real nested {"buying_power":
+    {"buying_power": ...}} shape, not a flat value."""
+    result = verify_account_preflight(
+        accounts_response=_REAL_ACCOUNTS_RESPONSE,
+        portfolio_response=_real_portfolio_response("100.0000"),
+        account_number="987155785",
+        max_position_size_usd=250.0,
+    )
+    assert not result.ok
+    assert result.buying_power_usd == 100.0
+    assert any("buying_power_usd=100.00" in f for f in result.failures)
+
+
 # --- LiveExecutionGateway: confirm_and_place is the sole path to place_option_order --------
 
 
