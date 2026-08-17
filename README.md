@@ -316,6 +316,29 @@ order — nothing here re-decides whether a trade should happen.
   > the requested layout). It's safe because it's only ever imported as
   > `src.logging...` — see the caution comment in `src/logging/__init__.py`
   > and don't add `src/` itself to `sys.path`.
+- **`trade_journal.py`** — `TradeJournal`, the "teaching moment" record.
+  Every time a position (paper or live) actually closes, `run_trading_cycle`
+  calls `record_close()`, which appends one structured JSONL entry: the
+  original thesis, entry price/time, how it exited and why, the realized
+  P&L, hold time, the momentum evidence at exit, and a short deterministic
+  `lesson` string derived from that evidence via template rules (e.g. "hard
+  stop — the stop capped the downside as designed" for a `STOP_EXIT`,
+  "trailing stop did its job" for a winning trailing exit). `summary()`
+  gives cheap aggregate stats (win rate, total realized P&L, exit-type
+  counts) for a quick look at the account's history so far.
+  > **Deliberately NOT a learning/auto-tuning system.** Nothing here ever
+  > mutates `RiskManager`'s limits, the strategy's momentum thresholds, or
+  > position sizing. Two hard reasons: (1) at `MAX_TRADES_PER_DAY=2` on a
+  > small account, any given day produces a small handful of closed trades
+  > at most — nowhere near enough to "learn" anything statistically real;
+  > auto-tuning off 2-3 trades is overfitting to noise, not learning. (2)
+  > every risk parameter (`MAX_POSITION_SIZE_USD`, `MAX_DAILY_LOSS_USD`,
+  > `MAX_TRADES_PER_DAY`, ...) was set by a deliberate human decision, and a
+  > system that silently loosens or tightens those from its own trade
+  > history would be exactly the autonomous-risk-control-mutation this
+  > project has been explicitly told never to do. Any change to those
+  > numbers stays a human decision, made the same way every prior change to
+  > them has been made in this project — by being asked for, explicitly.
 
 ## Configuration
 
@@ -329,6 +352,7 @@ Copy `.env.example` to `.env` and adjust. Key variables:
 | `PENDING_ORDERS_FILE` / `PENDING_ORDER_EXPIRY_MINUTES` | Live pending-order ledger path and how long a proposal stays approvable (default 15 min) |
 | `LIVE_BOT_POSITIONS_FILE` | Tracks which real positions this system itself opened live, for exit-proposal ownership |
 | `PEAK_PRICES_FILE` | Cross-cycle peak-price memory for the trailing-exit engine |
+| `TRADE_JOURNAL_FILE` | Append-only "teaching moment" record, one entry per closed trade — see `src/logging/trade_journal.py`. Never mutates config. |
 | `TRAILING_ARM_FRACTION` / `TRAILING_GIVEBACK_FRACTION` | Dynamic/trailing exit thresholds (defaults 0.5 / 0.3 — see the worked example above) |
 | `MAX_TRADES_PER_DAY` | Default 4 |
 | `MAX_DAILY_LOSS_USD` | Realized+unrealized daily loss cap |

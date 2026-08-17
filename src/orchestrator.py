@@ -67,6 +67,7 @@ from src.execution.live_positions import LiveBotPositionsStore
 from src.execution.orders import OrderLeg, OrderRequest
 from src.execution.pending import PendingOrderStore
 from src.logging.decision_logger import DecisionLogger
+from src.logging.trade_journal import TradeJournal
 from src.market.data_provider import MarketDataProvider
 from src.market.errors import MarketDataError
 from src.market.hood_client import HoodToolClient
@@ -168,6 +169,7 @@ def run_trading_cycle(
     risk_state = risk_store.load(today=now.date())
     paper_store = PaperPositionStore(Path(settings.paper_positions_file))
     peak_price_store = PeakPriceStore(Path(settings.peak_prices_file))
+    trade_journal = TradeJournal(Path(settings.trade_journal_file))
 
     report = CycleReport(ran=True)
 
@@ -206,9 +208,18 @@ def run_trading_cycle(
             report.errors.append(f"monitor failed for paper position {position.option_id}: {exc}")
             continue
         if result.decision_result.decision in EXIT_DECISIONS and result.acted:
-            risk_state.record_exit(position.symbol, now, realized_pnl_usd=_realized_pnl(position, result))
+            realized_pnl_usd = _realized_pnl(position, result)
+            risk_state.record_exit(position.symbol, now, realized_pnl_usd=realized_pnl_usd)
             paper_store.remove_position(position.option_id)
             report.exits.append(position.option_id)
+            trade_journal.record_close(
+                position=position,
+                result=result.decision_result,
+                exit_price=_exit_price(position, result),
+                realized_pnl_usd=realized_pnl_usd,
+                trade_mode="paper",
+                now=now,
+            )
 
     # Real positions: decide and log always. Whether an exit order is ever
     # actually PROPOSED for one depends on mode and ownership:
@@ -236,8 +247,17 @@ def run_trading_cycle(
             # LiveExecutionGateway._place_pending(); this system's own
             # daily trade-count/loss bookkeeping happens here, same as the
             # paper-position loop above.
-            risk_state.record_exit(position.symbol, now, realized_pnl_usd=_realized_pnl(position, result))
+            realized_pnl_usd = _realized_pnl(position, result)
+            risk_state.record_exit(position.symbol, now, realized_pnl_usd=realized_pnl_usd)
             report.exits.append(position.option_id)
+            trade_journal.record_close(
+                position=position,
+                result=result.decision_result,
+                exit_price=_exit_price(position, result),
+                realized_pnl_usd=realized_pnl_usd,
+                trade_mode="live",
+                now=now,
+            )
 
     # --- 3. MARKET SCAN → FIND SETUP → PAPER ENTRY -----------------------------------
     scan_universe_label = ",".join(settings.scan_universe) or "(empty universe)"
@@ -343,6 +363,15 @@ def _realized_pnl(position: OpenPosition, result: MonitorResult) -> float:
         fill_price = result.order_result.simulated_fill.fill_price
         return round((fill_price - position.entry_price) * position.quantity * position.contract_multiplier, 2)
     return float(result.decision_result.evidence.get("pnl_usd", 0.0))
+
+
+def _exit_price(position: OpenPosition, result: MonitorResult) -> float:
+    """Same "prefer the actual fill" preference as _realized_pnl, but
+    returning the per-contract price itself rather than the derived P&L —
+    what the trade journal records as what the position actually closed at."""
+    if result.order_result is not None and result.order_result.simulated_fill is not None:
+        return result.order_result.simulated_fill.fill_price
+    return float(result.decision_result.evidence.get("option_price", position.entry_price))
 
 
 def _evaluate_candidate(

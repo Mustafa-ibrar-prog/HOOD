@@ -139,6 +139,7 @@ class Settings:
     pending_orders_file: str
     live_bot_positions_file: str
     peak_prices_file: str
+    trade_journal_file: str
 
     # --- Brokerage account / scanning ------------------------------------------
     # account_number is intentionally never auto-selected from get_accounts by
@@ -250,6 +251,7 @@ class Settings:
             pending_orders_file=_get_str(env, "PENDING_ORDERS_FILE", "logs/pending_orders.json"),
             live_bot_positions_file=_get_str(env, "LIVE_BOT_POSITIONS_FILE", "logs/live_bot_positions.json"),
             peak_prices_file=_get_str(env, "PEAK_PRICES_FILE", "logs/peak_prices.json"),
+            trade_journal_file=_get_str(env, "TRADE_JOURNAL_FILE", "logs/trade_journal.jsonl"),
             account_number=_get_optional_str(env, "ROBINHOOD_ACCOUNT_NUMBER"),
             scan_universe=_get_str_tuple(env, "SCAN_UNIVERSE", "SPY,QQQ,AAPL,MSFT,NVDA"),
             max_new_entries_per_cycle=_get_int(env, "MAX_NEW_ENTRIES_PER_CYCLE", 1),
