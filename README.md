@@ -536,28 +536,34 @@ only relevant once `TRADING_MODE=live` and `LIVE_TRADING_CONFIRMED=true`:
 
 ## Going live: what this deployment has and hasn't done
 
-Live execution **is built and tested** (see "The execution layer" and "The
-live-order confirmation bridge" above) — 270 tests pass, including the
-guarantee that `place_option_order` is reachable from exactly one method.
-**No live order has been proposed or placed by this build, and none will be
-until a human deliberately does all of the following:**
+Live execution **is built, tested, and active in this deployment's real
+`.env`** as of 2026-08-17: `TRADING_MODE=live`, `LIVE_TRADING_CONFIRMED=true`,
+`LIVE_AUTO_EXECUTE=true`, against real account `987155785` ($100 buying
+power, `MAX_POSITION_SIZE_USD=97`, `MAX_DAILY_LOSS_USD=20`,
+`MAX_TRADES_PER_DAY=2`). 285 tests pass, including the guarantee that
+`place_option_order` is reachable from exactly one method
+(`LiveExecutionGateway._place_pending`).
 
-1. Run `scripts/verify_live_readiness.py` against a real, fresh
-   `get_accounts` + `get_portfolio` pull and confirm it passes.
-2. Set `TRADING_MODE=live` and `LIVE_TRADING_CONFIRMED=true` in `.env`
-   (both are `false`/`paper` in this deployment's real `.env` right now).
-3. Decide, deliberately, whether `LIVE_AUTO_EXECUTE` should be `true`
-   (no conversational per-trade approval — an order is placed the instant
-   it clears `RiskManager`/`PositionEvaluator`'s checks) or stay `false`
-   (every order needs a separate, explicit confirm/reject action first).
-   This is a real, materially different risk posture, not a cosmetic
-   toggle — treat it as its own decision, not a default to inherit.
-4. Only then start a recurring live cycle — and even so, every cycle still
-   only ever *proposes* orders; whether they're placed immediately or held
-   for confirmation follows directly from step 3's choice.
+**The human-click-approve step has been explicitly removed**, on the
+user's explicit direction (asked via `AskUserQuestion`, choosing "fully
+automatic real orders" over "keep it pending-approval"). Mechanically,
+nothing in `src/execution/gateway.py` changed to make this happen — every
+order still always creates a `PendingLiveOrder` first, and
+`place_option_order` is still only ever reachable through
+`LiveExecutionGateway._place_pending`. What changed is *procedure*: the
+recurring 5-minute cron tick's own prompt now instructs the agent that,
+within the same cycle a pending order is created, it should immediately
+read that pending order's exact parameters, make the real
+`place_option_order` call, and run `scripts/confirm_pending_order.py
+--approved-by "agent:auto_execute"` — rather than stopping and waiting for
+a later, separate human turn. Every `RiskManager`/`PositionEvaluator` check
+still runs, unchanged, before a candidate ever becomes a pending order;
+this only changes what happens *after* every one of those checks has
+already passed. A placed real order is never silently reported — the
+cron prompt is explicit that it must always be surfaced to the user,
+overriding the normal "stay quiet on routine cycles" instruction.
 
-This is a one-way door and should be treated as such: soak-test in paper
-mode across varied market conditions first (see "What's still not built"
-above), and treat `LIVE_AUTO_EXECUTE=true` as something to turn on only
-after the gated (`false`) mode has actually been exercised against real
-account activity, not as the first live setting ever tried.
+If you want to go back to the gated (human-approval-required) posture,
+either set `LIVE_AUTO_EXECUTE=false` in `.env`, or ask — the cron tick's
+prompt can be reverted to stop at `pending_approval` and wait for an
+explicit confirm/reject the same way it did before 2026-08-17.
