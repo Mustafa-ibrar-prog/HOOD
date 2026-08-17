@@ -340,6 +340,19 @@ order — nothing here re-decides whether a trade should happen.
   > numbers stays a human decision, made the same way every prior change to
   > them has been made in this project — by being asked for, explicitly.
 
+### `docs/masterclass_knowledge_base.md`
+A read-only reference summarizing a user-provided day-trading education
+course (Spartan Trades Masterclass Series), cross-referenced explicitly
+against what this codebase's strategy/risk logic already does vs. doesn't
+do. Same governance boundary as the trade journal: it's vocabulary and
+context for reasoning about candidates, not a second rulebook — every gap
+it identifies between the course's recommendations and this system's actual
+behavior (no VWAP, no delta-based contract selection, no time-of-day
+blackout windows, symmetric 50%/50% profit/stop vs. the course's ~20%/~10%,
+and a real tension between the course's "avoid stocks under $10" rule and
+the current `SCAN_UNIVERSE` being mostly under $10 for affordability
+reasons) is flagged as a question for the user, never auto-applied.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and adjust. Key variables:
