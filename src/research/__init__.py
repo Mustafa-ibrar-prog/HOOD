@@ -27,6 +27,25 @@ from src.research.baseline_comparison import BaselineComparisonReport, compare_a
 from src.research.classification import ClassificationResult, StrategyClassification, classify_strategy
 from src.research.cross_sectional import SubgroupResult, by_sector, by_symbol, by_volatility_bucket, by_year, concentration_summary
 from src.research.cross_sectional_alpha import CrossSectionalAlphaConfig, CrossSectionalAlphaReport, evaluate_cross_sectional_alpha
+from src.research.discovery_development_gate import (
+    CODE_COMPUTABLE_STAGES as DD_CODE_COMPUTABLE_STAGES,
+    FORWARD_ORDER as DD_FORWARD_ORDER,
+    DiscoveryDevelopmentGateStore,
+    DiscoveryDevelopmentStage,
+    DiscoveryDevelopmentTransitionRecord,
+)
+from src.research.discovery_development_gate import IllegalStageTransitionError as DDIllegalStageTransitionError
+from src.research.discovery_development_gate import StageRequiresHumanActionError as DDStageRequiresHumanActionError
+from src.research.discovery_development_gate import assert_code_may_set_stage as dd_assert_code_may_set_stage
+from src.research.discovery_development_gate import can_transition as dd_can_transition
+from src.research.pearson_ic import compute_pearson_ic_series, summarize_pearson_ic
+from src.research.regression import OLSResult, ols_regression
+from src.research.volatility_targets import (
+    future_absolute_cumulative_return,
+    future_max_absolute_move,
+    future_realized_variance,
+    future_realized_volatility,
+)
 from src.research.cross_sectional_placebo import (
     CrossSectionalPlaceboResult,
     irrelevant_feature_control,
@@ -287,4 +306,11 @@ __all__ = [
     "normal_cdf", "sharpe_ratio_from_returns", "t_statistic", "t_test_p_value", "two_tailed_p_value_from_z",
     "autocorrelation_profile", "lag_autocorrelation",
     "VolumeAnomalyLongStrategy",
+    # Phase 9 additions
+    "DD_CODE_COMPUTABLE_STAGES", "DD_FORWARD_ORDER", "DiscoveryDevelopmentGateStore", "DiscoveryDevelopmentStage",
+    "DiscoveryDevelopmentTransitionRecord", "DDIllegalStageTransitionError", "DDStageRequiresHumanActionError",
+    "dd_assert_code_may_set_stage", "dd_can_transition",
+    "OLSResult", "ols_regression",
+    "future_absolute_cumulative_return", "future_max_absolute_move", "future_realized_variance", "future_realized_volatility",
+    "compute_pearson_ic_series", "summarize_pearson_ic",
 ]
