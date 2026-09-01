@@ -65,6 +65,9 @@ class ExperimentRecord:
     supersedes_experiment_id: str | None = None  # links a revised experiment to the one it replaces, without overwriting it
     hypothesis_id: str | None = None  # FK into HypothesisRegistry (Phase 4) — enables search-space accounting (Phase 5)
     universe_name: str | None = None  # FK into a src.data.universe.Universe's .name
+    experiment_fingerprint: str | None = None  # Phase 7, Part 18: a content hash over the dimensions that, if changed, MUST produce a new experiment/version — see src.research.experiment_fingerprint.compute_experiment_fingerprint
+    partition_dataset_id: str | None = None  # Phase 7, Part 1: FK into a src.research.partition.ResearchDatasetPartition, when this experiment ran against a formally partitioned dataset
+    research_family_id: str | None = None  # Phase 7, Part 2: FK grouping this experiment with others in the same research family for multiple-testing accounting
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -97,6 +100,9 @@ class ExperimentRecord:
             supersedes_experiment_id=data.get("supersedes_experiment_id"),
             hypothesis_id=data.get("hypothesis_id"),
             universe_name=data.get("universe_name"),
+            experiment_fingerprint=data.get("experiment_fingerprint"),
+            partition_dataset_id=data.get("partition_dataset_id"),
+            research_family_id=data.get("research_family_id"),
         )
 
 
@@ -129,6 +135,9 @@ class ExperimentStore:
         supersedes_experiment_id: str | None = None,
         hypothesis_id: str | None = None,
         universe_name: str | None = None,
+        experiment_fingerprint: str | None = None,
+        partition_dataset_id: str | None = None,
+        research_family_id: str | None = None,
     ) -> ExperimentRecord:
         now = now or datetime.now(timezone.utc)
         record = ExperimentRecord(
@@ -155,6 +164,9 @@ class ExperimentStore:
             supersedes_experiment_id=supersedes_experiment_id,
             hypothesis_id=hypothesis_id,
             universe_name=universe_name,
+            experiment_fingerprint=experiment_fingerprint,
+            partition_dataset_id=partition_dataset_id,
+            research_family_id=research_family_id,
         )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a") as f:
@@ -187,6 +199,7 @@ class ExperimentStore:
         tag: str | None = None,
         hypothesis_id: str | None = None,
         universe_name: str | None = None,
+        research_family_id: str | None = None,
     ) -> list[ExperimentRecord]:
         """Answers the section-20 example questions directly:
           query(strategy_family="momentum")                 -> "every experiment that tested momentum"
@@ -215,4 +228,6 @@ class ExperimentStore:
             records = [r for r in records if r.hypothesis_id == hypothesis_id]
         if universe_name is not None:
             records = [r for r in records if r.universe_name == universe_name]
+        if research_family_id is not None:
+            records = [r for r in records if r.research_family_id == research_family_id]
         return records

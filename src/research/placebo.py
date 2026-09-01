@@ -232,3 +232,118 @@ def bootstrap_trade_statistics(trades: Sequence[BacktestTrade], *, n_resamples: 
         cumulative_return_ci=_ci(cumulatives, sum(pnls)),
         sharpe_like_ci=_ci(sharpes, observed_sharpe),
     )
+
+
+# ==============================================================================
+# DEPENDENCE-AWARE BOOTSTRAP (Phase 7, Part 11)
+# ==============================================================================
+#
+# bootstrap_trade_statistics above resamples individual trades i.i.d. with
+# replacement — documented as a simplification, since trade returns can be
+# serially correlated (e.g. clustered wins during a trending regime). The
+# two variants below resample CONTIGUOUS BLOCKS of the trade sequence (in
+# its original temporal order) instead of single trades, which preserves
+# local (within-block) serial dependence rather than assuming independence.
+# Neither is a rigorous proof of validity for financial trade sequences —
+# both are still approximations, documented as such, not presented as
+# ground truth.
+
+
+def block_bootstrap_trade_statistics(trades: Sequence[BacktestTrade], *, block_size: int, n_resamples: int = 2000, seed: int = 42, confidence_level: float = 0.90) -> BootstrapReport:
+    """MOVING BLOCK BOOTSTRAP: resamples fixed-length, possibly-overlapping
+    contiguous blocks of `block_size` CONSECUTIVE trades (in their
+    original temporal order) with replacement, concatenated until the
+    resample reaches the original sample size (the final block is
+    truncated if needed). Preserves serial dependence WITHIN a block;
+    still treats different blocks as independent of each other — a
+    documented, partial fix for the i.i.d. assumption, not a complete one.
+    `block_size` must be supplied explicitly (no default "correct" choice
+    exists — a longer block preserves more dependence structure at the
+    cost of fewer effectively-independent resampling units)."""
+    if block_size < 1:
+        raise ValueError("block_size must be >= 1")
+    pnls = [t.net_pnl for t in trades]
+    n = len(pnls)
+    if n < MIN_BOOTSTRAP_SAMPLE:
+        return BootstrapReport(sample_size=n, insufficient_sample=True, mean_trade_return_ci=None, expectancy_ci=None, cumulative_return_ci=None, sharpe_like_ci=None)
+    if block_size > n:
+        raise ValueError(f"block_size ({block_size}) cannot exceed the number of trades ({n})")
+
+    rng = random.Random(seed)
+    n_blocks_needed = -(-n // block_size)  # ceil
+    means: list[float] = []
+    cumulatives: list[float] = []
+    sharpes: list[float] = []
+    for _ in range(n_resamples):
+        sample: list[float] = []
+        for _b in range(n_blocks_needed):
+            start = rng.randrange(0, n - block_size + 1)
+            sample.extend(pnls[start:start + block_size])
+        sample = sample[:n]
+        sample_mean = mean(sample)
+        means.append(sample_mean)
+        cumulatives.append(sum(sample))
+        sd = stdev(sample)
+        sharpes.append(sample_mean / sd if sd > 0 else 0.0)
+
+    return _bootstrap_report_from_resamples(pnls, means, cumulatives, sharpes, confidence_level=confidence_level)
+
+
+def stationary_bootstrap_trade_statistics(trades: Sequence[BacktestTrade], *, mean_block_length: float, n_resamples: int = 2000, seed: int = 42, confidence_level: float = 0.90) -> BootstrapReport:
+    """POLITIS & ROMANO (1994) STATIONARY BOOTSTRAP: like the moving block
+    bootstrap, but block lengths are themselves RANDOM (geometrically
+    distributed with mean `mean_block_length`) rather than fixed — this
+    makes the resampled series itself (asymptotically) stationary, which
+    the fixed-block version is not. Still an approximation of true trade
+    dependence (real serial correlation may not decay geometrically), but
+    a documented improvement over both plain i.i.d. resampling and a
+    fixed block length."""
+    if mean_block_length <= 0:
+        raise ValueError("mean_block_length must be > 0")
+    pnls = [t.net_pnl for t in trades]
+    n = len(pnls)
+    if n < MIN_BOOTSTRAP_SAMPLE:
+        return BootstrapReport(sample_size=n, insufficient_sample=True, mean_trade_return_ci=None, expectancy_ci=None, cumulative_return_ci=None, sharpe_like_ci=None)
+
+    p_continue = 1.0 / mean_block_length  # probability of ENDING the current block at each step (geometric block length)
+    rng = random.Random(seed)
+    means: list[float] = []
+    cumulatives: list[float] = []
+    sharpes: list[float] = []
+    for _ in range(n_resamples):
+        sample: list[float] = []
+        while len(sample) < n:
+            idx = rng.randrange(n)
+            while True:
+                sample.append(pnls[idx])
+                if len(sample) >= n or rng.random() < p_continue:
+                    break
+                idx = (idx + 1) % n  # wrap around (circular block bootstrap), standard for the stationary bootstrap
+        sample = sample[:n]
+        sample_mean = mean(sample)
+        means.append(sample_mean)
+        cumulatives.append(sum(sample))
+        sd = stdev(sample)
+        sharpes.append(sample_mean / sd if sd > 0 else 0.0)
+
+    return _bootstrap_report_from_resamples(pnls, means, cumulatives, sharpes, confidence_level=confidence_level)
+
+
+def _bootstrap_report_from_resamples(pnls: list[float], means: list[float], cumulatives: list[float], sharpes: list[float], *, confidence_level: float) -> BootstrapReport:
+    lo_pct = (1 - confidence_level) / 2
+    hi_pct = 1 - lo_pct
+
+    def _ci(values: list[float], point: float) -> BootstrapCI:
+        values_sorted = sorted(values)
+        lo_idx = int(lo_pct * len(values_sorted))
+        hi_idx = min(len(values_sorted) - 1, int(hi_pct * len(values_sorted)))
+        return BootstrapCI(point_estimate=point, lower=values_sorted[lo_idx], upper=values_sorted[hi_idx], confidence_level=confidence_level)
+
+    observed_mean = mean(pnls)
+    observed_sd = stdev(pnls)
+    observed_sharpe = observed_mean / observed_sd if observed_sd > 0 else 0.0
+    return BootstrapReport(
+        sample_size=len(pnls), insufficient_sample=False,
+        mean_trade_return_ci=_ci(means, observed_mean), expectancy_ci=_ci(means, observed_mean),
+        cumulative_return_ci=_ci(cumulatives, sum(pnls)), sharpe_like_ci=_ci(sharpes, observed_sharpe),
+    )

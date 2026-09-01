@@ -15,11 +15,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Sequence
 
+from typing import Mapping
+
 from src.backtesting.journal import BacktestTrade
 from src.backtesting.metrics import PerformanceMetrics, compute_performance_metrics
 from src.data.bar import Bar
 from src.features.engine import FeatureEngine
 from src.features.regime import TrendRegime, VolatilityRegime
+from src.research.ic import ICSummary, compute_ic_series, summarize_ic
 
 
 def label_bars_by_regime(
@@ -74,4 +77,27 @@ def regime_performance_report(trades_by_regime: dict[str, list[BacktestTrade]], 
     return {
         regime: compute_performance_metrics(equity_curve=[], trades=trades, starting_cash=starting_cash)
         for regime, trades in trades_by_regime.items()
+    }
+
+
+def ic_by_regime(
+    panel_rows: list[dict], feature_col: str, target_col: str, regime_by_timestamp: Mapping[datetime, str], *, min_universe_size: int = 3,
+) -> dict[str, ICSummary]:
+    """Phase 7, Part 9: cross-sectional IC bucketed by regime — the
+    forward reference src.research.ic's module docstring has pointed to
+    since Phase 4 ("Regime-based bucketing ... see
+    src.research.regime.ic_by_regime") and Part 9's explicit requirement
+    ("distinguish 'works in most regimes' from 'works only in one narrow
+    regime'"). Buckets each panel row by the regime active AT THAT ROW'S
+    OWN timestamp (never a later regime — a row is bucketed using only
+    information available causally at its own timestamp, same principle
+    as bucket_trades_by_regime above), then runs Phase 4's
+    compute_ic_series/summarize_ic independently within each bucket."""
+    buckets: dict[str, list[dict]] = {}
+    for row in panel_rows:
+        label = regime_by_timestamp.get(row["timestamp"], "unknown")
+        buckets.setdefault(label, []).append(row)
+    return {
+        regime: summarize_ic(compute_ic_series(rows, feature_col, target_col, min_universe_size=min_universe_size), feature_name=feature_col, target_name=target_col)
+        for regime, rows in buckets.items()
     }

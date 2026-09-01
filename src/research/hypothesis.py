@@ -40,6 +40,16 @@ class Hypothesis:
     assumptions: tuple[str, ...]
     version: str = "1.0"
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Phase 7 additions (additive, all optional/defaulted — every Phase 4-6
+    # hypothesis record loads unchanged via from_dict's .get(..., default)):
+    family: str = ""  # mechanism family, e.g. "momentum" — src.research.hypothesis_generator.HypothesisFamily.value
+    target_definition: str = ""  # exact target column/definition this hypothesis is tested against
+    holding_period_bars: int | None = None
+    entry_rule: str = ""
+    exit_rule: str = ""
+    universe: tuple[str, ...] = ()
+    expected_mechanism: str = ""  # the causal story for WHY this should work, distinct from economic_intuition's broader framing
+    falsification_criteria: tuple[str, ...] = ()  # what result(s) would prove this hypothesis WRONG, written before testing
 
     def __post_init__(self) -> None:
         if self.expected_direction not in ("positive", "negative", "unsigned"):
@@ -68,6 +78,14 @@ class Hypothesis:
             assumptions=tuple(data.get("assumptions", ())),
             version=data.get("version", "1.0"),
             created_at=datetime.fromisoformat(data["created_at"]),
+            family=data.get("family", ""),
+            target_definition=data.get("target_definition", ""),
+            holding_period_bars=data.get("holding_period_bars"),
+            entry_rule=data.get("entry_rule", ""),
+            exit_rule=data.get("exit_rule", ""),
+            universe=tuple(data.get("universe", ())),
+            expected_mechanism=data.get("expected_mechanism", ""),
+            falsification_criteria=tuple(data.get("falsification_criteria", ())),
         )
 
 
