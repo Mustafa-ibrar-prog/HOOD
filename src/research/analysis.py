@@ -56,22 +56,22 @@ class FeatureAnalysisResult:
         return "\n".join(lines)
 
 
-def _mean(xs: Sequence[float]) -> float:
+def mean(xs: Sequence[float]) -> float:
     return sum(xs) / len(xs)
 
 
-def _stdev(xs: Sequence[float]) -> float:
+def stdev(xs: Sequence[float]) -> float:
     if len(xs) < 2:
         return 0.0
-    m = _mean(xs)
+    m = mean(xs)
     return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
 
 
-def _pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+def pearson_correlation(xs: Sequence[float], ys: Sequence[float]) -> float | None:
     n = len(xs)
     if n < 2:
         return None
-    mx, my = _mean(xs), _mean(ys)
+    mx, my = mean(xs), mean(ys)
     cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     sx = math.sqrt(sum((x - mx) ** 2 for x in xs))
     sy = math.sqrt(sum((y - my) ** 2 for y in ys))
@@ -80,8 +80,10 @@ def _pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
     return cov / (sx * sy)
 
 
-def _rank(xs: Sequence[float]) -> list[float]:
-    """Average rank on ties (standard "fractional ranking")."""
+def rank_values(xs: Sequence[float]) -> list[float]:
+    """Average rank on ties (standard "fractional ranking"), 1-indexed —
+    shared by this module's pooled analysis and src.research.ic's
+    cross-sectional Information Coefficient."""
     order = sorted(range(len(xs)), key=lambda i: xs[i])
     ranks = [0.0] * len(xs)
     i = 0
@@ -96,10 +98,10 @@ def _rank(xs: Sequence[float]) -> list[float]:
     return ranks
 
 
-def _spearman(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+def spearman_correlation(xs: Sequence[float], ys: Sequence[float]) -> float | None:
     if len(xs) < 2:
         return None
-    return _pearson(_rank(xs), _rank(ys))
+    return pearson_correlation(rank_values(xs), rank_values(ys))
 
 
 def analyze_feature(rows: Sequence[dict], feature_col: str, target_col: str, *, n_quantiles: int = 5) -> FeatureAnalysisResult:
@@ -125,8 +127,8 @@ def analyze_feature(rows: Sequence[dict], feature_col: str, target_col: str, *, 
     paired.sort(key=lambda p: p[0])
     xs = [p[0] for p in paired]
     ys = [p[1] for p in paired]
-    pearson = _pearson(xs, ys)
-    spearman = _spearman(xs, ys)
+    pearson = pearson_correlation(xs, ys)
+    spearman = spearman_correlation(xs, ys)
 
     n = len(paired)
     quantiles: list[QuantileResult] = []
@@ -139,11 +141,11 @@ def analyze_feature(rows: Sequence[dict], feature_col: str, target_col: str, *, 
         quantiles.append(
             QuantileResult(
                 quantile=q + 1,
-                mean_future_return=_mean(bucket_returns),
+                mean_future_return=mean(bucket_returns),
                 median_future_return=sorted(bucket_returns)[len(bucket_returns) // 2],
                 hit_rate=sum(1 for r in bucket_returns if r > 0) / len(bucket_returns),
                 sample_count=len(bucket_returns),
-                volatility=_stdev(bucket_returns),
+                volatility=stdev(bucket_returns),
             )
         )
 

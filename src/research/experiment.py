@@ -14,6 +14,20 @@ from `data_version`/`feature_version` instead, which are deterministic
 content hashes (src/data/versioning.py): given the same recorded
 data_version and feature_version, the exact same dataset and feature
 definitions can be reconstructed and the experiment re-run.
+
+Phase 4 additions (section 20-21): `strategy_family`/`classification`/
+`oos_metrics`/`cost_sensitivity`/`tags`/`backtest_id`/
+`supersedes_experiment_id` — all optional, all additive; every Phase 2
+field keeps its exact name, type, and position. `supersedes_experiment_id`
+is how a "new version" of a prior experiment stays linked to it WITHOUT
+ever overwriting the original record — this store was already append-only
+before Phase 4 (record() always appends; nothing here ever edits or
+deletes a prior line), so "do not overwrite historical results" was
+already the design; supersedes_experiment_id just makes the lineage
+between an old and a revised experiment explicit rather than implicit.
+ExperimentStore.query() answers the section-20 example questions
+("every experiment that tested momentum", "OOS Sharpe above X", "failed
+under 2x costs") directly against the stored records.
 """
 
 from __future__ import annotations
@@ -42,6 +56,13 @@ class ExperimentRecord:
     parameters: Mapping[str, Any] = field(default_factory=dict)
     metrics: Mapping[str, Any] = field(default_factory=dict)
     notes: str = ""
+    strategy_family: str | None = None  # e.g. "momentum", "mean_reversion" — enables query(strategy_family=...)
+    classification: str | None = None  # StrategyClassification value (src.research.classification)
+    oos_metrics: Mapping[str, Any] = field(default_factory=dict)
+    cost_sensitivity: Mapping[str, Any] = field(default_factory=dict)
+    tags: tuple[str, ...] = ()
+    backtest_id: str | None = None  # FK into BacktestResult/BacktestTradeJournal (Phase 3)
+    supersedes_experiment_id: str | None = None  # links a revised experiment to the one it replaces, without overwriting it
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -65,6 +86,13 @@ class ExperimentRecord:
             parameters=dict(data.get("parameters", {})),
             metrics=dict(data.get("metrics", {})),
             notes=data.get("notes", ""),
+            strategy_family=data.get("strategy_family"),
+            classification=data.get("classification"),
+            oos_metrics=dict(data.get("oos_metrics", {})),
+            cost_sensitivity=dict(data.get("cost_sensitivity", {})),
+            tags=tuple(data.get("tags", ())),
+            backtest_id=data.get("backtest_id"),
+            supersedes_experiment_id=data.get("supersedes_experiment_id"),
         )
 
 
@@ -88,6 +116,13 @@ class ExperimentStore:
         metrics: Mapping[str, Any] | None = None,
         notes: str = "",
         now: datetime | None = None,
+        strategy_family: str | None = None,
+        classification: str | None = None,
+        oos_metrics: Mapping[str, Any] | None = None,
+        cost_sensitivity: Mapping[str, Any] | None = None,
+        tags: Sequence[str] = (),
+        backtest_id: str | None = None,
+        supersedes_experiment_id: str | None = None,
     ) -> ExperimentRecord:
         now = now or datetime.now(timezone.utc)
         record = ExperimentRecord(
@@ -105,6 +140,13 @@ class ExperimentStore:
             parameters=dict(parameters or {}),
             metrics=dict(metrics or {}),
             notes=notes,
+            strategy_family=strategy_family,
+            classification=classification,
+            oos_metrics=dict(oos_metrics or {}),
+            cost_sensitivity=dict(cost_sensitivity or {}),
+            tags=tuple(tags),
+            backtest_id=backtest_id,
+            supersedes_experiment_id=supersedes_experiment_id,
         )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a") as f:
@@ -126,3 +168,37 @@ class ExperimentStore:
             if rec.experiment_id == experiment_id:
                 return rec
         return None
+
+    def query(
+        self,
+        *,
+        strategy_family: str | None = None,
+        classification: str | None = None,
+        min_oos_sharpe: float | None = None,
+        failed_at_cost_multiplier: float | None = None,
+        tag: str | None = None,
+    ) -> list[ExperimentRecord]:
+        """Answers the section-20 example questions directly:
+          query(strategy_family="momentum")                 -> "every experiment that tested momentum"
+          query(min_oos_sharpe=0.5)                          -> "every experiment with OOS Sharpe above X"
+          query(failed_at_cost_multiplier=2.0)                -> "experiments that failed under 2x transaction costs"
+        Every filter is optional and AND-combined; omit all of them to get
+        every record (equivalent to load_all())."""
+        records = self.load_all()
+        if strategy_family is not None:
+            records = [r for r in records if r.strategy_family == strategy_family]
+        if classification is not None:
+            records = [r for r in records if r.classification == classification]
+        if min_oos_sharpe is not None:
+            records = [r for r in records if isinstance(r.oos_metrics.get("sharpe_ratio"), (int, float)) and r.oos_metrics["sharpe_ratio"] >= min_oos_sharpe]
+        if failed_at_cost_multiplier is not None:
+            records = [
+                r for r in records
+                if any(
+                    point.get("cost_multiplier") == failed_at_cost_multiplier and point.get("viable") is False
+                    for point in r.cost_sensitivity.get("points", [])
+                )
+            ]
+        if tag is not None:
+            records = [r for r in records if tag in r.tags]
+        return records
