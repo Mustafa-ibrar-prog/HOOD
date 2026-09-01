@@ -85,6 +85,69 @@ def randomized_entry_timing_placebo(
     )
 
 
+def random_symbol_and_timing_placebo(
+    *,
+    observed_trades: Sequence[BacktestTrade],
+    bars_by_symbol: Mapping[str, Sequence[Bar]],
+    holding_period_bars: int,
+    quantity: int,
+    n_trials: int = 200,
+    seed: int = 43,
+    statistic_fn: Callable[[list[float]], float] = lambda pnls: mean(pnls) if pnls else 0.0,
+) -> PlaceboTestResult:
+    """Phase 6, section 16's SECOND, independent permutation test —
+    deliberately different from `randomized_entry_timing_placebo` above.
+
+    WHAT IS RANDOMIZED: both WHICH symbol a trade is drawn from (uniformly
+    over the universe, seeded) AND WHEN it enters within that symbol's
+    series (uniformly, seeded).
+    WHAT IS PRESERVED: total trade count (matches `len(observed_trades)`),
+    holding period (`holding_period_bars`, real consecutive bars — never
+    synthetic), and position size (`quantity`) — so the null model still
+    trades the same universe with the same mechanics, just with no
+    connection at all between "this symbol, this moment" and the
+    strategy's actual mean-reversion signal.
+    WHAT IS DESTROYED (intentionally): the specific SYMBOL-TIMING pairing
+    the strategy chose is completely severed — this is a strictly harder
+    null than the entry-timing-only placebo above, since a strategy that
+    is only good at picking WHICH symbol (with mediocre timing skill)
+    could still pass the entry-timing placebo but should fail this one.
+    WHAT IS NOT DONE: bars are never shuffled/reordered within a symbol —
+    that would erase the real price path a random entry is evaluated
+    against and invalidate the test entirely.
+    """
+    observed_stat = statistic_fn([t.net_pnl for t in observed_trades])
+    universe = sorted(sym for sym, bars in bars_by_symbol.items() if len(bars) > holding_period_bars)
+    n_trades = len(observed_trades)
+
+    simulated: list[float] = []
+    for trial in range(n_trials):
+        trial_rng = random.Random(seed * 7_919 + trial)
+        trial_pnls: list[float] = []
+        if not universe or n_trades == 0:
+            simulated.append(statistic_fn(trial_pnls))
+            continue
+        for i in range(n_trades):
+            symbol = trial_rng.choice(universe)
+            bars = bars_by_symbol[symbol]
+            random_trades = random_entry_baseline(bars, quantity=quantity, holding_period_bars=holding_period_bars, n_trades=1, seed=trial_rng.randrange(2**31))
+            trial_pnls.extend(t.net_pnl for t in random_trades)
+        simulated.append(statistic_fn(trial_pnls))
+
+    fraction = (sum(1 for s in simulated if s >= observed_stat) / len(simulated)) if simulated else None
+    return PlaceboTestResult(
+        method="randomized symbol AND entry timing: same total trade count, same holding period, same position size; symbol and entry bar both drawn uniformly at random (seeded) from the universe, independent of the strategy's signal",
+        n_trials=n_trials, seed=seed, observed_statistic=observed_stat, simulated_statistics=tuple(simulated),
+        fraction_as_extreme_or_better=fraction,
+        interpretation_note=(
+            "Empirical frequency that a null strategy with NO symbol-selection or timing skill (just trading random "
+            "symbols at random moments in the same universe) matched or beat the observed result. Stricter than the "
+            "entry-timing-only placebo. NOT a formal p-value — trade returns are not i.i.d. and this doesn't correct "
+            "for multiple testing; a low fraction is suggestive, not proof."
+        ),
+    )
+
+
 # ==============================================================================
 # BOOTSTRAP CONFIDENCE INTERVALS (section 15)
 # ==============================================================================

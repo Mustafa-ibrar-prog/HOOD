@@ -322,6 +322,46 @@ def run_execution_robustness(
     return ExecutionRobustnessReport(points=tuple(points))
 
 
+def run_execution_robustness_extended(
+    *,
+    research_strategy: ResearchStrategy,
+    bars_by_symbol: Mapping[str, Sequence[Bar]],
+    config: BacktestConfig,
+    base_execution_model: ExecutionModel,
+    base_slippage_model: SlippageModel,
+    base_cost_model: TransactionCostModel,
+    spread_model: SpreadModel,
+    position_sizer: PositionSizer,
+    risk_adapter: BacktestRiskAdapter,
+) -> ExecutionRobustnessReport:
+    """Phase 6, section 13's exact scenario list: BASE (next-bar open),
+    STRESS 1 (additional execution delay), STRESS 2 (higher slippage), and
+    STRESS 3 (delay AND higher slippage COMBINED) — a strictly harder test
+    than any single scenario in `run_execution_robustness` above. Additive:
+    `run_execution_robustness` (Phase 5) is untouched, so its existing
+    tests/results are unaffected; this is a separate, more demanding
+    variant for Phase 6's frozen-strategy holdout evaluation."""
+    from src.backtesting.execution_models import NextBarExecutionModel
+
+    scenarios: list[tuple[str, ExecutionModel, SlippageModel, TransactionCostModel]] = [
+        ("BASE (next-bar open)", base_execution_model, base_slippage_model, base_cost_model),
+        ("STRESS 1 (extra execution delay, +1 bar)", NextBarExecutionModel(price_field="open", delay_bars=base_execution_model.delay_bars() + 1), base_slippage_model, base_cost_model),
+        ("STRESS 2 (higher slippage, 2x)", base_execution_model, _ScaledSlippageModel(base_slippage_model, 2.0), base_cost_model),
+        ("STRESS 3 (combined: +1 bar delay AND 2x slippage)", NextBarExecutionModel(price_field="open", delay_bars=base_execution_model.delay_bars() + 1), _ScaledSlippageModel(base_slippage_model, 2.0), base_cost_model),
+    ]
+
+    points = []
+    for label, execution_model, slippage_model, cost_model in scenarios:
+        result = run_research_backtest(
+            research_strategy=research_strategy, bars_by_symbol=bars_by_symbol, config=config, execution_model=execution_model,
+            slippage_model=slippage_model, cost_model=cost_model, spread_model=spread_model, position_sizer=position_sizer, risk_adapter=risk_adapter,
+        )
+        net_total = sum(t.net_pnl for t in result.trades)
+        points.append(ExecutionRobustnessPoint(scenario=label, trade_count=len(result.trades), net_pnl_total=net_total, viable=net_total > 0))
+
+    return ExecutionRobustnessReport(points=tuple(points))
+
+
 def run_cost_sensitivity(
     *,
     research_strategy: ResearchStrategy,

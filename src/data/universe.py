@@ -154,6 +154,63 @@ def us_diversified_universe() -> Universe:
     )
 
 
+def us_diversified_secondary_universe() -> Universe:
+    """Phase 6, section 4: a SECOND, independent 20-symbol universe with
+    ZERO overlap with `us_diversified_universe()` — communication
+    services, utilities, materials, real estate, consumer discretionary,
+    technology, healthcare, financials, industrials, energy, and one
+    broad-market ETF, none of them shared with the Phase 5 universe.
+    Symbols were selected for sector coverage and being real, liquid,
+    currently-listed securities disjoint from Phase 5's list — BEFORE any
+    backtest was run on them, and independent of how MR-002 (or anything
+    else) performs on them. Same survivorship-bias caveat as every other
+    built-in universe here: current-constituent, not point-in-time."""
+    members = (
+        UniverseMember("META", "equity", "communication_services"),
+        UniverseMember("DIS", "equity", "communication_services"),
+        UniverseMember("NEE", "equity", "utilities"),
+        UniverseMember("DUK", "equity", "utilities"),
+        UniverseMember("LIN", "equity", "materials"),
+        UniverseMember("FCX", "equity", "materials"),
+        UniverseMember("PLD", "equity", "real_estate"),
+        UniverseMember("O", "equity", "real_estate"),
+        UniverseMember("HD", "equity", "consumer_discretionary"),
+        UniverseMember("NKE", "equity", "consumer_discretionary"),
+        UniverseMember("ADBE", "equity", "technology"),
+        UniverseMember("CRM", "equity", "technology"),
+        UniverseMember("PFE", "equity", "healthcare"),
+        UniverseMember("ABBV", "equity", "healthcare"),
+        UniverseMember("GS", "equity", "financials"),
+        UniverseMember("MS", "equity", "financials"),
+        UniverseMember("BA", "equity", "industrials"),
+        UniverseMember("UPS", "equity", "industrials"),
+        UniverseMember("COP", "equity", "energy"),
+        UniverseMember("DIA", "etf", "broad_market"),
+    )
+    return Universe(
+        name="US_DIVERSIFIED_SECONDARY",
+        description=(
+            "A second, independent 20-symbol universe disjoint from US_DIVERSIFIED, spanning 10 sectors plus one "
+            "broad-market ETF. Built for Phase 6's holdout validation — every symbol here was untouched by any "
+            "Phase 4/5 parameter selection, feature choice, or classification decision for any strategy."
+        ),
+        members=members,
+        inclusion_rules=(
+            "large, liquid, currently-listed US-domiciled security",
+            "verified via a real get_equity_historicals call returning a full multi-year daily bar series",
+            "zero symbol overlap with us_diversified_universe()",
+            "at least one representative from communication services, utilities, materials, real estate, consumer "
+            "discretionary, technology, healthcare, financials, industrials, energy, and one broad-market ETF",
+        ),
+        exclusion_rules=(
+            "no security selected based on expected future performance",
+            "no security already present in us_diversified_universe() or us_small_cap_volatile_universe()",
+            "no penny stocks / no securities below institutional liquidity norms",
+        ),
+        survivorship_bias_status=CURRENT_CONSTITUENT_SURVIVORSHIP_BIASED,
+    )
+
+
 def us_small_cap_volatile_universe() -> Universe:
     """The ORIGINAL Phase 1-4 universe (this codebase's live-system
     SCAN_UNIVERSE) — now an explicitly labeled, non-default sub-universe

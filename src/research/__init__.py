@@ -25,10 +25,27 @@ from src.research.classification import ClassificationResult, StrategyClassifica
 from src.research.cross_sectional import SubgroupResult, by_sector, by_symbol, by_volatility_bucket, by_year, concentration_summary
 from src.research.dataset import ResearchDataset, ResearchDatasetGenerator
 from src.research.experiment import ExperimentRecord, ExperimentStore
+from src.research.frozen_strategy import (
+    FrozenStrategyDefinition,
+    FrozenStrategyImmutabilityError,
+    FrozenStrategyStore,
+    build_mr002_frozen_definition,
+    build_strategy_from_frozen,
+)
+from src.research.holdout import HoldoutLeakageError, HoldoutPeriod, assert_no_holdout_leakage, determine_holdout_split
 from src.research.hypothesis import Hypothesis, HypothesisRegistry, HypothesisRegistryError
 from src.research.ic import ICPoint, ICSummary, compute_ic_series, ic_by_period, summarize_ic
 from src.research.leave_one_out import LeaveOneOutReport, LeaveOneOutResult, leave_one_group_out, leave_one_symbol_out
-from src.research.placebo import BootstrapCI, BootstrapReport, PlaceboTestResult, bootstrap_trade_statistics, randomized_entry_timing_placebo
+from src.research.paper_trading_gate import GateDecision, ResearchGateStage, determine_gate_stage
+from src.research.pass_criteria import HoldoutPassCriteria, PassCriteriaEvaluation, PassCriterionResult, evaluate_pass_criteria
+from src.research.placebo import (
+    BootstrapCI,
+    BootstrapReport,
+    PlaceboTestResult,
+    bootstrap_trade_statistics,
+    random_symbol_and_timing_placebo,
+    randomized_entry_timing_placebo,
+)
 from src.research.quantile import CrossSectionalQuantileResult, QuantilePortfolioReport, cross_sectional_quantile_returns
 from src.research.regime import bucket_trades_by_regime, label_bars_by_regime, regime_performance_report
 from src.research.research_matrix import ResearchMatrix, ResearchMatrixRow
@@ -40,6 +57,7 @@ from src.research.strategies import MeanReversionStrategy, MomentumStrategy, Vol
 from src.research.strategy import ResearchSignal, ResearchStrategy, ResearchStrategyBacktestAdapter, ResearchStrategySpec
 from src.research.sweep import ParameterStabilityReport, SweepPoint, run_parameter_sweep, summarize_parameter_stability
 from src.research.targets import future_return
+from src.research.trade_distribution import TradeReturnDistribution, trade_return_distribution
 from src.research.validation import (
     CostSensitivityPoint,
     CostSensitivityReport,
@@ -53,6 +71,7 @@ from src.research.validation import (
     generate_walk_forward_windows,
     run_cost_sensitivity,
     run_execution_robustness,
+    run_execution_robustness_extended,
     run_robustness_tests,
     run_walk_forward,
 )
@@ -143,4 +162,24 @@ __all__ = [
     "ExecutionRobustnessPoint",
     "ExecutionRobustnessReport",
     "run_execution_robustness",
+    "run_execution_robustness_extended",
+    "FrozenStrategyDefinition",
+    "FrozenStrategyStore",
+    "FrozenStrategyImmutabilityError",
+    "build_mr002_frozen_definition",
+    "build_strategy_from_frozen",
+    "HoldoutPeriod",
+    "HoldoutLeakageError",
+    "determine_holdout_split",
+    "assert_no_holdout_leakage",
+    "HoldoutPassCriteria",
+    "PassCriterionResult",
+    "PassCriteriaEvaluation",
+    "evaluate_pass_criteria",
+    "ResearchGateStage",
+    "GateDecision",
+    "determine_gate_stage",
+    "TradeReturnDistribution",
+    "trade_return_distribution",
+    "random_symbol_and_timing_placebo",
 ]
