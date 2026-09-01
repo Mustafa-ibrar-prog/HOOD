@@ -264,7 +264,10 @@ def run_trading_cycle(
     trade_count_check = risk_manager.check_trade_count(risk_state.trades_opened)
     cutoff_check = risk_manager.check_cutoff_time(now)
     if trade_count_check.passed and cutoff_check.passed and settings.max_new_entries_per_cycle > 0:
-        scanner = StrategyScanner([MomentumBreakoutStrategy()])
+        # now= threads the cycle's own injected time through to expiration
+        # selection — see MomentumBreakoutStrategy's constructor docstring
+        # for the bug this fixes (Phase 1 audit finding).
+        scanner = StrategyScanner([MomentumBreakoutStrategy(now=now)])
         scan_result = scanner.scan_for_setups(market_data, settings.scan_universe)
         report.scan_candidate_count = len(scan_result.candidates)
         decision_logger.log_decision(

@@ -61,8 +61,22 @@ class MomentumBreakoutConfig:
 class MomentumBreakoutStrategy(Strategy):
     name = "momentum-breakout-calls"
 
-    def __init__(self, config: MomentumBreakoutConfig | None = None):
+    def __init__(self, config: MomentumBreakoutConfig | None = None, *, now: datetime | None = None):
         self.config = config or MomentumBreakoutConfig()
+        # Injectable "current time" for expiration-window selection —
+        # optional and backward compatible: omitting it preserves the
+        # exact prior behavior (real wall clock). Fixes a real bug flagged
+        # in the Phase 1 audit: _select_expiration() previously always
+        # called datetime.now(timezone.utc) directly, unlike every other
+        # time-dependent function in this codebase (run_trading_cycle,
+        # is_within_monitoring_window, PositionMonitor.run_once all accept
+        # `now`), which made this strategy's expiration window silently
+        # drift out of sync with a cycle's own injected `now` — orchestrator.py
+        # now passes its own `now` through here.
+        self._now = now
+
+    def _current_time(self) -> datetime:
+        return self._now if self._now is not None else datetime.now(timezone.utc)
 
     def scan(self, market: MarketDataProvider, universe: Sequence[str]) -> list[SetupCandidate]:
         candidates: list[SetupCandidate] = []
@@ -184,7 +198,7 @@ class MomentumBreakoutStrategy(Strategy):
         return best
 
     def _select_expiration(self, market: MarketDataProvider, symbol: str) -> date | None:
-        today = datetime.now(timezone.utc).date()
+        today = self._current_time().date()
         expirations = market.get_option_expirations(symbol)
         in_window = [
             exp for exp in expirations if self.config.min_days_to_expiration <= (exp - today).days <= self.config.max_days_to_expiration
