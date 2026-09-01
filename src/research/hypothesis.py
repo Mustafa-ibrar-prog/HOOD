@@ -50,6 +50,13 @@ class Hypothesis:
     universe: tuple[str, ...] = ()
     expected_mechanism: str = ""  # the causal story for WHY this should work, distinct from economic_intuition's broader framing
     falsification_criteria: tuple[str, ...] = ()  # what result(s) would prove this hypothesis WRONG, written before testing
+    # Phase 8 additions (additive, optional/defaulted): links a DEVELOPMENT
+    # hypothesis (a tradeable translation of a discovery-stage finding)
+    # back to the discovery hypothesis it derives from, WITHOUT modifying
+    # the original — see src.research.volume_anomaly_strategy's module
+    # docstring for why this distinction matters.
+    parent_hypothesis_id: str | None = None
+    development_version: str | None = None
 
     def __post_init__(self) -> None:
         if self.expected_direction not in ("positive", "negative", "unsigned"):
@@ -86,6 +93,8 @@ class Hypothesis:
             universe=tuple(data.get("universe", ())),
             expected_mechanism=data.get("expected_mechanism", ""),
             falsification_criteria=tuple(data.get("falsification_criteria", ())),
+            parent_hypothesis_id=data.get("parent_hypothesis_id"),
+            development_version=data.get("development_version"),
         )
 
 

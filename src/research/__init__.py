@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from src.research.alpha_decay import STANDARD_DECAY_HORIZONS, AlphaDecayReport, HorizonPoint, measure_alpha_decay
 from src.research.analysis import FeatureAnalysisResult, QuantileResult, analyze_feature, pearson_correlation, rank_values, spearman_correlation
+from src.research.autocorrelation import autocorrelation_profile, lag_autocorrelation
 from src.research.baseline import RandomEntryTrade, buy_and_hold_curve, no_trade_curve, random_entry_baseline
 from src.research.baseline_comparison import BaselineComparisonReport, compare_against_baselines
 from src.research.classification import ClassificationResult, StrategyClassification, classify_strategy
@@ -137,6 +138,7 @@ from src.research.strategy import ResearchSignal, ResearchStrategy, ResearchStra
 from src.research.sweep import ParameterStabilityReport, SweepPoint, run_parameter_sweep, summarize_parameter_stability
 from src.research.targets import future_return
 from src.research.trade_distribution import TradeReturnDistribution, trade_return_distribution
+from src.research.volume_anomaly_strategy import VolumeAnomalyLongStrategy
 from src.research.validation import (
     CostSensitivityPoint,
     CostSensitivityReport,
@@ -283,4 +285,6 @@ __all__ = [
     "ResearchLifecycleStage", "StageRequiresHumanActionError", "assert_code_may_set_stage", "can_transition",
     "SCORECARD_DIMENSIONS", "DimensionVerdict", "ResearchScorecard", "ScorecardDimension", "build_scorecard", "classify_with_scorecard",
     "normal_cdf", "sharpe_ratio_from_returns", "t_statistic", "t_test_p_value", "two_tailed_p_value_from_z",
+    "autocorrelation_profile", "lag_autocorrelation",
+    "VolumeAnomalyLongStrategy",
 ]
