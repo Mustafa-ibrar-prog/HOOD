@@ -261,6 +261,67 @@ class CostSensitivityReport:
     viable_at_3x: bool | None
 
 
+# ==============================================================================
+# EXECUTION ROBUSTNESS (Phase 5, section 13)
+# ==============================================================================
+
+
+@dataclass(frozen=True)
+class ExecutionRobustnessPoint:
+    scenario: str  # e.g. "base (next-bar open, 1x slippage, 1x cost)", "extra 1-bar delay", "2x slippage", "2x cost"
+    trade_count: int
+    net_pnl_total: float
+    viable: bool
+
+
+@dataclass(frozen=True)
+class ExecutionRobustnessReport:
+    points: tuple[ExecutionRobustnessPoint, ...]
+
+    @property
+    def fraction_viable(self) -> float | None:
+        if not self.points:
+            return None
+        return sum(1 for p in self.points if p.viable) / len(self.points)
+
+
+def run_execution_robustness(
+    *,
+    research_strategy: ResearchStrategy,
+    bars_by_symbol: Mapping[str, Sequence[Bar]],
+    config: BacktestConfig,
+    base_execution_model: ExecutionModel,
+    base_slippage_model: SlippageModel,
+    base_cost_model: TransactionCostModel,
+    spread_model: SpreadModel,
+    position_sizer: PositionSizer,
+    risk_adapter: BacktestRiskAdapter,
+) -> ExecutionRobustnessReport:
+    """Section 13's exact scenario list: BASE (next-bar open), an
+    additional execution delay, higher slippage, and higher transaction
+    costs — the strategy must not depend on unrealistically perfect
+    execution to look good."""
+    from src.backtesting.execution_models import NextBarExecutionModel
+
+    scenarios: list[tuple[str, ExecutionModel, SlippageModel, TransactionCostModel]] = [
+        ("base (next-bar open)", base_execution_model, base_slippage_model, base_cost_model),
+        ("extra execution delay (+1 bar)", NextBarExecutionModel(price_field="open", delay_bars=base_execution_model.delay_bars() + 1), base_slippage_model, base_cost_model),
+        ("higher slippage (2x)", base_execution_model, _ScaledSlippageModel(base_slippage_model, 2.0), base_cost_model),
+        ("higher transaction costs (2x)", base_execution_model, base_slippage_model, _ScaledCostModel(base_cost_model, 2.0)),
+    ]
+
+    points = []
+    for label, execution_model, slippage_model, cost_model in scenarios:
+        result = run_research_backtest(
+            research_strategy=research_strategy, bars_by_symbol=bars_by_symbol, config=config, execution_model=execution_model,
+            slippage_model=slippage_model, cost_model=cost_model, spread_model=spread_model, position_sizer=position_sizer, risk_adapter=risk_adapter,
+        )
+        net_total = sum(t.net_pnl for t in result.trades)
+        points.append(ExecutionRobustnessPoint(scenario=label, trade_count=len(result.trades), net_pnl_total=net_total, viable=net_total > 0))
+
+    return ExecutionRobustnessReport(points=tuple(points))
+
+
 def run_cost_sensitivity(
     *,
     research_strategy: ResearchStrategy,

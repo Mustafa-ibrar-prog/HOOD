@@ -63,6 +63,8 @@ class ExperimentRecord:
     tags: tuple[str, ...] = ()
     backtest_id: str | None = None  # FK into BacktestResult/BacktestTradeJournal (Phase 3)
     supersedes_experiment_id: str | None = None  # links a revised experiment to the one it replaces, without overwriting it
+    hypothesis_id: str | None = None  # FK into HypothesisRegistry (Phase 4) — enables search-space accounting (Phase 5)
+    universe_name: str | None = None  # FK into a src.data.universe.Universe's .name
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -93,6 +95,8 @@ class ExperimentRecord:
             tags=tuple(data.get("tags", ())),
             backtest_id=data.get("backtest_id"),
             supersedes_experiment_id=data.get("supersedes_experiment_id"),
+            hypothesis_id=data.get("hypothesis_id"),
+            universe_name=data.get("universe_name"),
         )
 
 
@@ -123,6 +127,8 @@ class ExperimentStore:
         tags: Sequence[str] = (),
         backtest_id: str | None = None,
         supersedes_experiment_id: str | None = None,
+        hypothesis_id: str | None = None,
+        universe_name: str | None = None,
     ) -> ExperimentRecord:
         now = now or datetime.now(timezone.utc)
         record = ExperimentRecord(
@@ -147,6 +153,8 @@ class ExperimentStore:
             tags=tuple(tags),
             backtest_id=backtest_id,
             supersedes_experiment_id=supersedes_experiment_id,
+            hypothesis_id=hypothesis_id,
+            universe_name=universe_name,
         )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a") as f:
@@ -177,6 +185,8 @@ class ExperimentStore:
         min_oos_sharpe: float | None = None,
         failed_at_cost_multiplier: float | None = None,
         tag: str | None = None,
+        hypothesis_id: str | None = None,
+        universe_name: str | None = None,
     ) -> list[ExperimentRecord]:
         """Answers the section-20 example questions directly:
           query(strategy_family="momentum")                 -> "every experiment that tested momentum"
@@ -201,4 +211,8 @@ class ExperimentStore:
             ]
         if tag is not None:
             records = [r for r in records if tag in r.tags]
+        if hypothesis_id is not None:
+            records = [r for r in records if r.hypothesis_id == hypothesis_id]
+        if universe_name is not None:
+            records = [r for r in records if r.universe_name == universe_name]
         return records
