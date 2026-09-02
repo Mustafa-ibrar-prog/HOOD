@@ -46,6 +46,15 @@ from src.research.volatility_targets import (
     future_realized_variance,
     future_realized_volatility,
 )
+from src.research.phase10_targets import (
+    future_absolute_return,
+    future_max_drawdown,
+    future_risk_adjusted_return,
+    future_volatility_change,
+    future_volatility_direction,
+)
+from src.research.regime_transitions import STATES_LOW_NORMAL_HIGH_EXTREME, RegimeTransitionReport, analyze_regime_transitions
+from src.research.state_conditional_stats import StateBucketStats, bucket_stats_by_state
 from src.research.cross_sectional_placebo import (
     CrossSectionalPlaceboResult,
     irrelevant_feature_control,
@@ -313,4 +322,8 @@ __all__ = [
     "OLSResult", "ols_regression",
     "future_absolute_cumulative_return", "future_max_absolute_move", "future_realized_variance", "future_realized_volatility",
     "compute_pearson_ic_series", "summarize_pearson_ic",
+    # Phase 10 additions
+    "future_absolute_return", "future_max_drawdown", "future_risk_adjusted_return", "future_volatility_change", "future_volatility_direction",
+    "STATES_LOW_NORMAL_HIGH_EXTREME", "RegimeTransitionReport", "analyze_regime_transitions",
+    "StateBucketStats", "bucket_stats_by_state",
 ]
