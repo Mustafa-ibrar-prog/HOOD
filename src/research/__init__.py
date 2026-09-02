@@ -55,6 +55,26 @@ from src.research.phase10_targets import (
 )
 from src.research.regime_transitions import STATES_LOW_NORMAL_HIGH_EXTREME, RegimeTransitionReport, analyze_regime_transitions
 from src.research.state_conditional_stats import StateBucketStats, bucket_stats_by_state
+from src.research.exposure_mechanisms import (
+    COMPRESSION_EXPANSION_EXPOSURE,
+    EXPOSURE_MAX,
+    EXPOSURE_MIN,
+    MECHANISMS,
+    REBALANCE_FREQUENCIES,
+    REGIME_EXPOSURE,
+    TARGET_VOL_CANDIDATES,
+    ExposureMechanismConfig,
+    compute_exposure_series,
+    random_exposure_series,
+    shuffled_exposure_series,
+)
+from src.research.exposure_sizing import EqualWeightExposureSizer
+from src.research.exposure_strategy import PrecomputedExposureStrategy
+from src.research.exposure_risk_adapter import ExposureRiskAdapter
+from src.research.exposure_cost_stress import ExposureStressPoint, ExposureStressReport, run_exposure_cost_stress, run_exposure_execution_stress
+from src.research.tail_risk import TailRiskReport, compute_tail_risk, recovery_time_bars
+from src.research.return_series_bootstrap import block_bootstrap_return_series, stationary_bootstrap_return_series
+from src.research.volatility_forecast_error import ForecastErrorReport, compute_forecast_error
 from src.research.cross_sectional_placebo import (
     CrossSectionalPlaceboResult,
     irrelevant_feature_control,
@@ -326,4 +346,12 @@ __all__ = [
     "future_absolute_return", "future_max_drawdown", "future_risk_adjusted_return", "future_volatility_change", "future_volatility_direction",
     "STATES_LOW_NORMAL_HIGH_EXTREME", "RegimeTransitionReport", "analyze_regime_transitions",
     "StateBucketStats", "bucket_stats_by_state",
+    # Phase 11 additions
+    "COMPRESSION_EXPANSION_EXPOSURE", "EXPOSURE_MAX", "EXPOSURE_MIN", "MECHANISMS", "REBALANCE_FREQUENCIES", "REGIME_EXPOSURE", "TARGET_VOL_CANDIDATES",
+    "ExposureMechanismConfig", "compute_exposure_series", "random_exposure_series", "shuffled_exposure_series",
+    "EqualWeightExposureSizer", "PrecomputedExposureStrategy", "ExposureRiskAdapter",
+    "ExposureStressPoint", "ExposureStressReport", "run_exposure_cost_stress", "run_exposure_execution_stress",
+    "TailRiskReport", "compute_tail_risk", "recovery_time_bars",
+    "block_bootstrap_return_series", "stationary_bootstrap_return_series",
+    "ForecastErrorReport", "compute_forecast_error",
 ]
