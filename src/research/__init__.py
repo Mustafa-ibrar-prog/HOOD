@@ -72,6 +72,13 @@ from src.research.exposure_sizing import EqualWeightExposureSizer
 from src.research.exposure_strategy import PrecomputedExposureStrategy
 from src.research.exposure_risk_adapter import ExposureRiskAdapter
 from src.research.exposure_cost_stress import ExposureStressPoint, ExposureStressReport, run_exposure_cost_stress, run_exposure_execution_stress
+from src.research.residual_momentum import (
+    cumulative_residual_momentum,
+    estimate_rolling_beta,
+    market_residual_returns,
+    market_sector_residual_returns,
+    sector_residual_returns,
+)
 from src.research.tail_risk import TailRiskReport, compute_tail_risk, recovery_time_bars
 from src.research.return_series_bootstrap import block_bootstrap_return_series, stationary_bootstrap_return_series
 from src.research.volatility_forecast_error import ForecastErrorReport, compute_forecast_error
@@ -351,6 +358,8 @@ __all__ = [
     "ExposureMechanismConfig", "compute_exposure_series", "random_exposure_series", "shuffled_exposure_series",
     "EqualWeightExposureSizer", "PrecomputedExposureStrategy", "ExposureRiskAdapter",
     "ExposureStressPoint", "ExposureStressReport", "run_exposure_cost_stress", "run_exposure_execution_stress",
+    # Phase 12 additions
+    "estimate_rolling_beta", "market_residual_returns", "sector_residual_returns", "market_sector_residual_returns", "cumulative_residual_momentum",
     "TailRiskReport", "compute_tail_risk", "recovery_time_bars",
     "block_bootstrap_return_series", "stationary_bootstrap_return_series",
     "ForecastErrorReport", "compute_forecast_error",
