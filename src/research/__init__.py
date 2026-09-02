@@ -72,6 +72,7 @@ from src.research.exposure_sizing import EqualWeightExposureSizer
 from src.research.exposure_strategy import PrecomputedExposureStrategy
 from src.research.exposure_risk_adapter import ExposureRiskAdapter
 from src.research.exposure_cost_stress import ExposureStressPoint, ExposureStressReport, run_exposure_cost_stress, run_exposure_execution_stress
+from src.research.overnight_intraday_targets import future_intraday_return, future_overnight_return
 from src.research.residual_momentum import (
     cumulative_residual_momentum,
     estimate_rolling_beta,
@@ -360,6 +361,8 @@ __all__ = [
     "ExposureStressPoint", "ExposureStressReport", "run_exposure_cost_stress", "run_exposure_execution_stress",
     # Phase 12 additions
     "estimate_rolling_beta", "market_residual_returns", "sector_residual_returns", "market_sector_residual_returns", "cumulative_residual_momentum",
+    # Phase 13 additions
+    "future_overnight_return", "future_intraday_return",
     "TailRiskReport", "compute_tail_risk", "recovery_time_bars",
     "block_bootstrap_return_series", "stationary_bootstrap_return_series",
     "ForecastErrorReport", "compute_forecast_error",
