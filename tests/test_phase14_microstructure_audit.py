@@ -70,14 +70,23 @@ def test_only_day_timeframe_is_ever_persisted_for_the_research_universe():
 def test_no_order_book_or_trade_direction_code_exists_anywhere_in_src_or_scripts():
     """Repository-wide static guarantee: no order-book/depth/imbalance/
     trade-direction/signed-volume code exists in src/ or scripts/ — the
-    audit's Part E/D finding, made regression-proof. The audit script
-    itself is exempt: it legitimately NAMES these terms in its
-    explanatory output precisely to document their absence."""
+    audit's Part E/D finding, made regression-proof. A small set of
+    documentation-only files are exempt: they legitimately NAME these
+    terms in explanatory text precisely to document their absence (the
+    Phase 14 audit script itself, and Phase 15's data-source provenance
+    matrix, which documents the SAME live-only Level-2/order-book finding
+    from a data-architecture angle — see src/data/source_profile.py's
+    'Level 2 order book' row). Neither actually implements order-book
+    code."""
     forbidden_terms = ("order_book", "order book", "level2", "level 2", "trade_direction", "signed_volume", "order_imbalance")
-    audit_script = REPO_ROOT / "scripts" / "phase14_step0_microstructure_data_audit.py"
+    exempt_files = {
+        REPO_ROOT / "scripts" / "phase14_step0_microstructure_data_audit.py",
+        REPO_ROOT / "src" / "data" / "source_profile.py",
+        REPO_ROOT / "scripts" / "phase15_data_architecture_audit.py",
+    }
     for directory in ("src", "scripts"):
         for path in (REPO_ROOT / directory).rglob("*.py"):
-            if path == audit_script:
+            if path in exempt_files:
                 continue
             source = path.read_text()
             for term in forbidden_terms:

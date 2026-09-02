@@ -13,7 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
+
+if TYPE_CHECKING:
+    from src.data.universe import Universe
 
 
 def content_hash(payload: Mapping[str, Any], *, length: int = 16) -> str:
@@ -64,3 +69,44 @@ def compute_feature_version(feature_manifest: Sequence[Mapping[str, Any]]) -> st
         key=lambda d: d["name"],
     )
     return content_hash({"features": canonical})
+
+
+def compute_universe_version(universe: "Universe") -> str:
+    """Identifies exactly which universe (name + membership) a research
+    result was built from — a future data source's universe_version field
+    (Phase 15, Part 14) should be this, not a hand-typed string. Order-
+    independent over membership (sorted symbols) so re-registering the
+    same Universe with members listed in a different order never produces
+    a spuriously different version."""
+    return content_hash({"name": universe.name, "symbols": sorted(universe.symbols)})
+
+
+@dataclass(frozen=True)
+class DatasetVersionRecord:
+    """Phase 15, Part 14 — what a future research dataset must record to
+    be reproducible from a known version, generalizing compute_data_version
+    (which only identifies one symbol/timeframe/source/date-range) to the
+    full set of facts Part 14 asks for: source, retrieval time, source
+    version, schema version, adjustment status, universe version, and
+    feature version. `fingerprint()` composes them into one deterministic
+    id the same way compute_data_version/compute_feature_version already
+    do — reused via content_hash, not reimplemented."""
+
+    source: str
+    retrieval_timestamp: datetime
+    source_version: str | None
+    schema_version: str
+    adjustment_status: str
+    universe_version: str
+    feature_version: str | None = None
+
+    def fingerprint(self) -> str:
+        return content_hash({
+            "source": self.source,
+            "retrieval_timestamp": self.retrieval_timestamp.isoformat(),
+            "source_version": self.source_version,
+            "schema_version": self.schema_version,
+            "adjustment_status": self.adjustment_status,
+            "universe_version": self.universe_version,
+            "feature_version": self.feature_version,
+        })
