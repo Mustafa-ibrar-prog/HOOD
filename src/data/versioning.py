@@ -90,7 +90,16 @@ class DatasetVersionRecord:
     version, schema version, adjustment status, universe version, and
     feature version. `fingerprint()` composes them into one deterministic
     id the same way compute_data_version/compute_feature_version already
-    do — reused via content_hash, not reimplemented."""
+    do — reused via content_hash, not reimplemented.
+
+    Extended in Phase 16, Part 13 (as that phase's own instruction
+    anticipated — "Extend existing DatasetVersionRecord as necessary")
+    with `fact_selection_version` and `timestamp_policy_version`: two
+    datasets built from the same SEC source/schema/universe but under a
+    different causal timestamp policy, or a different fact whitelist,
+    must NOT collide on fingerprint() — these two fields are what makes
+    that true. Both are optional (None) for non-SEC callers, so this
+    stays a fully backward-compatible extension."""
 
     source: str
     retrieval_timestamp: datetime
@@ -99,6 +108,8 @@ class DatasetVersionRecord:
     adjustment_status: str
     universe_version: str
     feature_version: str | None = None
+    fact_selection_version: str | None = None
+    timestamp_policy_version: str | None = None
 
     def fingerprint(self) -> str:
         return content_hash({
@@ -109,4 +120,6 @@ class DatasetVersionRecord:
             "adjustment_status": self.adjustment_status,
             "universe_version": self.universe_version,
             "feature_version": self.feature_version,
+            "fact_selection_version": self.fact_selection_version,
+            "timestamp_policy_version": self.timestamp_policy_version,
         })

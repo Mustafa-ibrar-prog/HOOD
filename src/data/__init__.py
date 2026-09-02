@@ -39,6 +39,35 @@ from src.data.store_interfaces import (
     QuoteStore,
     TradeStore,
 )
+from src.data.sec_filing_store import (
+    FORM_PROFILES,
+    UNKNOWN_FORM_PROFILE,
+    FilingFormProfile,
+    SECFactRecord,
+    SECFilingRecord,
+    SECFilingStore,
+    SECFilingStoreError,
+    classify_form,
+)
+from src.data.sec_timestamp_policy import SECCausalPolicy, sec_is_available_asof
+from src.data.sec_fact_quality import (
+    FactQualityClass,
+    SECQualityReport,
+    classify_fact,
+    find_duplicate_facts,
+    find_impossible_period_ordering,
+    find_unit_inconsistencies,
+)
+from src.data.sec_concepts import CONCEPT_MAP, CONCEPT_MAP_BY_SOURCE, ConceptMapping, is_known_reliable_concept, normalized_concept_for
+from src.data.sec_snapshot import get_available_facts, get_available_facts_for_symbol, latest_known_value
+from src.data.sec_dataset import (
+    DATASET_NAME,
+    DEFAULT_FACT_WHITELIST,
+    SECDatasetSpec,
+    SECFundamentalObservation,
+    generate_asof_instants,
+    generate_sec_fundamentals_asof,
+)
 
 __all__ = [
     "Bar",
@@ -90,4 +119,34 @@ __all__ = [
     "ProvenancedObservation",
     "QuoteStore",
     "TradeStore",
+    "FORM_PROFILES",
+    "UNKNOWN_FORM_PROFILE",
+    "FilingFormProfile",
+    "SECFactRecord",
+    "SECFilingRecord",
+    "SECFilingStore",
+    "SECFilingStoreError",
+    "classify_form",
+    "SECCausalPolicy",
+    "sec_is_available_asof",
+    "FactQualityClass",
+    "SECQualityReport",
+    "classify_fact",
+    "find_duplicate_facts",
+    "find_impossible_period_ordering",
+    "find_unit_inconsistencies",
+    "CONCEPT_MAP",
+    "CONCEPT_MAP_BY_SOURCE",
+    "ConceptMapping",
+    "is_known_reliable_concept",
+    "normalized_concept_for",
+    "get_available_facts",
+    "get_available_facts_for_symbol",
+    "latest_known_value",
+    "DATASET_NAME",
+    "DEFAULT_FACT_WHITELIST",
+    "SECDatasetSpec",
+    "SECFundamentalObservation",
+    "generate_asof_instants",
+    "generate_sec_fundamentals_asof",
 ]
