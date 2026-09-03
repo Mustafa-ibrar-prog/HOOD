@@ -122,6 +122,26 @@ from src.options.outlier_treatment import (
 )
 from src.options.dependence_bootstrap import SymbolClusterBootstrapReport, symbol_cluster_bootstrap_ic
 
+# --- Phase 22 additions (options-specific alpha source discovery) ---
+from src.options.price_volatility_proxy import (
+    close_to_close_volatility,
+    mean_abs_return,
+    parkinson_volatility,
+    range_expansion_ratio,
+    trailing_return,
+    true_range_proxy,
+    volatility_ratio,
+)
+from src.options.momentum_features import (
+    option_gap,
+    option_range_expansion,
+    option_return_acceleration,
+    trailing_option_return,
+    trend_persistence,
+)
+from src.options.relative_return import beta_scaled_excess_return, naive_excess_return, rolling_beta
+from src.options.cost_model import FIVE_X_ASSUMPTION
+
 __all__ = [
     "OptionContract",
     "OptionChainObservation",
@@ -236,4 +256,20 @@ __all__ = [
     "winsorize",
     "SymbolClusterBootstrapReport",
     "symbol_cluster_bootstrap_ic",
+    "close_to_close_volatility",
+    "mean_abs_return",
+    "parkinson_volatility",
+    "range_expansion_ratio",
+    "trailing_return",
+    "true_range_proxy",
+    "volatility_ratio",
+    "option_gap",
+    "option_range_expansion",
+    "option_return_acceleration",
+    "trailing_option_return",
+    "trend_persistence",
+    "beta_scaled_excess_return",
+    "naive_excess_return",
+    "rolling_beta",
+    "FIVE_X_ASSUMPTION",
 ]

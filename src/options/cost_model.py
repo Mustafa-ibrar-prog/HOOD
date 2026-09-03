@@ -71,3 +71,13 @@ COST_SENSITIVITY_ASSUMPTIONS: tuple[CostAssumption, ...] = (
     CostAssumption("2x ASSUMPTION (typical)", spread_pct_of_mid=0.06, slippage_pct=0.02, commission_per_contract=0.65, rationale="ASSUMPTION: a typical single-stock option away from the most liquid strikes"),
     CostAssumption("3x ASSUMPTION (wide/thin contract)", spread_pct_of_mid=0.10, slippage_pct=0.04, commission_per_contract=0.65, rationale="ASSUMPTION: a thin, wide-spread contract (e.g. far OTM, far-dated) -- no real historical spread data exists to calibrate this, it is a stress case only"),
 )
+
+# Phase 21/22's extreme/illiquid stress case, added additively (Phase 19's
+# COST_SENSITIVITY_ASSUMPTIONS tuple above is left untouched -- some
+# callers explicitly want the 1x/2x/3x ladder without this 4th, more
+# extreme tier). Never calibrated to any observed spread (none exist
+# historically) -- a stress case only, same as the 3x tier's own rationale.
+FIVE_X_ASSUMPTION = CostAssumption(
+    "5x ASSUMPTION (extreme/illiquid stress case)", spread_pct_of_mid=0.18, slippage_pct=0.07, commission_per_contract=0.65,
+    rationale="ASSUMPTION: an extreme stress case (e.g. a far-dated, far-OTM, thinly-quoted contract) -- not calibrated to any observed spread (none exist historically)",
+)
