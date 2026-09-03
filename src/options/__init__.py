@@ -142,6 +142,31 @@ from src.options.momentum_features import (
 from src.options.relative_return import beta_scaled_excess_return, naive_excess_return, rolling_beta
 from src.options.cost_model import FIVE_X_ASSUMPTION
 
+# --- Phase 24 additions (historical options data expansion & alpha-source audit) ---
+from src.options.historical_data_interfaces import (
+    ContractIdentity,
+    ContractLifecycle,
+    ContractLifecycleStatus,
+    ContractLifecycleStore,
+    HistoricalOptionChainStore,
+    HistoricalOptionContractStore,
+    HistoricalOptionGreeksStore,
+    HistoricalOptionIVStore,
+    HistoricalOptionOpenInterestStore,
+    HistoricalOptionQuoteStore,
+    HistoricalOptionTradeStore,
+    HistoricalOrLive,
+    OptionDataProvenance,
+)
+from src.options.historical_depth_audit import (
+    HISTORICAL_DEPTH_PROBES,
+    POINT_IN_TIME_EXISTENCE_RECONCILIATION,
+    HistoricalDepthProbe,
+    extended_capability_matrix,
+    historical_depth_lower_bound,
+)
+from src.options.vendor_scorecard import VENDOR_SCORECARD, OverallClassification, VendorScorecardRow, VerificationLevel, rows_by_classification
+
 __all__ = [
     "OptionContract",
     "OptionChainObservation",
@@ -273,4 +298,27 @@ __all__ = [
     "naive_excess_return",
     "rolling_beta",
     "FIVE_X_ASSUMPTION",
+    "ContractIdentity",
+    "ContractLifecycle",
+    "ContractLifecycleStatus",
+    "ContractLifecycleStore",
+    "HistoricalOptionChainStore",
+    "HistoricalOptionContractStore",
+    "HistoricalOptionGreeksStore",
+    "HistoricalOptionIVStore",
+    "HistoricalOptionOpenInterestStore",
+    "HistoricalOptionQuoteStore",
+    "HistoricalOptionTradeStore",
+    "HistoricalOrLive",
+    "OptionDataProvenance",
+    "HISTORICAL_DEPTH_PROBES",
+    "POINT_IN_TIME_EXISTENCE_RECONCILIATION",
+    "HistoricalDepthProbe",
+    "extended_capability_matrix",
+    "historical_depth_lower_bound",
+    "VENDOR_SCORECARD",
+    "OverallClassification",
+    "VendorScorecardRow",
+    "VerificationLevel",
+    "rows_by_classification",
 ]
