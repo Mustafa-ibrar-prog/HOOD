@@ -1,18 +1,26 @@
-"""Phase 16, Part 10 — a small, explicit concept whitelist and
-normalization layer.
+"""Phase 16/17, Part 10, Phase 17 Part 6 — a small, explicit concept
+whitelist and normalization layer.
 
-Real probe evidence (sec_filing_store.py's module docstring): AAPL's
-FY2022 10-K does NOT tag revenue as "Revenues" — a request for that exact
-concept returned zero rows; the real tag is
-"RevenueFromContractWithCustomerExcludingAssessedTax". This is exactly
-the "not every company reports under identical taxonomy identifiers"
-risk Part 10 names. Rather than guess a single canonical tag per concept,
-`CONCEPT_MAP` lists every SOURCE concept this phase independently
-verified (by real probe) resolves correctly, each mapped to one
-NORMALIZED concept name — never the reverse (no code path invents a
-mapping for an unverified source concept). A source concept that isn't
-in this map is, by construction, REQUIRES_NORMALIZATION (see
-sec_fact_quality.classify_fact) — never silently coerced.
+Real probe evidence (Phase 16): AAPL's FY2022 10-K does NOT tag revenue
+as "Revenues" — a request for that exact concept returned zero rows; the
+real tag is "RevenueFromContractWithCustomerExcludingAssessedTax". Phase
+17 extended this to MSFT/NVDA/JPM and found the split is real and
+issuer-grouped, not random: AAPL and MSFT both use
+RevenueFromContractWithCustomerExcludingAssessedTax; NVDA and JPM both
+use the plain "Revenues" tag instead (confirmed: neither NVDA's nor
+JPM's filing has a single row under
+RevenueFromContractWithCustomerExcludingAssessedTax). Rather than guess a
+single canonical tag per concept, `CONCEPT_MAP` lists every SOURCE
+concept this phase independently verified (by real probe) resolves
+correctly, each mapped to one NORMALIZED concept name — never the
+reverse (no code path invents a mapping for an unverified source
+concept). A source concept that isn't in this map is, by construction,
+REQUIRES_NORMALIZATION (see sec_fact_quality.classify_fact) — never
+silently coerced. A source concept present but marked `reliable=False`
+(see CashAndDueFromBanks below) is likewise NOT treated as certified —
+its semantic equivalence to the normalized concept is genuinely
+ambiguous, and Part 6 of Phase 17 is explicit: "No silent semantic
+equivalence."
 """
 
 from __future__ import annotations
@@ -81,14 +89,52 @@ CONCEPT_MAP: tuple[ConceptMapping, ...] = (
         taxonomy="us-gaap", expected_unit="iso4217:USD", reliable=True,
         notes="Confirmed present with axises=() for AAPL FY2022 (122,151,000,000).",
     ),
+    # --- Phase 17 additions --------------------------------------------------------------------
+    ConceptMapping(
+        source_concept="Revenues", normalized_concept="revenue",
+        taxonomy="us-gaap", expected_unit="iso4217:USD", reliable=True,
+        notes="Confirmed via real probe: NVDA FY2023 10-K (period 2022-01-31/2023-01-29), axises=(), "
+              "value=26,974,000,000; JPM FY2022 10-K (period 2022-01-01/2022-12-31), axises=(), "
+              "value=128,695,000,000. Neither NVDA's nor JPM's filing has ANY row under "
+              "RevenueFromContractWithCustomerExcludingAssessedTax (0 rows for both) -- this is the "
+              "issuer's ONLY revenue tag, not a duplicate/alternate of the other mapping above. "
+              "AAPL/MSFT use RevenueFromContractWithCustomerExcludingAssessedTax exclusively; NVDA/JPM "
+              "use Revenues exclusively -- confirmed disjoint across all 4 issuers probed, no issuer "
+              "populates both tags for the same period this phase observed.",
+    ),
+    ConceptMapping(
+        source_concept="PaymentsToAcquirePropertyPlantAndEquipment", normalized_concept="capital_expenditures",
+        taxonomy="us-gaap", expected_unit="iso4217:USD", reliable=True,
+        notes="Confirmed via real probe: AAPL FY2022 10-K, axises=(), 3 years present "
+              "(FY2020=7,309,000,000; FY2021=11,085,000,000; FY2022=10,708,000,000). Only confirmed for "
+              "AAPL this phase -- MSFT/NVDA/JPM capex was not independently probed, so cross-issuer "
+              "reliability for this concept is UNVERIFIED beyond AAPL (see sec_certification.py, which "
+              "certifies this concept CONDITIONALLY_CERTIFIED, restricted to AAPL, for exactly this reason).",
+    ),
+    ConceptMapping(
+        source_concept="CashAndDueFromBanks", normalized_concept="cash_and_equivalents",
+        taxonomy="us-gaap", expected_unit="iso4217:USD", reliable=False,
+        notes="JPM does NOT report CashAndCashEquivalentsAtCarryingValue at all (0 rows, confirmed by "
+              "real probe) -- CashAndDueFromBanks is JPM's own real, consolidated (axises=()) cash-like "
+              "balance (FY2021=26,438,000,000; FY2022=27,697,000,000). Deliberately marked "
+              "reliable=False and NOT treated as equivalent to cash_and_equivalents: a bank's 'cash and "
+              "due from banks' may or may not include the same scope of short-term instruments as a "
+              "non-bank's 'cash and cash equivalents' (e.g. it may exclude money-market/short-term-"
+              "investment balances the other concept includes) -- Part 6's explicit 'no silent semantic "
+              "equivalence' rule. Recorded here so the real, verified alternative concept is documented "
+              "and traceable, not silently dropped -- but it stays REQUIRES_NORMALIZATION until someone "
+              "explicitly reviews and defends the equivalence.",
+    ),
 )
 
 CONCEPT_MAP_BY_SOURCE: dict[str, ConceptMapping] = {m.source_concept: m for m in CONCEPT_MAP}
 
-# Part 10 explicitly lists capital expenditures as "if reliably available" -- it was NOT probed
-# this phase (no real call verified a CapitalExpenditures-shaped concept against a real reported
-# figure), so it is deliberately absent from CONCEPT_MAP rather than guessed. Any source concept
-# not in CONCEPT_MAP_BY_SOURCE, capex included, is REQUIRES_NORMALIZATION by construction.
+
+def source_concepts_for(normalized_concept: str) -> tuple[str, ...]:
+    """Every source concept (reliable or not) that maps to
+    `normalized_concept` -- e.g. source_concepts_for("revenue") ==
+    ("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues")."""
+    return tuple(m.source_concept for m in CONCEPT_MAP if m.normalized_concept == normalized_concept)
 
 
 def is_known_reliable_concept(source_concept: str) -> bool:

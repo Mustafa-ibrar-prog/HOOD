@@ -58,8 +58,28 @@ from src.data.sec_fact_quality import (
     find_impossible_period_ordering,
     find_unit_inconsistencies,
 )
-from src.data.sec_concepts import CONCEPT_MAP, CONCEPT_MAP_BY_SOURCE, ConceptMapping, is_known_reliable_concept, normalized_concept_for
+from src.data.sec_concepts import CONCEPT_MAP, CONCEPT_MAP_BY_SOURCE, ConceptMapping, is_known_reliable_concept, normalized_concept_for, source_concepts_for
 from src.data.sec_snapshot import get_available_facts, get_available_facts_for_symbol, latest_known_value
+from src.data.sec_period_semantics import (
+    EXPECTED_PERIOD_KIND,
+    DurationSpanClass,
+    FactPeriodKind,
+    actual_period_kind,
+    classify_duration_span,
+    select_by_span,
+    validate_period_kind,
+)
+from src.data.sec_certification import (
+    CERTIFICATION_BY_CONCEPT,
+    CERTIFICATION_TABLE,
+    CertificationLevel,
+    ConceptCertification,
+    DatasetCertificationResult,
+    MissingDataReason,
+    certification_for,
+    certify_sec_fundamentals_asof_dataset,
+    is_safe_for_issuer,
+)
 from src.data.sec_dataset import (
     DATASET_NAME,
     DEFAULT_FACT_WHITELIST,
@@ -140,9 +160,26 @@ __all__ = [
     "ConceptMapping",
     "is_known_reliable_concept",
     "normalized_concept_for",
+    "source_concepts_for",
     "get_available_facts",
     "get_available_facts_for_symbol",
     "latest_known_value",
+    "EXPECTED_PERIOD_KIND",
+    "DurationSpanClass",
+    "FactPeriodKind",
+    "actual_period_kind",
+    "classify_duration_span",
+    "select_by_span",
+    "validate_period_kind",
+    "CERTIFICATION_BY_CONCEPT",
+    "CERTIFICATION_TABLE",
+    "CertificationLevel",
+    "ConceptCertification",
+    "DatasetCertificationResult",
+    "MissingDataReason",
+    "certification_for",
+    "certify_sec_fundamentals_asof_dataset",
+    "is_safe_for_issuer",
     "DATASET_NAME",
     "DEFAULT_FACT_WHITELIST",
     "SECDatasetSpec",
