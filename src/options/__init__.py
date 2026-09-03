@@ -97,6 +97,31 @@ from src.options.data_balance import ConcentrationResult, DataBalanceReport, bui
 from src.options.return_normalization import NormalizedReturn, compute_normalized_return
 from src.options.mechanical_baseline import BaselineClassification, MechanicalBaselineComparison, compare_option_vs_underlying_signal
 
+# --- Phase 21 additions (options alpha falsification & statistical validation) ---
+from src.options.placebo_extensions import (
+    block_preserving_shuffle_gap_placebo,
+    block_preserving_shuffle_placebo,
+    random_group_gap_control,
+    shifted_group_gap_placebo,
+    sign_flipped_target_diagnostic,
+    sign_flipped_target_gap_diagnostic,
+    shuffled_group_gap_placebo,
+    symbol_identity_shuffle_gap_placebo,
+    symbol_identity_shuffle_placebo,
+    time_shuffled_target_gap_placebo,
+    within_symbol_time_shuffle_gap_placebo,
+    within_symbol_time_shuffle_placebo,
+)
+from src.options.outlier_treatment import (
+    OutlierAttribution,
+    TopObservation,
+    compute_outlier_attribution,
+    remove_top_percent,
+    top_observations,
+    winsorize,
+)
+from src.options.dependence_bootstrap import SymbolClusterBootstrapReport, symbol_cluster_bootstrap_ic
+
 __all__ = [
     "OptionContract",
     "OptionChainObservation",
@@ -191,4 +216,24 @@ __all__ = [
     "BaselineClassification",
     "MechanicalBaselineComparison",
     "compare_option_vs_underlying_signal",
+    "block_preserving_shuffle_placebo",
+    "sign_flipped_target_diagnostic",
+    "symbol_identity_shuffle_placebo",
+    "within_symbol_time_shuffle_placebo",
+    "block_preserving_shuffle_gap_placebo",
+    "random_group_gap_control",
+    "shifted_group_gap_placebo",
+    "sign_flipped_target_gap_diagnostic",
+    "shuffled_group_gap_placebo",
+    "symbol_identity_shuffle_gap_placebo",
+    "time_shuffled_target_gap_placebo",
+    "within_symbol_time_shuffle_gap_placebo",
+    "OutlierAttribution",
+    "TopObservation",
+    "compute_outlier_attribution",
+    "remove_top_percent",
+    "top_observations",
+    "winsorize",
+    "SymbolClusterBootstrapReport",
+    "symbol_cluster_bootstrap_ic",
 ]
