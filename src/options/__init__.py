@@ -37,6 +37,30 @@ from src.options.store import HistoricalOptionsDataUnavailableError, OptionsData
 from src.options.position import OptionLegPosition, OptionsPosition, PositionRiskProfile, analyze_position_risk
 from src.options.capability_audit import OPTIONS_CAPABILITY_MATRIX, OptionsCapabilityRow, OptionsSourceCapability, summarize_capability
 
+# --- Phase 19 additions (options-alpha discovery foundation) ---
+from src.options.universe import OptionableUnderlying, UnderlyingFilterConfig, UnderlyingUniverse, phase19_verified_underlying_universe
+from src.options.moneyness import MoneynessBucket, MoneynessObservation, classify_moneyness, log_moneyness, moneyness_ratio
+from src.options.expiration import DTEBucket, bucket_dte, days_to_expiration
+from src.options.price_history import (
+    STANDARD_FORWARD_HORIZONS,
+    OptionPriceBar,
+    close_to_close_return,
+    daily_return_series,
+    future_option_return,
+    holding_period_return,
+)
+from src.options.contract_existence import ExistenceState, classify_existence
+from src.options.research_observation import OptionResearchObservation, build_research_series
+from src.options.cost_model import COST_SENSITIVITY_ASSUMPTIONS, CostAssumption, ResearchRealismLabel, apply_cost_assumption
+from src.options.opportunity_score import (
+    UNAVAILABLE_HISTORICALLY,
+    ChainCandidate,
+    ContractCandidate,
+    OpportunityScore,
+    SignalEvaluation,
+    UnderlyingCandidate,
+)
+
 __all__ = [
     "OptionContract",
     "OptionChainObservation",
@@ -70,4 +94,36 @@ __all__ = [
     "OptionsCapabilityRow",
     "OptionsSourceCapability",
     "summarize_capability",
+    "OptionableUnderlying",
+    "UnderlyingFilterConfig",
+    "UnderlyingUniverse",
+    "phase19_verified_underlying_universe",
+    "MoneynessBucket",
+    "MoneynessObservation",
+    "classify_moneyness",
+    "log_moneyness",
+    "moneyness_ratio",
+    "DTEBucket",
+    "bucket_dte",
+    "days_to_expiration",
+    "STANDARD_FORWARD_HORIZONS",
+    "OptionPriceBar",
+    "close_to_close_return",
+    "daily_return_series",
+    "future_option_return",
+    "holding_period_return",
+    "ExistenceState",
+    "classify_existence",
+    "OptionResearchObservation",
+    "build_research_series",
+    "COST_SENSITIVITY_ASSUMPTIONS",
+    "CostAssumption",
+    "ResearchRealismLabel",
+    "apply_cost_assumption",
+    "UNAVAILABLE_HISTORICALLY",
+    "ChainCandidate",
+    "ContractCandidate",
+    "OpportunityScore",
+    "SignalEvaluation",
+    "UnderlyingCandidate",
 ]

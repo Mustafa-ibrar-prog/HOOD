@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
+from datetime import date, timedelta
+
 from src.data.generic_quality import find_duplicate_timestamps, find_out_of_order_indices
 from src.options.chain import OptionChainObservation, OptionsFieldStatus
 from src.options.greeks import Greeks
@@ -125,4 +127,85 @@ def find_inconsistent_contract_metadata(contracts: Sequence[OptionContract]) -> 
                 issues.append(OptionsQualityIssue("INCONSISTENT_EXPIRATION", "ERROR", f"{option_id} has conflicting expiration: {first.expiration} vs {other.expiration}"))
             if other.strike != first.strike:
                 issues.append(OptionsQualityIssue("INCONSISTENT_STRIKE", "ERROR", f"{option_id} has conflicting strike: {first.strike} vs {other.strike}"))
+    return issues
+
+
+# --- Phase 19, Part 15 — additive extensions: missing bars, corporate-action inconsistencies, suspicious/incomplete histories ---
+
+
+def find_missing_business_days(bar_dates: Sequence[date]) -> list[date]:
+    """Reports which weekday calendar dates BETWEEN the first and last
+    bar date are absent from `bar_dates` -- a gap detector, not a
+    'fixer': it never inserts a bar, only names the missing dates so a
+    caller can decide (e.g. flag the contract, or accept a known holiday
+    gap). Weekends are never reported as missing (no exchange trades
+    then); US market holidays are NOT special-cased here -- a holiday
+    will show up as a 'missing' business day, which is correct in the
+    weekday sense and left for the caller to reconcile against a holiday
+    calendar if they need to (Part 17: detect and report, never assume)."""
+    if len(bar_dates) < 2:
+        return []
+    ordered = sorted(bar_dates)
+    present = set(ordered)
+    missing: list[date] = []
+    current = ordered[0]
+    end = ordered[-1]
+    while current <= end:
+        if current.weekday() < 5 and current not in present:
+            missing.append(current)
+        current += timedelta(days=1)
+    return missing
+
+
+def find_suspicious_flat_price_run(closes: Sequence[float], *, min_run_length: int = 10, flat_value: float = 0.01) -> list[OptionsQualityIssue]:
+    """Part 15/18's deep-OTM caveat, made mechanical: a run of `flat_value`
+    (the tick floor observed in Phase 18's real deep-OTM probe) closes
+    at least `min_run_length` bars long is flagged WARNING, not rejected
+    -- it may be a genuine tick-floor-pinned worthless contract (plausible
+    and observed for real in Phase 18), or it may indicate a data
+    problem; this function does not decide which, only surfaces it."""
+    issues: list[OptionsQualityIssue] = []
+    run_start: int | None = None
+    for i, c in enumerate(closes):
+        if c == flat_value:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None and i - run_start >= min_run_length:
+                issues.append(OptionsQualityIssue(
+                    "SUSPICIOUS_FLAT_PRICE_RUN", "WARNING",
+                    f"closes[{run_start}:{i}] ({i - run_start} bars) are all {flat_value} -- plausible tick-floor pinning "
+                    "(Phase 18's real deep-OTM finding) but not independently confirmed genuine for this contract",
+                ))
+            run_start = None
+    if run_start is not None and len(closes) - run_start >= min_run_length:
+        issues.append(OptionsQualityIssue(
+            "SUSPICIOUS_FLAT_PRICE_RUN", "WARNING",
+            f"closes[{run_start}:{len(closes)}] ({len(closes) - run_start} bars) are all {flat_value} -- see above",
+        ))
+    return issues
+
+
+def find_corporate_action_inconsistency(contract: OptionContract) -> list[OptionsQualityIssue]:
+    """A non-standard multiplier (Part 15's corporate-action case) MUST
+    carry a `deliverable_note` -- `OptionContract.__post_init__` already
+    enforces this at construction time, so this function's only job is
+    to flag the INVERSE inconsistency: a contract claiming
+    `is_standard_deliverable=True` while its multiplier is not the
+    standard 100 (the same check `validate_observation` makes from an
+    observation's contract, exposed here directly against a bare
+    contract so a caller auditing a contract LIST -- not individual
+    quote observations -- can run it without constructing a fake
+    observation)."""
+    issues: list[OptionsQualityIssue] = []
+    if contract.is_standard_deliverable and contract.contract_multiplier != 100:
+        issues.append(OptionsQualityIssue(
+            "INCONSISTENT_MULTIPLIER", "ERROR",
+            f"{contract.option_id}: multiplier={contract.contract_multiplier} != 100 but is_standard_deliverable=True",
+        ))
+    if not contract.is_standard_deliverable and not contract.deliverable_note:
+        issues.append(OptionsQualityIssue(
+            "MISSING_DELIVERABLE_NOTE", "ERROR",
+            f"{contract.option_id}: is_standard_deliverable=False with no deliverable_note (should be impossible -- __post_init__ should have rejected this construction)",
+        ))
     return issues
