@@ -7,13 +7,23 @@ a SYMBOL-CLUSTER bootstrap -- resampling whole symbols (with
 replacement), not individual rows -- so a confidence interval accounts
 for "this panel really only has ~12 independent underlyings," not "9,044
 independent rows."
+
+Phase 23, Part 19 additionally needs the SAME cluster-resampling idea
+along OTHER dependence axes -- expiration (only 3 exist) and calendar
+year (only 3 exist) -- so `cluster_bootstrap_ic` below generalizes
+`symbol_cluster_bootstrap_ic`'s exact resampling logic to an arbitrary
+grouping key, reusing the same `SymbolClusterBootstrapReport` shape.
+`symbol_cluster_bootstrap_ic` itself is left completely unmodified
+(same signature, same behavior, same tests) -- it is not rewritten to
+call the generic version, so nothing about its already-committed,
+already-tested behavior can silently change.
 """
 
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 from src.research.ic import compute_ic_series, summarize_ic
 
@@ -80,5 +90,55 @@ def symbol_cluster_bootstrap_ic(
     hi_idx = min(len(ordered) - 1, int(len(ordered) * (1 - alpha / 2)))
     return SymbolClusterBootstrapReport(
         n_resamples=n_resamples, seed=seed, n_symbols=n_symbols, point_estimate=point_estimate,
+        confidence_level=confidence_level, lower_bound=ordered[lo_idx], upper_bound=ordered[hi_idx], resampled_values=tuple(resampled),
+    )
+
+
+def cluster_bootstrap_ic(
+    panel_rows: Sequence[dict], *, feature_col: str, target_col: str, cluster_key_fn: Callable[[dict], object],
+    n_resamples: int = 1000, seed: int = 3001, confidence_level: float = 0.90, min_universe_size: int = 3,
+) -> SymbolClusterBootstrapReport:
+    """Generalizes `symbol_cluster_bootstrap_ic` to an ARBITRARY grouping
+    key (Phase 23, Part 19: expiration-cluster and year-cluster
+    bootstraps, where the panel has only 3 distinct expirations / 3
+    distinct years -- resampling individual ROWS there would drastically
+    overstate the effective sample size along that axis, exactly the
+    same problem `symbol_cluster_bootstrap_ic` solves for symbols).
+    `cluster_key_fn(row)` returns the cluster a row belongs to (e.g.
+    `lambda r: r["expiration"]` or `lambda r: r["timestamp"].year`).
+    Same resampling mechanics, same report shape, reused rather than
+    duplicated -- only the grouping key changes."""
+    by_cluster: dict[object, list[dict]] = {}
+    for row in panel_rows:
+        by_cluster.setdefault(cluster_key_fn(row), []).append(row)
+    clusters = list(by_cluster.keys())
+    n_clusters = len(clusters)
+
+    point_points = compute_ic_series(panel_rows, feature_col, target_col, min_universe_size=min_universe_size)
+    point_estimate = summarize_ic(point_points, feature_name=feature_col, target_name=target_col).average_ic
+
+    resampled: list[float] = []
+    rng = random.Random(seed)
+    for _ in range(n_resamples):
+        chosen = [rng.choice(clusters) for _ in range(n_clusters)]
+        resample_rows: list[dict] = []
+        for c in chosen:
+            resample_rows.extend(by_cluster[c])
+        points = compute_ic_series(resample_rows, feature_col, target_col, min_universe_size=min_universe_size)
+        ic = summarize_ic(points, feature_name=feature_col, target_name=target_col).average_ic
+        if ic is not None:
+            resampled.append(ic)
+
+    if not resampled:
+        return SymbolClusterBootstrapReport(
+            n_resamples=n_resamples, seed=seed, n_symbols=n_clusters, point_estimate=point_estimate,
+            confidence_level=confidence_level, lower_bound=None, upper_bound=None, resampled_values=(),
+        )
+    ordered = sorted(resampled)
+    alpha = 1 - confidence_level
+    lo_idx = int(len(ordered) * (alpha / 2))
+    hi_idx = min(len(ordered) - 1, int(len(ordered) * (1 - alpha / 2)))
+    return SymbolClusterBootstrapReport(
+        n_resamples=n_resamples, seed=seed, n_symbols=n_clusters, point_estimate=point_estimate,
         confidence_level=confidence_level, lower_bound=ordered[lo_idx], upper_bound=ordered[hi_idx], resampled_values=tuple(resampled),
     )

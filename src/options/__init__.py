@@ -120,7 +120,7 @@ from src.options.outlier_treatment import (
     top_observations,
     winsorize,
 )
-from src.options.dependence_bootstrap import SymbolClusterBootstrapReport, symbol_cluster_bootstrap_ic
+from src.options.dependence_bootstrap import SymbolClusterBootstrapReport, cluster_bootstrap_ic, symbol_cluster_bootstrap_ic
 
 # --- Phase 22 additions (options-specific alpha source discovery) ---
 from src.options.price_volatility_proxy import (
@@ -256,6 +256,7 @@ __all__ = [
     "winsorize",
     "SymbolClusterBootstrapReport",
     "symbol_cluster_bootstrap_ic",
+    "cluster_bootstrap_ic",
     "close_to_close_volatility",
     "mean_abs_return",
     "parkinson_volatility",
