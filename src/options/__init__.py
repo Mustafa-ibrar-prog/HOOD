@@ -38,7 +38,15 @@ from src.options.position import OptionLegPosition, OptionsPosition, PositionRis
 from src.options.capability_audit import OPTIONS_CAPABILITY_MATRIX, OptionsCapabilityRow, OptionsSourceCapability, summarize_capability
 
 # --- Phase 19 additions (options-alpha discovery foundation) ---
-from src.options.universe import OptionableUnderlying, UnderlyingFilterConfig, UnderlyingUniverse, phase19_verified_underlying_universe
+from src.options.universe import (
+    PHASE20_DYNAMIC_DISCOVERY_EVIDENCE,
+    DynamicDiscoveryEvidence,
+    OptionableUnderlying,
+    UnderlyingFilterConfig,
+    UnderlyingUniverse,
+    phase19_verified_underlying_universe,
+    phase20_verified_underlying_universe,
+)
 from src.options.moneyness import MoneynessBucket, MoneynessObservation, classify_moneyness, log_moneyness, moneyness_ratio
 from src.options.expiration import DTEBucket, bucket_dte, days_to_expiration
 from src.options.price_history import (
@@ -60,6 +68,34 @@ from src.options.opportunity_score import (
     SignalEvaluation,
     UnderlyingCandidate,
 )
+
+# --- Phase 20 additions (options research universe expansion & cross-sectional validation) ---
+from src.options.research_eligibility import (
+    ExclusionReason,
+    ExistenceImpactSummary,
+    InclusionReason,
+    OptionChainCandidate,
+    OptionContractCandidate,
+    ResearchEligibleContract,
+    evaluate_underlying_inclusion,
+    summarize_existence_impact,
+)
+from src.options.expiration_diversity import (
+    CROSS_SECTIONAL_IC_UNDEFINED,
+    ExpirationCoverage,
+    ExpirationDiversityReport,
+    build_expiration_diversity_report,
+    has_cross_sectional_variance,
+)
+from src.options.moneyness_diversity import (
+    ALL_BUCKETS,
+    MoneynessBucketStats,
+    MoneynessDiversityReport,
+    build_moneyness_diversity_report,
+)
+from src.options.data_balance import ConcentrationResult, DataBalanceReport, build_data_balance_report, compute_concentration
+from src.options.return_normalization import NormalizedReturn, compute_normalized_return
+from src.options.mechanical_baseline import BaselineClassification, MechanicalBaselineComparison, compare_option_vs_underlying_signal
 
 __all__ = [
     "OptionContract",
@@ -126,4 +162,33 @@ __all__ = [
     "OpportunityScore",
     "SignalEvaluation",
     "UnderlyingCandidate",
+    "PHASE20_DYNAMIC_DISCOVERY_EVIDENCE",
+    "DynamicDiscoveryEvidence",
+    "phase20_verified_underlying_universe",
+    "ExclusionReason",
+    "ExistenceImpactSummary",
+    "InclusionReason",
+    "OptionChainCandidate",
+    "OptionContractCandidate",
+    "ResearchEligibleContract",
+    "evaluate_underlying_inclusion",
+    "summarize_existence_impact",
+    "CROSS_SECTIONAL_IC_UNDEFINED",
+    "ExpirationCoverage",
+    "ExpirationDiversityReport",
+    "build_expiration_diversity_report",
+    "has_cross_sectional_variance",
+    "ALL_BUCKETS",
+    "MoneynessBucketStats",
+    "MoneynessDiversityReport",
+    "build_moneyness_diversity_report",
+    "ConcentrationResult",
+    "DataBalanceReport",
+    "build_data_balance_report",
+    "compute_concentration",
+    "NormalizedReturn",
+    "compute_normalized_return",
+    "BaselineClassification",
+    "MechanicalBaselineComparison",
+    "compare_option_vs_underlying_signal",
 ]
