@@ -88,3 +88,10 @@ def test_both_directional_and_non_directional_targets_present():
     targets = {h.target_definition for h in build_hypotheses()}
     assert any(t.startswith("forward_bucket_return") for t in targets)  # directional
     assert any(t.startswith("forward_dispersion") or t.startswith("forward_abs") or "mfe" in t for t in targets)  # non-directional
+
+
+def test_feature_family_lookup_covers_every_hypothesis():
+    from src.options.phase32_hypotheses import FEATURE_FAMILY_BY_ID
+    hypotheses = build_hypotheses()
+    assert set(FEATURE_FAMILY_BY_ID) == {h.hypothesis_id for h in hypotheses}
+    assert set(FEATURE_FAMILY_BY_ID.values()) == {"A", "B", "C", "D", "E"}

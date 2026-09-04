@@ -90,6 +90,9 @@ def hypothesis_id(suffix: str) -> str:
     return f"P32-BKT-{suffix}"
 
 
+FEATURE_FAMILY_BY_ID: dict[str, str] = {hypothesis_id(suffix): letter for suffix, *_rest, letter, _intuition, _mechanism in _DEFINITIONS}
+
+
 def build_hypotheses() -> tuple[Hypothesis, ...]:
     out = []
     for suffix, name, feature, target, horizon, direction, letter, intuition, mechanism in _DEFINITIONS:
