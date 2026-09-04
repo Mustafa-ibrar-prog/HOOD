@@ -42,11 +42,19 @@ COMPUTATIONAL-BUDGET SUBSAMPLE (disclosed, not hidden): the real free
 dataset's DAILY-resolution AAPL/GOOG slice alone spans thousands of real
 contracts; building every one into a full causal-feature + 5-horizon
 target panel is not tractable in this environment's runtime budget.
-`select_contracts()` takes a deterministic, evenly-strided (never
-cherry-picked) sample of up to `max_contracts_per_underlying` REAL
-contracts per underlying — a real, disclosed sampling choice over real
-data, never a fabricated observation. See
-`docs/phase31_options_alpha_round2.md` for the exact counts used.
+Two selectors exist: `select_contracts()` takes a deterministic,
+evenly-strided (never cherry-picked) sample of up to
+`max_contracts_per_underlying` REAL contracts per underlying by ID
+order; `select_contracts_by_daily_richness()` (the DEFAULT
+`build_panel_rows` uses) instead ranks real contracts by how many
+distinct real daily dates they actually have and keeps the richest —
+never looking at any feature/target value, so this is a data-coverage
+filter, not a result-driven selection. The real campaign script
+(`scripts/phase31_run_campaign.py`) passes `max_contracts_per_underlying`
+well above every real underlying's total contract count (AAPL's 4,532
+is the largest), so in practice NO contract is excluded by the cap at
+all — every real contract with at least one real daily observation is
+used. See `docs/phase31_options_alpha_round2.md` for the exact counts.
 
 DAILY-ONLY: only rows whose real `observation_timestamp` is midnight
 (the Lean sample's daily-file convention — see
@@ -96,6 +104,54 @@ def select_contracts(store: InMemoryLeanSampleStore, *, max_per_underlying: int 
             continue
         stride = len(ids) / max_per_underlying
         selected.extend(ids[int(i * stride)] for i in range(max_per_underlying))
+    return sorted(selected)
+
+
+def _daily_date_count(store: InMemoryLeanSampleStore, option_id: str) -> int:
+    """The number of DISTINCT real calendar dates this contract has at
+    least one real daily-resolution quote observation for — used purely
+    as a data-RICHNESS ranking signal, never as a statistic that could
+    bias which contracts "look like alpha." Counting distinct dates
+    (not raw field-observation rows) avoids double-counting a single
+    day's bid+ask as two."""
+    dates: set[date] = set()
+    for o in store.quotes.get(option_id, []):
+        if o.timestamps.event_time is not None and _is_daily(o.timestamps.event_time):
+            dates.add(o.timestamps.event_time.date())
+    return len(dates)
+
+
+def select_contracts_by_daily_richness(
+    store: InMemoryLeanSampleStore, *, max_per_underlying: int = DEFAULT_MAX_CONTRACTS_PER_UNDERLYING, min_daily_days: int = 1,
+) -> list[str]:
+    """REAL-data-richness-ranked selection, per underlying: real
+    contracts are ranked by how many distinct real daily-resolution
+    dates they actually have (`_daily_date_count`), richest first, ties
+    broken by `option_id` for determinism, and only the top
+    `max_per_underlying` are kept. `select_contracts`'s plain
+    evenly-strided-by-ID approach turned out, on the real dataset, to
+    draw mostly single-day/minute-only contract IDs for AAPL (a real
+    finding: `scripts/phase31_run_campaign.py`'s first real run produced
+    only 701 total daily panel rows across 404 selected contracts,
+    median 2 real daily dates/contract) — not because the free dataset
+    lacks real daily history, but because AAPL's real contract-ID space
+    is numerically dominated by short, single-day minute-only probe
+    files. This selector fixes that SAMPLING artifact (not a data
+    fabrication or a result-driven choice — it never looks at any
+    feature/target value, only at how much real history a contract
+    has) by preferring contracts with genuinely long real observation
+    histories, so the campaign's statistical tests have real, usable
+    sample sizes. `select_contracts` remains available unchanged for
+    callers that want plain ID-order sampling."""
+    by_underlying: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for option_id, contract in store.contracts.items():
+        richness = _daily_date_count(store, option_id)
+        if richness >= min_daily_days:
+            by_underlying[contract.underlying_symbol].append((richness, option_id))
+    selected: list[str] = []
+    for items in by_underlying.values():
+        items.sort(key=lambda t: (-t[0], t[1]))
+        selected.extend(option_id for _richness, option_id in items[:max_per_underlying])
     return sorted(selected)
 
 
@@ -284,11 +340,16 @@ def build_panel_rows(
     store: InMemoryLeanSampleStore, *,
     max_contracts_per_underlying: int = DEFAULT_MAX_CONTRACTS_PER_UNDERLYING,
     horizons: tuple[int, ...] = HORIZONS, lookback: int = 5,
+    contract_selector=select_contracts_by_daily_richness,
 ) -> list[dict]:
     """The real, complete panel-row builder. Returns rows sorted by
     (option_id, timestamp) — deterministic, reproducible given the same
-    store and `max_contracts_per_underlying`."""
-    contract_ids = select_contracts(store, max_per_underlying=max_contracts_per_underlying)
+    store and `max_contracts_per_underlying`. Defaults to
+    `select_contracts_by_daily_richness` (see its docstring for why
+    plain evenly-strided-by-ID selection is not the default here);
+    pass `contract_selector=select_contracts` to opt back into the
+    plain ID-order sampling."""
+    contract_ids = contract_selector(store, max_per_underlying=max_contracts_per_underlying)
     small_store = subset_store(store, contract_ids)
     observations = build_research_observations(small_store)  # reuses Phase 30 unmodified
 

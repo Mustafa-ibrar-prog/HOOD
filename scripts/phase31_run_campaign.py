@@ -98,7 +98,7 @@ def main() -> None:
           "multiple-testing correction) -- this may take several minutes...", flush=True)
     report = run_campaign(
         store,
-        max_contracts_per_underlying=80,
+        max_contracts_per_underlying=6000,  # exceeds every real underlying's total contract count (max: AAPL's 4,532) -- effectively the FULL real daily dataset, not a sample
         n_placebo_trials=25,
         n_bootstrap_resamples=100,
         hypothesis_registry_path=HYPOTHESIS_REGISTRY_PATH,
