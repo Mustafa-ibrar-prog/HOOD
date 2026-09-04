@@ -49,7 +49,7 @@ RANKING = ProviderRanking(
     best_overall="ORATS",  # highest total score (47/100), not disqualified
     best_value="ThetaData",  # cheapest reported figure (~$25/mo) among finalists with a real, non-trivial evidence tier
     best_data_quality="ORATS",  # richest real schema: 21-point IV smile, full Greeks, dedicated corporate-action endpoints
-    best_execution_realism="ThetaData",  # the ONLY finalist with CONFIRMED (not merely claimed) bid/ask size fields in a real inspected schema
+    best_execution_realism="ThetaData",  # corrected in Phase 29: ORATS also has confirmed bid/ask SIZE fields (a Phase 28 recall error, fixed), so this is no longer about sizes uniquely -- ThetaData still wins on the strength of its confirmed last-trade tick (Trade.size) field, which ORATS's schema does not confirm
     best_for_this_project="ORATS",  # strongest real PIT-chain mechanism (trade_date parameter) + dedicated dividends/splits/earnings endpoints directly supporting this project's existing corporate-action and earnings research
 )
 
@@ -93,7 +93,7 @@ PROVIDER_RECOMMENDATION = PurchaseRecommendation(
     ),
     fields_available=(
         "See src.options.phase28_provider_scorecard.ORATS_SCORECARD -- contract identity (partial, no "
-        "multiplier/exercise-style/exchange), OHLC (adjusted+unadjusted), bid/ask (no confirmed sizes), "
+        "multiplier/exercise-style/exchange), OHLC (adjusted+unadjusted), bid/ask with confirmed sizes, "
         "volume, open interest, IV (raw+bid/mid/ask+21-point delta smile), full Greeks, historical "
         "volatility, dividends, splits, earnings, historical trade_date-scoped chain access -- every field "
         "CLAIMED_UNVERIFIED pending a real API key (Part 4 vocabulary)."
