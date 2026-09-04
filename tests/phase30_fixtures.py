@@ -110,6 +110,52 @@ def synthetic_multi_bar_store(
     )
 
 
+def synthetic_daily_multi_bar_store(
+    *, n_bars: int = 8, strike: float = 100.0, expiration: date = date(2026, 12, 18), underlying: str = "AAPL",
+) -> InMemoryLeanSampleStore:
+    """Same shape as `synthetic_multi_bar_store`, but every quote/trade/OI
+    timestamp is real midnight (Phase 26/27's actual DAILY-file
+    convention -- see `phase26_quality_rules`/`phase27_coverage_report`'s
+    `has_daily_resolution` check), for exercising Phase 31's
+    daily-only-panel machinery, which filters on exactly that
+    convention. `synthetic_multi_bar_store` intentionally keeps its
+    original 15:00 timestamps (other already-passing tests depend on
+    that exact fixture) -- this is a separate, additive fixture."""
+    provenance = build_provenance(retrieval_timestamp=RETRIEVAL, adjustment_status="unadjusted_synthetic")
+    meta = LeanContractFileMeta(underlying, "call", strike, expiration, "quote", "american", None)
+    contract = build_contract_identity(meta, provenance)
+    cid = contract.option_id
+
+    quotes_list, trades_list, oi_list, underlying_list = [], [], [], []
+    dates = [date(2026, 8, 1 + i) for i in range(n_bars)]
+    for i, d in enumerate(dates):
+        ts = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)  # midnight -- real daily-file convention
+        option_close = 4.50 + 0.10 * i
+        bid, ask = option_close - 0.10, option_close + 0.10
+        underlying_price = 185.0 + 1.0 * i
+        quotes_list += [_obs(cid, "bid", bid, ts), _obs(cid, "ask", ask, ts)]
+        trades_list += [
+            _obs(cid, "price", option_close, ts), _obs(cid, "open", option_close - 0.05, ts),
+            _obs(cid, "high", option_close + 0.08, ts), _obs(cid, "low", option_close - 0.08, ts),
+            _obs(cid, "volume", 10.0 + i, ts),
+        ]
+        oi_list.append(_obs(cid, "open_interest", 300.0 + 5 * i, ts))
+        underlying_list.append(ProvenancedObservation(
+            key=underlying, field="close", value=underlying_price,
+            timestamps=EventTimestamps(event_time=ts),
+            provenance=DataProvenance.OBSERVED, source="phase30_synthetic_test_data",
+        ))
+
+    from src.options.phase26_dataset_builder import build_contract_lifecycle
+    lifecycle = build_contract_lifecycle(meta, dates, provenance, today=date(2026, 9, 4))
+
+    return InMemoryLeanSampleStore(
+        contracts={cid: contract}, lifecycles={cid: lifecycle},
+        quotes={cid: quotes_list}, trades={cid: trades_list}, open_interest={cid: oi_list},
+        underlying={underlying: underlying_list},
+    )
+
+
 def synthetic_store_with_crossed_market() -> InMemoryLeanSampleStore:
     """A deliberately malformed contract (bid > ask) to exercise
     FLAGGED_CRITICAL / DATA_QUALITY_FAILURE paths."""
