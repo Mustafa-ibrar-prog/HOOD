@@ -138,13 +138,22 @@ def test_adapter_has_no_live_trade_path():
     """No code anywhere constructs a MomentumBreakoutProductionAdapter and
     feeds it into run_live_decision_cycle with a VALIDATED registry entry
     -- confirmed by grepping src/ (never just tests/) for the adapter's
-    class name outside its own defining module."""
+    class name outside its own defining module.
+
+    ONE deliberate, documented exception as of Phase 37:
+    `src/research_recorder/research_signal.py` also references it, to
+    evaluate the strategy PURELY as a research signal (never feeding it
+    into `run_live_decision_cycle` -- that module has no import of
+    `src.production.pipeline` or `src.production.registry` at all, see
+    `tests/test_phase37_safety.py::test_research_signal_module_never_registers_or_promotes_the_strategy`).
+    Any OTHER reference remains exactly as forbidden as before."""
     from pathlib import Path
 
     repo_root = Path(__file__).resolve().parent.parent
+    allowed_extra_reference = repo_root / "src/research_recorder/research_signal.py"
     hits = []
     for path in (repo_root / "src").rglob("*.py"):
-        if path.name == "momentum_breakout_adapter.py":
+        if path.name == "momentum_breakout_adapter.py" or path == allowed_extra_reference:
             continue
         if "MomentumBreakoutProductionAdapter" in path.read_text():
             hits.append(path)
