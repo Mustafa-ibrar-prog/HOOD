@@ -334,3 +334,155 @@ been placed, live authorization remains off, and the emergency stop
 remains active.
 
 This phase does not proceed to Phase 40 automatically.
+
+---
+
+## Addendum — closing the fetch/save/invoke operational gap
+
+A follow-up session identified an operational gap: `scripts/run_live_research_cycle.py`
+never itself calls a HOOD MCP tool — by design (nothing in this codebase
+can; see `src/market/hood_client.py`'s docstring) — so it can only replay
+responses the agent already fetched and saved into `--data-dir`. There
+was no reusable, tested glue for the agent to do that saving correctly.
+
+### What was added
+
+- **`src/live_bridge.save_hood_response_to_data_dir`** — writes a real,
+  unmodified HOOD MCP response to `<data_dir>/<filename_stem>.json`
+  (creating the directory if needed), so the agent never hand-writes
+  these files. Write-side counterpart to the existing
+  `load_static_hood_client_from_dir`.
+- **`src/live_bridge.merge_option_instrument_pages`** — merges multiple
+  real `get_option_instruments` pages into one response with
+  `"next": null`, required because `StaticHoodClient` keys a recorded
+  response by `chain_id` alone (not cursor) — an un-merged multi-page
+  recording would make the market-data provider replay page 1 on every
+  subsequent call instead of seeing the full chain.
+- **`tests/test_phase39_operational_glue.py`** (18 tests) proving: the
+  save/merge functions never fabricate or drop a real instrument; no
+  synthetic fallback exists anywhere (`StaticHoodClient`/the loader
+  always raise `KeyError` rather than returning a default); no historical
+  fallback exists (the recorder never calls
+  `get_equity_historicals`/`get_option_historicals`, and
+  `record_equity_historicals` can never satisfy a `get_equity_quotes`
+  lookup); the market-hours gate refuses to record even when handed a
+  fully-valid, ready client (proving the refusal is about TIME, not data
+  availability); the new glue functions never call
+  `run_observation_cycle` themselves; no credential-shaped content; no
+  `execution.gateway` import; live authorization remains off; emergency
+  stop remains active.
+
+All 18 pass. Full Phase 39 suite (77 tests across 4 files) passes. Full
+project suite: 3,100 passed, 4 failed — the same 4 pre-existing
+`test_orchestrator.py` baseline failures, untouched.
+
+### One real, bounded end-to-end demonstration
+
+With the glue in place, a full real fetch → save → invoke cycle was
+performed for **SPY and AAPL** (per Part 5's own guidance to start with
+SPY plus one or two liquid names rather than the full 12-symbol universe,
+to bound API usage):
+
+1. **Real connectivity check and equity quotes** —
+   `mcp__HOOD__get_equity_quotes(["SPY"])` and `(["AAPL"])`: both
+   returned real, current data (SPY last_trade=770.23 as of
+   2026-09-04T19:59:59Z; AAPL last_trade=319.99 as of the same
+   timestamp — the last real regular-session trades, since today is a
+   Saturday).
+2. **Real option chains** — `mcp__HOOD__get_option_chains` for both
+   symbols, returning real chain IDs and 24-34 real expiration dates
+   each.
+3. **Real option instruments near the current price** — rather than
+   paginating a full chain (SPY/AAPL each have thousands of contracts;
+   the first unfiltered page for either symbol came back far
+   out-of-the-money and was not useful for contract selection), 5
+   targeted `expiration_dates` + `strike_price` queries per symbol
+   fetched exactly 30 real instruments each, spanning 3 expirations
+   (matching the SHORT/MEDIUM/LONG DTE targets) × up to 5 strikes
+   around the real current price × both option types. Merged via
+   `merge_option_instrument_pages` and saved via
+   `save_hood_response_to_data_dir`.
+4. **Real contract selection computed directly** — running
+   `HoodMarketDataProvider.get_option_chain_candidates` +
+   `select_observation_contracts` (both existing, unmodified) against
+   this real data with the real current underlying price and real
+   current timestamp determined the EXACT option_ids the recorder would
+   request: 6 for SPY (only the NEAR_ATM moneyness bucket was covered by
+   the fetched strikes), 18 for AAPL (all 3 moneyness buckets covered).
+5. **Real option quotes** — `mcp__HOOD__get_option_quotes` for exactly
+   those 6 + 18 real instrument IDs, in the same two batched calls the
+   recorder itself would make. Saved under the filenames keyed by each
+   batch's first instrument ID, matching `StaticHoodClient`'s own lookup
+   convention.
+6. **Real script invocation**: `python scripts/run_live_research_cycle.py
+   --data-dir <dir> --symbols SPY,AAPL` against this real 8-file data
+   directory. Result: `MARKET_CLOSED at 2026-09-05T19:39:31Z` — correct,
+   because today is a Saturday. This is the honest, by-design outcome:
+   the market-hours gate is checked before any client method is touched,
+   so no real quote/chain/instrument data was actually read this
+   invocation — but the full fetch → save → invoke chain is now proven
+   with genuinely real Robinhood data, not merely an empty directory.
+
+**Known limitation, documented rather than worked around:** the SPY/AAPL
+instrument fetch here targeted only a handful of strikes near the current
+price for practical/rate-limit reasons (Part 6's "choose the safest
+practical cadence" principle applied to chain breadth, not just cadence)
+— it is not a complete download of either chain. A future real
+(market-open) run should either follow full pagination via
+`merge_option_instrument_pages` (now tested for this) or apply the same
+targeted-strike approach demonstrated here, which is sufficient for
+`select_observation_contracts`'s actual needs.
+
+### Real report (this addendum)
+
+- **Symbols queried:** SPY, AAPL.
+- **Robinhood calls made:** 2× `get_equity_quotes` (1 symbol each), 2×
+  `get_option_chains`, 12× `get_option_instruments` (2 broad + 10
+  targeted-strike), 2× `get_option_quotes` (batched, 6 and 18
+  instruments) — 18 real calls total, all read-only.
+- **Raw files created:** 8 (`equity_quotes_SPY.json`,
+  `equity_quotes_AAPL.json`, `option_chains_SPY.json`,
+  `option_chains_AAPL.json`, `option_instruments_<SPY chain>.json` [30
+  instruments], `option_instruments_<AAPL chain>.json` [30 instruments],
+  `option_quotes_<SPY first id>.json` [6 quotes],
+  `option_quotes_<AAPL first id>.json` [18 quotes]) — in a scratch
+  directory outside the repository, not committed (these are a manual
+  fetch, not part of the recorder's own persistent storage).
+- **Observation cycles created:** 0 (market closed).
+- **Contracts recorded:** 0.
+- **Observations recorded:** 0.
+- **Quote-field availability (in the real, unrecorded fetched data):**
+  100% — every fetched option quote carried bid, ask, bid/ask size, mark,
+  adjusted mark, IV, all 5 Greeks, open interest, volume, break-even, and
+  both chance-of-profit fields.
+- **Errors/warnings:** none — every real call succeeded.
+- **Data directory:** a session scratch directory (not part of the
+  repository); the recorder's own persistent path remains
+  `logs/research_data/phase37/` (still does not exist — confirmed
+  unchanged after this invocation).
+- **Coverage/readiness status:** unchanged —
+  `DataQualityReport` all-zero; `assess_collection_readiness` still
+  reports `INSUFFICIENT_DATA_FOR_VALIDATION` (8 of 9 gating milestones
+  unmet).
+- **Zero order activity confirmed:** no `place_option_order`/
+  `submit_order`/`cancel_order`/`review_option_order` call was made or
+  is reachable from any file touched this session (re-verified by the
+  full Phase 39 safety suite, including the subprocess-isolated dynamic
+  import check).
+- **Zero paper trading confirmed:** no simulated fill/position/P&L/paper
+  order exists anywhere in the new code.
+- **Live authorization: OFF** (unchanged, re-verified).
+- **Emergency stop: ACTIVE** (unchanged, re-verified).
+
+**Verdict stands: A. COLLECTION_PIPELINE_OPERATIONAL.** The operational
+gap is closed — the agent can now fetch real Robinhood data, save it
+correctly, and invoke the recorder end to end — and this was demonstrated
+with genuinely real data this session. The market-hours rule correctly
+prevented an actual recorded observation today; the next real
+accumulation run should occur during the next regular trading session
+(the next weekday, 09:30-16:00 America/New_York).
+
+Commit: see the commit accompanying this addendum on branch
+`claude/inspect-repo-mcp-tools-s5ic0p`.
+
+This phase does not proceed to Phase 40 automatically. No new strategy-validation phase was started.

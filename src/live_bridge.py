@@ -215,6 +215,58 @@ def load_static_hood_client_from_dir(data_dir: Path, account_number: str | None 
     return client
 
 
+def save_hood_response_to_data_dir(data_dir: Path, filename_stem: str, response: dict[str, Any]) -> Path:
+    """Write-side counterpart to `load_static_hood_client_from_dir`'s
+    read-side convention. Writes `response` — a REAL, unmodified return
+    value from a REAL HOOD MCP tool call the agent already made — to
+    ``<data_dir>/<filename_stem>.json``, creating `data_dir` if needed.
+
+    `filename_stem` must follow scripts/run_cycle.py's naming convention
+    exactly, e.g. ``"equity_quotes_SPY"``, ``"option_chains_SPY"``,
+    ``"option_instruments_<chain_id>"``, ``"option_quotes_<first_
+    instrument_id_in_that_call>"`` — this function does not choose or
+    validate the stem itself (StaticHoodClient's own `_lookup` already
+    raises a clear error if the wrong key was used), it only guarantees
+    the write itself is exact: `response` is serialized as-is, nothing
+    is added, removed, or transformed. This exists so the agent never
+    hand-writes these JSON files (a source of naming/content mistakes);
+    it is not a new data source, provider, or fallback of any kind.
+    """
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = data_dir / f"{filename_stem}.json"
+    path.write_text(json.dumps(response))
+    return path
+
+
+def merge_option_instrument_pages(pages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merges multiple REAL `get_option_instruments` pages — each one a
+    real, unmodified response the agent fetched by following that tool's
+    own "next" cursor for real — into ONE response with `"next": None`.
+
+    Required before recording via `save_hood_response_to_data_dir`:
+    `StaticHoodClient.get_option_instruments` keys a recorded response by
+    `chain_id` alone, not by cursor, so recording each page under the
+    same chain_id key would make `HoodMarketDataProvider._fetch_all_
+    instruments` replay only the FIRST page repeatedly instead of seeing
+    the full chain (see scripts/run_live_research_cycle.py's module
+    docstring). Every instrument in the merged result is copied verbatim
+    from a real page — this function only concatenates; it never
+    fabricates, drops, or truncates a real instrument silently.
+    """
+    merged_instruments: list[Any] = []
+    guide = None
+    for page in pages:
+        data = page.get("data") or {}
+        merged_instruments.extend(data.get("instruments") or [])
+        if guide is None:
+            guide = page.get("guide")
+    result: dict[str, Any] = {"data": {"instruments": merged_instruments, "next": None}}
+    if guide is not None:
+        result["guide"] = guide
+    return result
+
+
 class StaticLiveOrderPlacer:
     """A LiveOrderPlacer (src/execution/live_client.py) built from real
     tool-call responses the agent already fetched — see this module's
