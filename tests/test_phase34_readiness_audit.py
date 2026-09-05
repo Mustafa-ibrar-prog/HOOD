@@ -35,24 +35,33 @@ def _imports(path: Path) -> set[str]:
     return names
 
 
-# --- Finding: the Phase 28 SystemState machine is real but unwired --------------
+# --- Finding (Phase 34): the Phase 28 SystemState machine was real but unwired --
+# --- UPDATED Phase 35, Part O: it is now wired in for real. This is the ---------
+# --- deliberate, intentional flip this file's own original docstring predicted -
+# --- ("a future phase wires it in, this test's assertion flips and must be -----
+# --- updated deliberately") -- not a silent regression. ------------------------
 
 
-def test_system_state_module_still_declares_itself_design_only():
+def test_system_state_module_now_declares_itself_wired_by_phase35():
     source = (REPO_ROOT / "src/execution/system_state.py").read_text()
-    assert "DESIGN ONLY" in source
-    assert "nothing here is wired into" in source
+    assert "Phase 35, Parts N-O" in source
+    assert "wired into the real execution gateway" in source
 
 
-def test_system_state_not_imported_by_gateway_settings_or_orchestrator():
-    """Locks in Phase 34's headline finding: the 7-state authorization
-    machine (RESEARCH -> ... -> LIVE_AUTONOMOUS_TRADING, EMERGENCY_STOP)
-    is never consulted by the actual live gate. If a future phase wires
-    it in, this test's assertion flips and must be updated deliberately
-    -- it should never happen silently."""
-    for rel in ("src/execution/gateway.py", "src/config/settings.py", "src/orchestrator.py"):
-        imports = _imports(REPO_ROOT / rel)
-        assert not any("system_state" in name for name in imports), f"{rel} now imports system_state -- update this test AND docs/phase34_readiness_audit.md"
+def test_system_state_is_now_imported_by_gateway_and_orchestrator():
+    """Phase 34's headline finding was that the (then 7-state) authorization
+    machine was never consulted by the actual live gate. Phase 35, Part O
+    wires it into `LiveExecutionGateway._place_pending()` (via
+    `gateway.py`) and `orchestrator.py` constructs the real, file-backed
+    `SystemStateAuditLog` used at runtime. `settings.py` deliberately does
+    NOT import system_state itself -- it only carries the file-path
+    strings the audit log is built from -- so that one stays excluded."""
+    gateway_imports = _imports(REPO_ROOT / "src/execution/gateway.py")
+    orchestrator_imports = _imports(REPO_ROOT / "src/orchestrator.py")
+    settings_imports = _imports(REPO_ROOT / "src/config/settings.py")
+    assert any("system_state" in name for name in gateway_imports)
+    assert any("system_state" in name for name in orchestrator_imports)
+    assert not any("system_state" in name for name in settings_imports)
 
 
 # --- Finding: preflight.py (buying-power/account eligibility) is real but never called per-cycle --

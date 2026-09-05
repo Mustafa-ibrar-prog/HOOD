@@ -194,7 +194,7 @@ def test_system_state_machine_unchanged_no_per_trade_approval():
     """Phase 29 does not modify Phase 28's system_state.py -- re-
     confirmed here, not merely assumed."""
     from src.execution.system_state import SystemState
-    assert len(SystemState) == 7
+    assert len(SystemState) == 6
     names = {s.name for s in SystemState}
     assert "WAITING_FOR_TRADE_APPROVAL" not in names
     assert not any("PER_TRADE" in n or "TRADE_APPROVAL" in n for n in names)

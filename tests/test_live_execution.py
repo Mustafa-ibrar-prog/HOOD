@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from src.execution.emergency_stop import EmergencyStopStore
 from src.execution.gateway import (
     LiveExecutionGateway,
     PendingOrderNotActionableError,
@@ -20,8 +21,35 @@ from src.execution.live_positions import LiveBotPositionsStore
 from src.execution.orders import OrderLeg, OrderRequest
 from src.execution.pending import PendingLiveOrder, PendingOrderStore, PendingOrderStoreError
 from src.execution.preflight import verify_account_preflight
+from src.execution.system_state import SystemState, SystemStateAuditLog, record_code_transition, record_human_authorized_transition
 from src.live_bridge import StaticLiveOrderPlacer
 from src.logging.decision_logger import DecisionLogger
+
+
+def _authorized_stores(tmp_path):
+    """Phase 35, Parts N-P: every test in this file that expects a REAL
+    placement to succeed must now explicitly clear the emergency stop and
+    advance the system-state audit log all the way to LIVE_AUTONOMOUS_
+    TRADING -- the same two gates a real deployment would have to satisfy.
+    Tests that don't call this and don't pass these stores get the safe,
+    blocked default (see test_execution_guard.py's new Phase 35 tests)."""
+    stop_store = EmergencyStopStore(tmp_path / "emergency_stop.json")
+    stop_store.clear(authorized_by="user:test", reason="test fixture -- authorizing for a placement test")
+
+    audit_log = SystemStateAuditLog(tmp_path / "system_state_audit.jsonl")
+    t1 = record_code_transition(SystemState.RESEARCH, SystemState.VALIDATED_STRATEGY, reason="test fixture")
+    audit_log.append_transition(t1)
+    t2 = record_human_authorized_transition(
+        SystemState.VALIDATED_STRATEGY, SystemState.HUMAN_LIVE_AUTHORIZATION,
+        authorized_by="user:test", reason="test fixture",
+    )
+    audit_log.append_transition(t2)
+    t3 = record_human_authorized_transition(
+        SystemState.HUMAN_LIVE_AUTHORIZATION, SystemState.LIVE_AUTONOMOUS_TRADING,
+        authorized_by="user:test", reason="test fixture",
+    )
+    audit_log.append_transition(t3)
+    return stop_store, audit_log
 
 
 @pytest.fixture
@@ -310,11 +338,15 @@ def test_preflight_real_shape_nested_buying_power_below_max_position_size_fails(
 
 
 def test_confirm_and_place_calls_placer_exactly_once_and_records_live_fill(
-    live_confirmed_settings, decision_logger, buy_order
+    live_confirmed_settings, decision_logger, buy_order, tmp_path
 ):
     pending_store = PendingOrderStore(Path(live_confirmed_settings.pending_orders_file))
     bot_positions = LiveBotPositionsStore(Path(live_confirmed_settings.live_bot_positions_file))
-    gateway = LiveExecutionGateway(live_confirmed_settings, decision_logger, pending_store, bot_positions)
+    stop_store, audit_log = _authorized_stores(tmp_path)
+    gateway = LiveExecutionGateway(
+        live_confirmed_settings, decision_logger, pending_store, bot_positions,
+        emergency_stop_store=stop_store, system_state_audit_log=audit_log,
+    )
 
     submitted = gateway.submit_order(buy_order)
     assert submitted.status == "pending_approval"
@@ -339,12 +371,16 @@ def test_confirm_and_place_calls_placer_exactly_once_and_records_live_fill(
 
 
 def test_confirm_and_place_close_leg_removes_bot_position_provenance(
-    live_confirmed_settings, decision_logger, sell_order
+    live_confirmed_settings, decision_logger, sell_order, tmp_path
 ):
     pending_store = PendingOrderStore(Path(live_confirmed_settings.pending_orders_file))
     bot_positions = LiveBotPositionsStore(Path(live_confirmed_settings.live_bot_positions_file))
     bot_positions.add("opt-1")  # simulate a prior confirmed entry
-    gateway = LiveExecutionGateway(live_confirmed_settings, decision_logger, pending_store, bot_positions)
+    stop_store, audit_log = _authorized_stores(tmp_path)
+    gateway = LiveExecutionGateway(
+        live_confirmed_settings, decision_logger, pending_store, bot_positions,
+        emergency_stop_store=stop_store, system_state_audit_log=audit_log,
+    )
 
     submitted = gateway.submit_order(sell_order)
     placer = FakePlacer()
@@ -360,9 +396,13 @@ def test_confirm_and_place_refuses_unknown_pending_id(live_confirmed_settings, d
         gateway.confirm_and_place("does-not-exist", FakePlacer(), approved_by="user:test")
 
 
-def test_confirm_and_place_refuses_already_decided_pending(live_confirmed_settings, decision_logger, buy_order):
+def test_confirm_and_place_refuses_already_decided_pending(live_confirmed_settings, decision_logger, buy_order, tmp_path):
     pending_store = PendingOrderStore(Path(live_confirmed_settings.pending_orders_file))
-    gateway = LiveExecutionGateway(live_confirmed_settings, decision_logger, pending_store)
+    stop_store, audit_log = _authorized_stores(tmp_path)
+    gateway = LiveExecutionGateway(
+        live_confirmed_settings, decision_logger, pending_store,
+        emergency_stop_store=stop_store, system_state_audit_log=audit_log,
+    )
     pending_id = gateway.submit_order(buy_order).extra["pending_order_id"]
 
     gateway.confirm_and_place(pending_id, FakePlacer(), approved_by="user:test")
@@ -385,9 +425,13 @@ def test_confirm_and_place_refuses_expired_pending(live_confirmed_settings, deci
     assert pending_store.get(pending_id).status == "expired"
 
 
-def test_confirm_and_place_records_failure_and_reraises(live_confirmed_settings, decision_logger, buy_order):
+def test_confirm_and_place_records_failure_and_reraises(live_confirmed_settings, decision_logger, buy_order, tmp_path):
     pending_store = PendingOrderStore(Path(live_confirmed_settings.pending_orders_file))
-    gateway = LiveExecutionGateway(live_confirmed_settings, decision_logger, pending_store)
+    stop_store, audit_log = _authorized_stores(tmp_path)
+    gateway = LiveExecutionGateway(
+        live_confirmed_settings, decision_logger, pending_store,
+        emergency_stop_store=stop_store, system_state_audit_log=audit_log,
+    )
     pending_id = gateway.submit_order(buy_order).extra["pending_order_id"]
 
     placer = FakePlacer(raise_error=RuntimeError("insufficient buying power"))
@@ -440,8 +484,12 @@ def test_submit_order_auto_executes_when_flag_set_and_placer_injected(tmp_path, 
     pending_store = PendingOrderStore(Path(settings.pending_orders_file))
     bot_positions = LiveBotPositionsStore(Path(settings.live_bot_positions_file))
     placer = FakePlacer(response={"id": "order-auto", "state": "confirmed"})
+    stop_store, audit_log = _authorized_stores(tmp_path)
 
-    gateway = LiveExecutionGateway(settings, decision_logger, pending_store, bot_positions, placer)
+    gateway = LiveExecutionGateway(
+        settings, decision_logger, pending_store, bot_positions, placer,
+        emergency_stop_store=stop_store, system_state_audit_log=audit_log,
+    )
     result = gateway.submit_order(buy_order)
 
     assert result.status == "placed"

@@ -153,7 +153,7 @@ def test_orats_activation_state_still_pending_human():
 
 def test_system_state_still_unchanged_by_phase33():
     from src.execution.system_state import SystemState
-    assert len(SystemState) == 7
+    assert len(SystemState) == 6
     assert "WAITING_FOR_TRADE_APPROVAL" not in {s.name for s in SystemState}
 
 

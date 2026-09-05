@@ -1,7 +1,17 @@
 """Phase 28, Part 11/17 — the system-level autonomous-trading state
-machine: exactly the 7 required states, no per-trade-approval state,
+machine: exactly the required states, no per-trade-approval state,
 correct code-vs-human-computable transition rules, autonomous pause/
-resume and emergency-stop behavior, and a real audit-log round trip."""
+resume and emergency-stop behavior, and a real audit-log round trip.
+
+Phase 35, Part O redefined the state list per that phase's explicit
+instruction (RESEARCH, VALIDATED_STRATEGY, HUMAN_LIVE_AUTHORIZATION,
+LIVE_AUTONOMOUS_TRADING, LIVE_PAUSED, EMERGENCY_STOP) -- dropping the
+original PAPER_TRADING/PAPER_VALIDATED two-step in favor of a single
+VALIDATED_STRATEGY state. This file is updated to match; the behavior
+being tested (code can progress RESEARCH -> ... -> VALIDATED_STRATEGY,
+only a human can cross into HUMAN_LIVE_AUTHORIZATION or LIVE_AUTONOMOUS_
+TRADING, emergency stop is autonomously reachable but only human-
+clearable) is unchanged."""
 
 from __future__ import annotations
 
@@ -22,9 +32,9 @@ from src.execution.system_state import (
 )
 
 
-def test_exactly_seven_required_states():
+def test_exactly_six_required_states():
     assert {s.value for s in SystemState} == {
-        "RESEARCH", "PAPER_TRADING", "PAPER_VALIDATED", "HUMAN_LIVE_AUTHORIZATION",
+        "RESEARCH", "VALIDATED_STRATEGY", "HUMAN_LIVE_AUTHORIZATION",
         "LIVE_AUTONOMOUS_TRADING", "LIVE_PAUSED", "EMERGENCY_STOP",
     }
 
@@ -36,16 +46,14 @@ def test_no_waiting_for_trade_approval_state_exists():
     assert not any("PER_TRADE" in n for n in names)
 
 
-def test_forward_progress_through_paper_validated_is_code_computable():
-    t1 = record_code_transition(SystemState.RESEARCH, SystemState.PAPER_TRADING, reason="x")
-    t2 = record_code_transition(SystemState.PAPER_TRADING, SystemState.PAPER_VALIDATED, reason="x")
+def test_forward_progress_through_validated_strategy_is_code_computable():
+    t1 = record_code_transition(SystemState.RESEARCH, SystemState.VALIDATED_STRATEGY, reason="x")
     assert t1.authorized_by == "system:code"
-    assert t2.authorized_by == "system:code"
 
 
 def test_code_cannot_reach_human_live_authorization():
     with pytest.raises(StateRequiresHumanActionError):
-        record_code_transition(SystemState.PAPER_VALIDATED, SystemState.HUMAN_LIVE_AUTHORIZATION, reason="x")
+        record_code_transition(SystemState.VALIDATED_STRATEGY, SystemState.HUMAN_LIVE_AUTHORIZATION, reason="x")
 
 
 def test_code_cannot_cross_from_human_live_authorization_into_live_autonomous_trading():
@@ -55,13 +63,13 @@ def test_code_cannot_cross_from_human_live_authorization_into_live_autonomous_tr
 
 def test_human_authorized_transition_requires_a_real_human_identifier():
     with pytest.raises(ValueError):
-        record_human_authorized_transition(SystemState.PAPER_VALIDATED, SystemState.HUMAN_LIVE_AUTHORIZATION, authorized_by="system:auto", reason="x")
+        record_human_authorized_transition(SystemState.VALIDATED_STRATEGY, SystemState.HUMAN_LIVE_AUTHORIZATION, authorized_by="system:auto", reason="x")
     with pytest.raises(ValueError):
-        record_human_authorized_transition(SystemState.PAPER_VALIDATED, SystemState.HUMAN_LIVE_AUTHORIZATION, authorized_by="", reason="x")
+        record_human_authorized_transition(SystemState.VALIDATED_STRATEGY, SystemState.HUMAN_LIVE_AUTHORIZATION, authorized_by="", reason="x")
 
 
 def test_human_can_authorize_the_full_activation_sequence():
-    t1 = record_human_authorized_transition(SystemState.PAPER_VALIDATED, SystemState.HUMAN_LIVE_AUTHORIZATION, authorized_by="a_real_person", reason="reviewed")
+    t1 = record_human_authorized_transition(SystemState.VALIDATED_STRATEGY, SystemState.HUMAN_LIVE_AUTHORIZATION, authorized_by="a_real_person", reason="reviewed")
     t2 = record_human_authorized_transition(SystemState.HUMAN_LIVE_AUTHORIZATION, SystemState.LIVE_AUTONOMOUS_TRADING, authorized_by="a_real_person", reason="go live")
     assert t1.authorized_by == t2.authorized_by == "a_real_person"
 
@@ -84,7 +92,7 @@ def test_emergency_stop_is_reachable_autonomously_from_live_autonomous_trading()
 
 def test_emergency_stop_is_reachable_autonomously_from_paper_states_too():
     assert can_transition(SystemState.RESEARCH, SystemState.EMERGENCY_STOP)
-    assert can_transition(SystemState.PAPER_TRADING, SystemState.EMERGENCY_STOP)
+    assert can_transition(SystemState.VALIDATED_STRATEGY, SystemState.EMERGENCY_STOP)
     assert can_transition(SystemState.LIVE_PAUSED, SystemState.EMERGENCY_STOP)
 
 
@@ -100,7 +108,7 @@ def test_emergency_stop_can_only_be_cleared_via_human_live_authorization():
 
 
 def test_no_transition_skips_a_stage():
-    assert not can_transition(SystemState.RESEARCH, SystemState.PAPER_VALIDATED)
+    assert not can_transition(SystemState.RESEARCH, SystemState.HUMAN_LIVE_AUTHORIZATION)
     assert not can_transition(SystemState.RESEARCH, SystemState.LIVE_AUTONOMOUS_TRADING)
 
 
@@ -119,16 +127,30 @@ def test_audit_log_round_trips_transitions_and_events(tmp_path):
     from datetime import datetime, timezone
     path = tmp_path / "system_state_audit.jsonl"
     log = SystemStateAuditLog(path)
-    t1 = record_code_transition(SystemState.RESEARCH, SystemState.PAPER_TRADING, reason="x")
+    t1 = record_code_transition(SystemState.RESEARCH, SystemState.VALIDATED_STRATEGY, reason="x")
     log.append_transition(t1)
     ev = SystemAuthorizationEvent(AuthorizationEventType.CHANGE_RISK_PARAMETERS, "a_real_person", datetime.now(timezone.utc), "raised max position size")
     log.append_event(ev)
 
-    assert log.current_state() == SystemState.PAPER_TRADING
+    assert log.current_state() == SystemState.VALIDATED_STRATEGY
     lines = path.read_text().splitlines()
     assert len(lines) == 2
-    assert json.loads(lines[0])["to_state"] == "PAPER_TRADING"
+    assert json.loads(lines[0])["to_state"] == "VALIDATED_STRATEGY"
     assert json.loads(lines[1])["event_type"] == "CHANGE_RISK_PARAMETERS"
+
+
+def test_audit_log_reloads_current_state_after_a_restart(tmp_path):
+    """Phase 35, Part O -- the authorization gate must 'survive process
+    restart'. A fresh SystemStateAuditLog instance pointed at the same
+    path (simulating a process restart) must recover the persisted
+    current state, not silently reset to None/RESEARCH."""
+    path = tmp_path / "system_state_audit.jsonl"
+    log1 = SystemStateAuditLog(path)
+    t1 = record_code_transition(SystemState.RESEARCH, SystemState.VALIDATED_STRATEGY, reason="x")
+    log1.append_transition(t1)
+
+    log2 = SystemStateAuditLog(path)  # a fresh instance, as if the process restarted
+    assert log2.current_state() == SystemState.VALIDATED_STRATEGY
 
 
 def test_authorization_event_types_cover_part_11s_preamble_list():

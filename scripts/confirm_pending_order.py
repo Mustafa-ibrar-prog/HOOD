@@ -30,9 +30,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config.settings import Settings  # noqa: E402
+from src.execution.emergency_stop import EmergencyStopStore  # noqa: E402
 from src.execution.gateway import LiveExecutionGateway  # noqa: E402
 from src.execution.live_positions import LiveBotPositionsStore  # noqa: E402
 from src.execution.pending import PendingOrderStore  # noqa: E402
+from src.execution.system_state import SystemStateAuditLog  # noqa: E402
 from src.live_bridge import StaticLiveOrderPlacer  # noqa: E402
 from src.logging.decision_logger import DecisionLogger  # noqa: E402
 
@@ -53,7 +55,17 @@ def main() -> int:
     decision_logger = DecisionLogger(path=settings.decision_log_file, app_log_file=settings.app_log_file)
     pending_store = PendingOrderStore(Path(settings.pending_orders_file))
     bot_positions_store = LiveBotPositionsStore(Path(settings.live_bot_positions_file))
-    gateway = LiveExecutionGateway(settings, decision_logger, pending_store, bot_positions_store)
+    # Phase 35, Parts N-P: this script gets no special exemption from the
+    # emergency-stop / system-authorization gate — it constructs the same
+    # real, file-backed stores the orchestrator does, so a tripped stop or
+    # an unauthorized system state blocks this path exactly as it blocks
+    # the autonomous cycle.
+    emergency_stop_store = EmergencyStopStore(Path(settings.emergency_stop_file))
+    system_state_audit_log = SystemStateAuditLog(Path(settings.system_state_log_file))
+    gateway = LiveExecutionGateway(
+        settings, decision_logger, pending_store, bot_positions_store,
+        emergency_stop_store=emergency_stop_store, system_state_audit_log=system_state_audit_log,
+    )
 
     placer = StaticLiveOrderPlacer()
     placer.record_place_option_order(json.loads(args.place_response_file.read_text()))

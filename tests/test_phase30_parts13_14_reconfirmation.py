@@ -15,13 +15,18 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_system_state_still_exactly_seven_states_no_per_trade_approval():
+def test_system_state_still_exactly_six_states_no_per_trade_approval():
+    """Phase 35, Part O redefined this enum (RESEARCH, VALIDATED_STRATEGY,
+    HUMAN_LIVE_AUTHORIZATION, LIVE_AUTONOMOUS_TRADING, LIVE_PAUSED,
+    EMERGENCY_STOP) -- dropping PAPER_TRADING/PAPER_VALIDATED in favor of a
+    single VALIDATED_STRATEGY state, per that phase's explicit instruction.
+    Still no per-trade-approval state of any kind."""
     from src.execution.system_state import SystemState
 
-    assert len(SystemState) == 7
+    assert len(SystemState) == 6
     names = {s.name for s in SystemState}
     assert names == {
-        "RESEARCH", "PAPER_TRADING", "PAPER_VALIDATED", "HUMAN_LIVE_AUTHORIZATION",
+        "RESEARCH", "VALIDATED_STRATEGY", "HUMAN_LIVE_AUTHORIZATION",
         "LIVE_AUTONOMOUS_TRADING", "LIVE_PAUSED", "EMERGENCY_STOP",
     }
     assert "WAITING_FOR_TRADE_APPROVAL" not in names
@@ -31,7 +36,7 @@ def test_system_state_still_exactly_seven_states_no_per_trade_approval():
 def test_code_computable_states_unchanged():
     from src.execution.system_state import CODE_COMPUTABLE_STATES, SystemState
 
-    assert CODE_COMPUTABLE_STATES == frozenset({SystemState.RESEARCH, SystemState.PAPER_TRADING, SystemState.PAPER_VALIDATED})
+    assert CODE_COMPUTABLE_STATES == frozenset({SystemState.RESEARCH, SystemState.VALIDATED_STRATEGY})
 
 
 def test_human_authorized_transition_still_rejects_system_authorized_by():
@@ -40,7 +45,7 @@ def test_human_authorized_transition_still_rejects_system_authorized_by():
 
     with pytest.raises(ValueError):
         record_human_authorized_transition(
-            SystemState.PAPER_VALIDATED, SystemState.HUMAN_LIVE_AUTHORIZATION,
+            SystemState.VALIDATED_STRATEGY, SystemState.HUMAN_LIVE_AUTHORIZATION,
             authorized_by="system:auto", reason="test",
         )
 

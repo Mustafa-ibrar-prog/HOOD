@@ -58,6 +58,37 @@ one doesn't silently remove the others:
      degrades to the same pending-approval behavior as
      live_auto_execute=False during a normal run_trading_cycle() call; see
      README.md for what "auto-execute" means operationally here.
+
+Phase 35, Parts N-P added THREE MORE independent, overlapping guards,
+all enforced inside `_place_pending()` — the single method both
+submit_order()'s auto-execute path and confirm_and_place() already
+funnel through — so nothing can reach a real broker call by skipping
+them:
+
+  6. `assert_options_only(order)` (src/execution/asset_class_restriction.py,
+     Phase 18) is now actually CALLED here, not just defined. Structurally
+     redundant with OrderLeg.option_id being required (see that module's
+     docstring), but Part N asked for this boundary to be explicit and
+     enforced at the gateway itself, not merely true by construction
+     elsewhere.
+
+  7. `EmergencyStopStore.is_stopped()` (src/execution/emergency_stop.py,
+     Part P) — a real, file-backed, restart-surviving kill switch,
+     defaulting to STOPPED. Checked immediately before every broker call.
+     Cannot be bypassed by live_auto_execute=True (checked regardless of
+     that flag) or by strategy code (strategies never see this store).
+
+  8. `is_live_trading_authorized(system_state_audit_log)`
+     (src/execution/system_state.py, Part O) — true only when the
+     persisted system state is exactly LIVE_AUTONOMOUS_TRADING. RESEARCH,
+     VALIDATED_STRATEGY, HUMAN_LIVE_AUTHORIZATION, LIVE_PAUSED,
+     EMERGENCY_STOP, and "no record at all" are all unauthorized.
+
+Both new stores are constructor arguments with no permissive default:
+omitting either (passing None) is treated as the safe/blocked answer
+("no configured stop store" behaves as "stopped"; "no configured audit
+log" behaves as "not authorized") — there is no way to construct a
+gateway that skips these checks by simply not wiring the stores.
 """
 
 from __future__ import annotations
@@ -67,9 +98,12 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from src.execution.asset_class_restriction import assert_options_only
+from src.execution.emergency_stop import EmergencyStopStore
 from src.execution.live_positions import LiveBotPositionsStore
 from src.execution.orders import LiveFill, OrderRequest, OrderResult, SimulatedFill
 from src.execution.pending import PendingLiveOrder, PendingOrderStore
+from src.execution.system_state import SystemStateAuditLog, is_live_trading_authorized
 
 if TYPE_CHECKING:
     from src.config.settings import Settings
@@ -175,6 +209,8 @@ class LiveExecutionGateway(ExecutionGateway):
         pending_store: PendingOrderStore,
         bot_positions_store: LiveBotPositionsStore | None = None,
         live_order_placer: "LiveOrderPlacer | None" = None,
+        emergency_stop_store: EmergencyStopStore | None = None,
+        system_state_audit_log: SystemStateAuditLog | None = None,
     ) -> None:
         if not settings.is_live:
             raise LiveTradingDisabledError(
@@ -200,6 +236,13 @@ class LiveExecutionGateway(ExecutionGateway):
         # degrades to the same pending-approval behavior as
         # live_auto_execute=False.
         self._live_order_placer = live_order_placer
+        # Phase 35, Parts N-P — see the module docstring's guards 6-8.
+        # Deliberately NOT defaulted to a permissive stand-in: None is
+        # carried through as-is and treated as the blocked answer at
+        # check time in _place_pending, so there is no way to construct
+        # a gateway that silently skips these checks.
+        self._emergency_stop_store = emergency_stop_store
+        self._system_state_audit_log = system_state_audit_log
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
         """NEVER calls place_option_order directly from this method's own
@@ -294,6 +337,38 @@ class LiveExecutionGateway(ExecutionGateway):
 
         return self._place_pending(pending, live_order_placer, approved_by=approved_by, now=now)
 
+    def _assert_execution_permitted(
+        self, order: OrderRequest, *, now: datetime, pending: PendingLiveOrder, approved_by: str,
+    ) -> None:
+        """Phase 35, Parts N-P's guards 6-8 (see module docstring),
+        enforced unconditionally right before every broker call. A
+        blocked attempt is recorded exactly like a placer-raised
+        failure — status="failed" on the pending order, logged, then
+        re-raised — never silently swallowed."""
+        try:
+            assert_options_only(order)
+            if self._emergency_stop_store is None or self._emergency_stop_store.is_stopped():
+                raise LiveTradingDisabledError(
+                    "Emergency stop is active (or no emergency-stop store was configured for "
+                    "this gateway) -- refusing to place a live order. See "
+                    "src/execution/emergency_stop.py."
+                )
+            if self._system_state_audit_log is None or not is_live_trading_authorized(self._system_state_audit_log):
+                current = (
+                    self._system_state_audit_log.current_state()
+                    if self._system_state_audit_log is not None else None
+                )
+                raise LiveTradingDisabledError(
+                    f"System is not authorized for live autonomous trading (current state: "
+                    f"{current}) -- refusing to place a live order. See "
+                    "src/execution/system_state.py."
+                )
+        except Exception as exc:  # noqa: BLE001 - record the block in the audit trail, then re-raise
+            failed = pending.with_status("failed", decided_at=now, decided_by=approved_by, error=str(exc))
+            self._pending_store.update(failed)
+            self._decision_logger.log_pending_live_order(failed)
+            raise
+
     def _place_pending(
         self,
         pending: PendingLiveOrder,
@@ -306,9 +381,17 @@ class LiveExecutionGateway(ExecutionGateway):
         place_option_order. Both submit_order()'s auto-execute path and
         confirm_and_place() funnel through here after their own
         pre-checks, so there is exactly one implementation of "what
-        actually happens when we place a live order" to audit and test."""
+        actually happens when we place a live order" to audit and test.
+
+        Phase 35, Parts N-P: this is also where guards 6-8 from the
+        module docstring are enforced — immediately before the broker
+        call, unconditionally, regardless of live_auto_execute or which
+        caller reached here. A blocked attempt is recorded to the
+        pending-order store/audit log exactly like any other failure
+        (status="failed"), never silently swallowed."""
         now = now or datetime.now(timezone.utc)
         order = pending.order
+        self._assert_execution_permitted(order, now=now, pending=pending, approved_by=approved_by)
         ref_id = order.ref_id or new_ref_id()
         try:
             raw = live_order_placer.place_option_order(
@@ -381,6 +464,8 @@ def get_execution_gateway(
     pending_store: PendingOrderStore | None = None,
     bot_positions_store: LiveBotPositionsStore | None = None,
     live_order_placer: "LiveOrderPlacer | None" = None,
+    emergency_stop_store: EmergencyStopStore | None = None,
+    system_state_audit_log: SystemStateAuditLog | None = None,
 ) -> ExecutionGateway:
     """The only supported way to obtain a gateway.
 
@@ -389,6 +474,12 @@ def get_execution_gateway(
     pass a PendingOrderStore — there is no implicit default that would let
     a caller accidentally receive a live-capable gateway just by flipping
     TRADING_MODE without also wiring the rest of the live path deliberately.
+
+    Phase 35, Parts N-P: `emergency_stop_store`/`system_state_audit_log` are
+    threaded straight through to LiveExecutionGateway unchanged — omitting
+    either here produces a gateway that will refuse every real placement
+    attempt (see that class's docstring), never one that silently skips
+    the check.
     """
     if settings.is_paper:
         return PaperExecutionGateway(settings, decision_logger)
@@ -398,7 +489,10 @@ def get_execution_gateway(
             "get_execution_gateway — there is no implicit default, so a caller can't "
             "accidentally obtain a live-capable gateway."
         )
-    return LiveExecutionGateway(settings, decision_logger, pending_store, bot_positions_store, live_order_placer)
+    return LiveExecutionGateway(
+        settings, decision_logger, pending_store, bot_positions_store, live_order_placer,
+        emergency_stop_store=emergency_stop_store, system_state_audit_log=system_state_audit_log,
+    )
 
 
 def new_ref_id() -> str:

@@ -62,10 +62,12 @@ from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING
 
 from src.config.settings import Settings
+from src.execution.emergency_stop import EmergencyStopStore
 from src.execution.gateway import ExecutionGateway, get_execution_gateway, new_ref_id
 from src.execution.live_positions import LiveBotPositionsStore
 from src.execution.orders import OrderLeg, OrderRequest
 from src.execution.pending import PendingOrderStore
+from src.execution.system_state import SystemStateAuditLog
 from src.logging.decision_logger import DecisionLogger
 from src.logging.trade_journal import TradeJournal
 from src.market.data_provider import MarketDataProvider
@@ -161,8 +163,18 @@ def run_trading_cycle(
     # class's own concern — see src/execution/gateway.py.
     bot_positions_store = LiveBotPositionsStore(Path(settings.live_bot_positions_file))
     pending_store = PendingOrderStore(Path(settings.pending_orders_file)) if settings.is_live else None
+    # Phase 35, Parts N-P: constructed here unconditionally (paper mode
+    # ignores them; get_execution_gateway only threads them into a
+    # LiveExecutionGateway) so real placement is never possible without
+    # them, and neither this function nor anything it calls ever writes
+    # to either store to authorize itself — that stays a deliberate,
+    # separate human action outside this codepath (see
+    # src/execution/system_state.py / emergency_stop.py).
+    emergency_stop_store = EmergencyStopStore(Path(settings.emergency_stop_file))
+    system_state_audit_log = SystemStateAuditLog(Path(settings.system_state_log_file))
     execution_gateway = get_execution_gateway(
-        settings, decision_logger, pending_store, bot_positions_store, live_order_placer
+        settings, decision_logger, pending_store, bot_positions_store, live_order_placer,
+        emergency_stop_store=emergency_stop_store, system_state_audit_log=system_state_audit_log,
     )
     risk_manager = RiskManager(RiskLimits.from_settings(settings))
     risk_store = RiskStateStore(Path(settings.risk_state_file))

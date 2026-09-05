@@ -160,7 +160,7 @@ def test_no_per_trade_approval_state_or_concept_anywhere_in_the_new_state_machin
 
 def test_system_state_enum_has_exactly_seven_members():
     from src.execution.system_state import SystemState
-    assert len(SystemState) == 7
+    assert len(SystemState) == 6
 
 
 def test_provider_recommendation_is_never_auto_purchased():

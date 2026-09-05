@@ -140,6 +140,11 @@ class Settings:
     live_bot_positions_file: str
     peak_prices_file: str
     trade_journal_file: str
+    # --- Phase 35, Parts N-P: the execution-boundary hardening's own
+    # file-backed stores. Independent of every file above -- these two
+    # ADD gates in front of the live gateway, they replace nothing.
+    emergency_stop_file: str
+    system_state_log_file: str
 
     # --- Brokerage account / scanning ------------------------------------------
     # account_number is intentionally never auto-selected from get_accounts by
@@ -252,6 +257,8 @@ class Settings:
             live_bot_positions_file=_get_str(env, "LIVE_BOT_POSITIONS_FILE", "logs/live_bot_positions.json"),
             peak_prices_file=_get_str(env, "PEAK_PRICES_FILE", "logs/peak_prices.json"),
             trade_journal_file=_get_str(env, "TRADE_JOURNAL_FILE", "logs/trade_journal.jsonl"),
+            emergency_stop_file=_get_str(env, "EMERGENCY_STOP_FILE", "logs/emergency_stop.json"),
+            system_state_log_file=_get_str(env, "SYSTEM_STATE_LOG_FILE", "logs/system_state_audit.jsonl"),
             account_number=_get_optional_str(env, "ROBINHOOD_ACCOUNT_NUMBER"),
             scan_universe=_get_str_tuple(env, "SCAN_UNIVERSE", "SPY,QQQ,AAPL,MSFT,NVDA"),
             max_new_entries_per_cycle=_get_int(env, "MAX_NEW_ENTRIES_PER_CYCLE", 1),
