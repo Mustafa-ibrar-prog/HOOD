@@ -88,6 +88,8 @@ called for a rejected proposal.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 
@@ -175,6 +177,42 @@ class StaticHoodClient:
                 f"{method}({key!r}) was never recorded on this StaticHoodClient — "
                 "fetch it live and call the matching record_* method first"
             ) from exc
+
+
+_RECORD_FILE_PREFIXES = {
+    "equity_quotes_": "record_equity_quotes",
+    "equity_historicals_": "record_equity_historicals",
+    "option_quotes_": "record_option_quotes",
+    "option_historicals_": "record_option_historicals",
+    "option_chains_": "record_option_chains",
+    "option_instruments_": "record_option_instruments",
+}
+
+
+def load_static_hood_client_from_dir(data_dir: Path, account_number: str | None = None) -> StaticHoodClient:
+    """Shared loader for the manual runbook's file-naming convention
+    (see scripts/run_cycle.py's module docstring for the exact per-tool
+    filename patterns) — used by every script that replays real,
+    agent-fetched HOOD tool responses through a StaticHoodClient, so the
+    convention is defined once rather than re-implemented per script."""
+    client = StaticHoodClient()
+    for path in sorted(Path(data_dir).glob("*.json")):
+        name = path.stem
+        response = json.loads(path.read_text())
+
+        if name == "option_positions":
+            if not account_number:
+                continue
+            client.record_option_positions(account_number, response)
+            continue
+
+        for prefix, method_name in _RECORD_FILE_PREFIXES.items():
+            if name.startswith(prefix):
+                key = name[len(prefix) :]
+                getattr(client, method_name)(key, response)
+                break
+
+    return client
 
 
 class StaticLiveOrderPlacer:
