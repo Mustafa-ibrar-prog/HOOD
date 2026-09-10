@@ -47,4 +47,25 @@ Modules:
   - risk_monitoring.py — Part 20.
   - engine.py — run_paper_experiment_cycle(), the per-cycle wrapper.
   - report.py — final-report data aggregation (Part 26-28).
+
+Phase 41 — the automatic market-open scheduler (docs/phase41_automatic_
+scheduler.md has the full operational runbook). Builds entirely on the
+modules above, adds only:
+  - market_calendar.py — market-open detection + deterministic intraday
+    cadence slots, on top of Phase 37's unmodified is_market_open_for_
+    recording (scheduling component A).
+  - data_acquisition.py — the InboxDataAcquisitionProvider seam real
+    agent-fetched Robinhood data flows through into a scheduled cycle;
+    never a fake MCP client (scheduling component B).
+  - scheduler_events.py — the scheduler's own append-only operational
+    event log (PAPER_SCHEDULER_STARTED, MARKET_OPEN, DATA_COLLECTION_*,
+    PAPER_CYCLE_*, PAPER_ENTRY/EXIT, EXPERIMENT_COMPLETED, ...).
+  - cycle_runner.py — execute_paper_cycle(), the ONE real-cycle execution
+    path shared by scripts/paper_experiment.py's CLI and the scheduler
+    (scheduling component C — never re-implements run_paper_experiment_
+    cycle, only wraps it).
+  - scheduler.py — run_scheduler_tick()/run_scheduler_forever(), the
+    deterministic decide-then-execute loop tying A+B+C together, plus
+    duplicate-cycle protection via slot_id natural keys.
+  - scripts/run_paper_scheduler.py — the CLI entrypoint that starts it.
 """

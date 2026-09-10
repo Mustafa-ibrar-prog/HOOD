@@ -49,16 +49,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config.settings import Settings  # noqa: E402
-from src.live_bridge import load_static_hood_client_from_dir  # noqa: E402
-from src.market.hood_provider import HoodMarketDataProvider  # noqa: E402
 from src.paper_trading.account import compute_account_snapshot  # noqa: E402
 from src.paper_trading.clock import compute_clock_status  # noqa: E402
+from src.paper_trading.cycle_runner import execute_paper_cycle  # noqa: E402
 from src.paper_trading.engine import (  # noqa: E402
     CYCLE_OK,
     MARKET_CLOSED_RESULT,
     NO_QUALIFIED_OPPORTUNITY,
     experiment_paths,
-    run_paper_experiment_cycle,
 )
 from src.paper_trading.equity_curve import EquitySnapshotStore  # noqa: E402
 from src.paper_trading.experiment_config import (  # noqa: E402
@@ -122,25 +120,16 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_run_cycle(args: argparse.Namespace) -> int:
-    paths, config_store, state_store = _stores(args.experiment_id)
-    config = config_store.get()
-    if config is None:
-        print(f"No experiment config found for {args.experiment_id!r} — run 'start' first", file=sys.stderr)
-        return 1
-    status = state_store.current_status()
-    if status != ExperimentStatus.RUNNING:
-        print(f"Experiment status is {status.value if status else 'MISSING'}, not RUNNING — no cycle run", file=sys.stderr)
-        return 1
-
     now = datetime.fromisoformat(args.now.replace("Z", "+00:00")) if args.now else datetime.now(timezone.utc)
-    base_settings = Settings.from_env()
-    client = load_static_hood_client_from_dir(args.data_dir, base_settings.account_number)
-    market = HoodMarketDataProvider(client, base_settings)
-
-    result = run_paper_experiment_cycle(
-        config=config, client=client, market=market, base_settings=base_settings, now=now,
-        slippage_tier=SlippageAssumptionTier(args.slippage_tier), paths=paths,
+    outcome = execute_paper_cycle(
+        experiment_id=args.experiment_id, data_dir=args.data_dir, now=now,
+        slippage_tier=SlippageAssumptionTier(args.slippage_tier),
     )
+    if not outcome.ok:
+        print(outcome.error, file=sys.stderr)
+        return 1
+
+    result = outcome.result
     print(f"outcome={result.outcome}")
     print(f"observation_cycle_id={result.observation_cycle_id}")
     print(f"new_trades={len(result.new_trades)} closed_trades={len(result.closed_trades)}")
@@ -151,13 +140,11 @@ def cmd_run_cycle(args: argparse.Namespace) -> int:
         print(f"errors={result.errors}", file=sys.stderr)
 
     # Auto-complete on reaching the minimum duration -- the designed end
-    # condition (Part 25: never auto-stop merely because of a loss).
-    clock = compute_clock_status(
-        experiment_start=config.start_timestamp, planned_minimum_end=config.planned_minimum_end_timestamp, now=now,
-        cycle_dates=frozenset(e.timestamp.date() for e in EquitySnapshotStore(paths.equity_curve_file).load_all()),
-    )
-    if clock.minimum_duration_met:
-        state_store.transition(experiment_id=args.experiment_id, to_status=ExperimentStatus.COMPLETED, at=now, reason=f"Reached the {MINIMUM_EXPERIMENT_DAYS}-calendar-day minimum duration")
+    # condition (Part 25: never auto-stop merely because of a loss). This
+    # check lives in src.paper_trading.cycle_runner.execute_paper_cycle
+    # now (Phase 41) -- shared, not duplicated, with the automatic
+    # scheduler (src.paper_trading.scheduler).
+    if outcome.auto_completed:
         print("status=COMPLETED (minimum duration reached)")
     return 0
 
