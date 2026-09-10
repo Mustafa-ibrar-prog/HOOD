@@ -35,6 +35,7 @@ up, and executing the cycle without a human re-issuing each command.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,9 +100,19 @@ def mark_inbox_slot_ready(inbox_root: Path, slot_id: str) -> Path:
     response intended for this slot has already been written via
     `src.live_bridge.save_hood_response_to_data_dir(inbox_root/slot_id,
     ...)`. Writing this sentinel is the ONLY signal the provider accepts
-    that a slot's directory is complete rather than still being written."""
+    that a slot's directory is complete rather than still being written.
+
+    Phase 42: writes atomically (temp file + `os.replace`, same
+    directory/filesystem) rather than a direct `write_text` — a reader
+    polling concurrently (`InboxDataAcquisitionProvider.acquire`) can
+    never observe a partially-written sentinel; it either doesn't exist
+    yet or exists complete. `os.replace` is POSIX-atomic within one
+    filesystem, which every path this function is called with is (the
+    experiment's own `logs/paper_experiments/...` tree)."""
     directory = Path(inbox_root) / slot_id
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / READY_SENTINEL
-    path.write_text("")
+    tmp_path = directory / f".{READY_SENTINEL}.tmp-{os.getpid()}"
+    tmp_path.write_text("")
+    os.replace(tmp_path, path)
     return path

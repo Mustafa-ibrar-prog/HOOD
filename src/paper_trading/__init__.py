@@ -68,4 +68,24 @@ modules above, adds only:
     deterministic decide-then-execute loop tying A+B+C together, plus
     duplicate-cycle protection via slot_id natural keys.
   - scripts/run_paper_scheduler.py — the CLI entrypoint that starts it.
+
+Phase 42 — investigated whether Robinhood data acquisition itself (not
+just the scheduling around it) can be made genuinely automatic. Answer:
+no (see docs/phase42_data_acquisition_automation_investigation.md for
+the full evidence — a subprocess `claude -p` has zero MCP access in this
+environment, confirmed via `claude mcp list`; session/account-level
+scheduling tools can wake an agent turn but never eliminate it). Adds:
+  - near_the_money.py — deterministic, bounded exact-strike targeting
+    (`compute_target_strikes`) that avoids blind option-instrument
+    pagination's real failure mode (a page never reaching a high-priced
+    underlying's current price) instead of trying to paginate around it.
+  - acquisition_planning.py — `compute_cycle_identity` (the exact slot
+    id/inbox dir the agent must write to) and `compute_symbol_strike_
+    tasks` (per-symbol strike targets once real prices are known) —
+    removes the error-prone arithmetic from the still-required agent
+    step, never replaces it.
+  - data_acquisition.py::mark_inbox_slot_ready now writes the READY
+    sentinel atomically (temp file + os.replace).
+  - scripts/prepare_acquisition_plan.py — CLI for the two planning
+    functions above.
 """
