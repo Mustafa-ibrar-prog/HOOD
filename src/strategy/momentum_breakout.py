@@ -56,6 +56,12 @@ class MomentumBreakoutConfig:
     max_spread_pct: float = 0.15  # pre-filter only; RiskManager enforces the real limit at entry
     min_volume: int = 10
     min_open_interest: int = 50
+    # Entry-gate strictness. Both default True/STRENGTHENING-only, exactly
+    # preserving the original frozen behavior (phase35_frozen_strategy_spec.py)
+    # for any caller that doesn't override them. orchestrator.py passes a
+    # looser instance explicitly -- see that file for why.
+    require_confirmed_breakout: bool = True
+    accept_stable_momentum: bool = False  # True also qualifies MomentumState.STABLE, not just STRENGTHENING
 
 
 class MomentumBreakoutStrategy(Strategy):
@@ -92,7 +98,7 @@ class MomentumBreakoutStrategy(Strategy):
     def _scan_symbol(self, market: MarketDataProvider, symbol: str) -> SetupCandidate | None:
         underlying = market.get_underlying_snapshot(symbol)
 
-        if not underlying.breakout_continuation:
+        if self.config.require_confirmed_breakout and not underlying.breakout_continuation:
             return None  # hard gate: a confirmed breakout, not just "looks okay"
 
         evidence = MomentumEvidence(
@@ -111,7 +117,10 @@ class MomentumBreakoutStrategy(Strategy):
             volume_ratio=underlying.volume_ratio,
         )
         assessment = evaluate_momentum(evidence)
-        if assessment.state is not MomentumState.STRENGTHENING:
+        qualifying_states = (MomentumState.STRENGTHENING,)
+        if self.config.accept_stable_momentum:
+            qualifying_states = (MomentumState.STRENGTHENING, MomentumState.STABLE)
+        if assessment.state not in qualifying_states:
             return None  # scanning is conservative: ambiguous/weak evidence doesn't qualify
 
         contract = self._select_contract(market, symbol, underlying.quote.last_trade_price)

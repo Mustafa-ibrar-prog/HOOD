@@ -16,6 +16,17 @@ Strategy ID: `MOMENTUM_BREAKOUT_EXISTING_V1`. Calling it "frozen" is not
 the same as calling it "validated" — Part A: "Do not call it validated.
 It is simply the frozen candidate under test." No claim about its
 performance or validity is made anywhere in this module.
+
+NOTE (2026-09-18): `orchestrator.py`'s live scan call site no longer
+constructs `MomentumBreakoutConfig()` bare — by explicit user instruction,
+it now passes a looser, scalp-oriented override (accepts STABLE momentum,
+drops the hard `breakout_continuation` gate, smaller profit/stop targets).
+`UnderlyingSignalSpec.requires_breakout_continuation` /
+`requires_momentum_state` below still describe the dataclass DEFAULT
+(unchanged, still what any bare `MomentumBreakoutConfig()` gets), but that
+default is no longer what the live orchestrator actually runs. This spec
+is accurate for the frozen candidate under test; it is not, as of this
+note, an accurate description of live-wired production behavior.
 """
 
 from __future__ import annotations
