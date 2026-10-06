@@ -24,8 +24,18 @@ TODAY = NOW.date()
 
 
 def _bullish_underlying(symbol="AAPL") -> UnderlyingSnapshot:
+    # fetched_at/as_of are anchored to REAL wall-clock time, deliberately
+    # independent of the module-level NOW above: MarketSnapshot/
+    # UnderlyingSnapshot.data_age_seconds (src/market/models.py) always
+    # measures age against datetime.now(timezone.utc), by design (not
+    # spoofable via an injected `now=`), so a fixture pinned to NOW's
+    # fixed calendar date would silently go "stale" (and start failing
+    # the data-freshness risk check) as real time moves past it. NOW
+    # itself stays fixed — it only anchors time-of-day/cutoff scenarios,
+    # which don't care what the real calendar date is.
+    fetched_at = datetime.now(timezone.utc)
     return UnderlyingSnapshot(
-        quote=EquityQuote(symbol=symbol, last_trade_price=230.0, previous_close=225.0, as_of=NOW),
+        quote=EquityQuote(symbol=symbol, last_trade_price=230.0, previous_close=225.0, as_of=fetched_at),
         bars=tuple(make_bars([220.0, 224.0, 228.0, 231.0])),
         rsi=62.0,
         rsi_prev=58.0,
@@ -39,11 +49,12 @@ def _bullish_underlying(symbol="AAPL") -> UnderlyingSnapshot:
         lower_highs=False,
         breakout_continuation=True,
         failed_breakout=False,
-        fetched_at=NOW,
+        fetched_at=fetched_at,
     )
 
 
 def _liquid_option_snapshot(option_id, bid=1.00, ask=1.05, volume=200, open_interest=500) -> MarketSnapshot:
+    fetched_at = datetime.now(timezone.utc)  # see _bullish_underlying()'s comment above
     return MarketSnapshot(
         option=OptionQuote(
             instrument_id=option_id,
@@ -53,9 +64,9 @@ def _liquid_option_snapshot(option_id, bid=1.00, ask=1.05, volume=200, open_inte
             previous_close=0.90,
             volume=volume,
             open_interest=open_interest,
-            as_of=NOW,
+            as_of=fetched_at,
         ),
-        underlying=EquityQuote(symbol="AAPL", last_trade_price=230.0, previous_close=225.0, as_of=NOW),
+        underlying=EquityQuote(symbol="AAPL", last_trade_price=230.0, previous_close=225.0, as_of=fetched_at),
         option_bars=(),
         underlying_bars=(),
         rsi=None,
@@ -66,7 +77,7 @@ def _liquid_option_snapshot(option_id, bid=1.00, ask=1.05, volume=200, open_inte
         ema_slow=None,
         vwap=None,
         volume_ratio=None,
-        fetched_at=NOW,
+        fetched_at=fetched_at,
     )
 
 

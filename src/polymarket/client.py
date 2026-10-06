@@ -244,12 +244,32 @@ class PolymarketClient:
 
     def get_resolution(self, condition_id: str) -> str | None:
         """Returns "YES"/"NO" if this market has resolved, else None.
-        UNVERIFIED (see module docstring) — Market's `state.closed` plus
-        `outcomes.yes/no.price` snapping to 0/1 is the best-effort
-        resolution signal available from the verified Market model;
-        confirm against a real resolved market before relying on it."""
+
+        Verified fix (found by installing polymarket-client==0.12.0 and
+        inspecting its real pydantic models directly, not docs): an
+        earlier version of this method called
+        `client.get_market(id=condition_id)` — but `Market.id` and
+        `Market.condition_id` are TWO DIFFERENT fields
+        (`Market.model_fields` confirms `id: NewType` is a required,
+        distinct field from the optional `condition_id: NewType | None`,
+        aliased from the API's `conditionId`), and `get_market(id=...)`
+        builds its request path from that `id`, not `condition_id`. This
+        system never learns a market's internal `id` — only its
+        `condition_id` (see BinaryMarket) — so the old call could only
+        ever 404 or, worse, silently resolve the wrong market if `id`
+        and `condition_id` ever collided in format. `list_markets()`
+        has a real, correctly-wired `condition_ids` filter (confirmed in
+        `polymarket/_internal/actions/gamma.py`), which is the right way
+        to look a market up by the identifier this system actually has.
+
+        STILL UNVERIFIED against a live resolved market (see module
+        docstring): `state.closed` plus `outcomes.yes/no.price` snapping
+        to 0/1 is the best-effort resolution signal available from the
+        verified Market model; confirm against a real resolved market
+        before relying on it.
+        """
         client = self._public_client()
-        market = client.get_market(id=condition_id)
+        market = next(iter(client.list_markets(condition_ids=condition_id, page_size=1)), None)
         if market is None or not market.state.closed:
             return None
         yes_price = market.outcomes.yes.price
