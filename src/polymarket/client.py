@@ -1,51 +1,90 @@
 """Real network client for Polymarket — the only module that may ever
-call out to clob.polymarket.com or gamma-api.polymarket.com. Two
-sub-concerns, two libraries:
+call the Polymarket API. Wraps the OFFICIAL `polymarket-client` SDK
+(PyPI name `polymarket-client`, import name `polymarket`).
 
-  - Order book, pricing, and order placement/signing: py-clob-client
-    (the official SDK) via self._clob. Hand-rolling EIP-712 order
-    signing for real money is exactly the kind of mistake a maintained
-    SDK exists to prevent — this wrapper never reimplements signing.
-  - Market discovery (which condition_id is the current 15-min BTC
-    market): the public Gamma API via plain `requests` calls, parsed
-    defensively (missing/unexpected fields -> None, never guessed) —
-    same posture src/market/hood_provider.py takes toward HOOD tool
-    responses.
+Research trail (see the conversation this was built in for the full
+primary-source verification — summarized here so the next person
+doesn't have to redo it):
 
-NOT independently verified against the real API: this entire module
+  - `py-clob-client` (the SDK the previous version of this file used)
+    is ARCHIVED. Its own GitHub README (raw.githubusercontent.com,
+    fetched directly, NOT a summarized/rendered page) carries a literal
+    warning banner: "This repository has been archived and is no
+    longer maintained. The client is no longer functional and should
+    not be used for new or existing integrations. Please migrate to
+    our new unified SDK: https://github.com/Polymarket/py-sdk". Its
+    PyPI long_description does NOT carry this notice (it's stale,
+    unrelated to the real GitHub state) — do not trust PyPI's
+    long_description alone for a maintenance-status claim; GitHub's
+    raw README is the primary source here.
+  - `polymarket-client` (PyPI, import `polymarket`) is the real
+    successor: published by "Polymarket Engineering
+    <engineering@polymarket.com>", actively released (0.3.0b2 through
+    0.12.0, July-Sept 2026), `requires_python>=3.11`. Confirmed by
+    reading the actual source of github.com/Polymarket/py-sdk (raw
+    files, not a summary): `src/polymarket/clients/secure.py`,
+    `src/polymarket/models/clob/{order_response,order_book,account,
+    orders,api_key}.py`.
+  - Order placement: `SecureClient.place_market_order(token_id=,
+    side="BUY"/"SELL", amount=(BUY)/shares=(SELL), max_price=/min_price=,
+    order_type: MarketOrderType = "FAK")` creates, signs, and posts a
+    market order in one call, returning `OrderResponse =
+    AcceptedOrder | RejectedOrder` (discriminated by `.ok`).
+    `MarketOrderType = Literal["FAK", "FOK"]` — market orders can ONLY
+    be FAK or FOK, never resting; this system defaults to FOK (see
+    models.OrderRequest's docstring).
+  - Fill status is NEVER read from the post-order response's
+    making_amount/taking_amount here — get_fill_status() always does a
+    fresh, separate lookup via `SecureClient.get_order(order_id=)` ->
+    `OpenOrder` (whose `size_matched`/`original_size` fields are this
+    system's definition of "actually filled"), per Task 3's explicit
+    "never fabricate a fill, inspect the actual API response."
+  - Order book: `SecureClient.get_order_book(token_id=) -> OrderBook`
+    with `bids`/`asks: tuple[OrderBookLevel, ...]`. Verified SDK
+    convention (straight from order_book.py's own repr code): bids
+    ascending (best/highest LAST), asks descending (best/lowest LAST).
+    This module normalizes both to best-first before handing them to
+    models.OrderBookSnapshot, so that convention never leaks past this
+    file.
+  - Auth: `SecureClient.create(private_key=, wallet=, credentials=)`.
+    `private_key` is a REQUIRED keyword even when `credentials` (a
+    pre-derived `ApiKeyCreds`) is also supplied — every order is
+    EIP-712-signed by the private key regardless of how L2 REST auth is
+    established. See settings.py's fail-closed check for this.
+
+NOT independently verified against a LIVE server response: this module
 was written in a network-sandboxed environment that cannot reach
-polymarket.com (see src/polymarket/__init__.py). Before trusting this
-with real funds, run scripts/verify_polymarket_setup.py (read-only: logs
-in, fetches markets, prints what it found) somewhere with network
-access and confirm find_active_btc_market() actually finds a real,
-currently-open 15-minute BTC market — the exact Gamma API query
-(tag/slug pattern) below is a best-effort guess, not a confirmed fact.
+polymarket.com (confirmed on both gamma-api.polymarket.com and
+clob.polymarket.com — see src/polymarket/__init__.py). Everything above
+is verified against the SDK's real, current SOURCE CODE (not
+documentation, not a summary, not an assumption) — but no call in this
+file has actually executed against the live API. Before trusting this
+with real funds, run scripts/verify_polymarket_setup.py somewhere with
+network access.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from src.polymarket.models import BinaryMarket, OrderRequest
+from src.polymarket.models import (
+    BinaryMarket,
+    BookLevel,
+    FillResult,
+    OrderBookSnapshot,
+    OrderRequest,
+    SubmissionOutcome,
+)
 from src.polymarket.settings import PolymarketSettings
 
-_REQUEST_TIMEOUT_SECONDS = 10
-
-
-def _requests():
-    """Lazy import so this module — and anything that only needs its
-    exception types or pure-logic pieces, like tests — can be imported
-    without the `requests` package installed. Every method that talks
-    to the network calls this instead of importing at module level."""
-    try:
-        import requests
-    except ImportError as exc:
-        raise PolymarketClientError(
-            "The `requests` package is not installed — run `pip install requests` "
-            "(see pyproject.toml). Only needed for actual network calls."
-        ) from exc
-    return requests
+# Defensive bound on how many trade pages get_fill_status() will scan
+# looking for this order's fills — list_account_trades has no order_id
+# filter (verified: its real signature only takes asset_id/token_id/id/
+# market/maker_address/after/before), so matching is client-side over a
+# time-and-token-bounded window. A real fill for a 15-minute market's
+# order is always recent; this many pages is already generous.
+_MAX_TRADE_PAGES_SCANNED = 5
 
 
 class PolymarketClientError(RuntimeError):
@@ -59,197 +98,287 @@ class NoActiveMarketError(PolymarketClientError):
     market than the one actually configured."""
 
 
+def _sdk():
+    """Lazy import of polymarket-client, so pure-logic modules/tests
+    (models.py, risk.py, strategy.py, gateway.py, positions.py,
+    reconciliation.py, and their tests) never need it installed."""
+    try:
+        import polymarket
+    except ImportError as exc:
+        raise PolymarketClientError(
+            "polymarket-client is not installed — run `pip install polymarket-client` "
+            "(see pyproject.toml). Import name is `polymarket`, NOT `py_clob_client` — "
+            "that package is archived; see this module's docstring."
+        ) from exc
+    return polymarket
+
+
 class PolymarketClient:
     def __init__(self, settings: PolymarketSettings):
         self._settings = settings
-        self._clob = None  # lazy — see _clob_client(); paper-mode callers may never need it
+        self._public = None
+        self._secure = None
 
-    # --- py-clob-client, lazily constructed so paper-mode / discovery-only
-    # callers never need credentials or the dependency installed --------------
-    def _clob_client(self):
-        if self._clob is not None:
-            return self._clob
-        try:
-            from py_clob_client.client import ClobClient
-        except ImportError as exc:
+    # --- Client construction, lazy so discovery-only / paper-mode callers
+    # never need credentials or the SDK installed at import time -----------
+    def _public_client(self):
+        if self._public is not None:
+            return self._public
+        pm = _sdk()
+        self._public = pm.PublicClient()
+        return self._public
+
+    def _secure_client(self):
+        if self._secure is not None:
+            return self._secure
+        if not self._settings.private_key:
             raise PolymarketClientError(
-                "py-clob-client is not installed — run `pip install py-clob-client` "
-                "(see pyproject.toml). Only needed for order placement / authenticated "
-                "calls; market discovery alone (find_active_btc_market) doesn't need it."
-            ) from exc
-
+                "No POLYMARKET_PRIVATE_KEY configured — required for any authenticated call "
+                "(order placement, order status, balance). See .env.polymarket.example. "
+                "settings.py's fail-closed check should have already caught this for live "
+                "mode; reaching here means something constructed a client without going "
+                "through PolymarketSettings.from_env()'s validation."
+            )
+        pm = _sdk()
+        credentials = None
         if self._settings.api_key and self._settings.api_secret and self._settings.api_passphrase:
-            from py_clob_client.clob_types import ApiCreds
-            client = ClobClient(
-                self._settings.clob_api_url, key=self._settings.private_key,
-                chain_id=self._settings.chain_id, funder=self._settings.funder_address,
+            credentials = pm.ApiKeyCreds(
+                key=self._settings.api_key, secret=self._settings.api_secret, passphrase=self._settings.api_passphrase,
             )
-            client.set_api_creds(ApiCreds(
-                api_key=self._settings.api_key, api_secret=self._settings.api_secret,
-                api_passphrase=self._settings.api_passphrase,
-            ))
-        elif self._settings.private_key:
-            client = ClobClient(
-                self._settings.clob_api_url, key=self._settings.private_key,
-                chain_id=self._settings.chain_id, funder=self._settings.funder_address,
-            )
-            client.set_api_creds(client.create_or_derive_api_creds())
-        else:
-            raise PolymarketClientError(
-                "No Polymarket credentials configured — set either "
-                "POLYMARKET_PRIVATE_KEY, or POLYMARKET_API_KEY/_SECRET/_PASSPHRASE "
-                "plus POLYMARKET_FUNDER_ADDRESS. See .env.polymarket.example."
-            )
-        self._clob = client
-        return client
+        self._secure = pm.SecureClient.create(
+            private_key=self._settings.private_key,
+            wallet=self._settings.funder_address,
+            credentials=credentials,
+        )
+        return self._secure
 
-    # --- Market discovery (Gamma API, no credentials needed) -----------------
+    def close(self) -> None:
+        if self._secure is not None:
+            self._secure.close()
+        if self._public is not None:
+            self._public.close()
+
+    # --- Market discovery (public data, no credentials needed) ---------------
     def find_active_btc_market(self, *, now: datetime | None = None) -> BinaryMarket:
-        """Finds the currently-open market for settings.asset whose
-        duration is closest to settings.market_duration_minutes.
+        """Finds the open market for settings.asset whose duration is
+        closest to settings.market_duration_minutes, among markets
+        closing within roughly the next 3 target-durations (a window
+        wide enough to not miss one near a boundary, narrow enough to
+        stay a cheap query).
 
-        UNVERIFIED (see module docstring): the tag/slug filter below is a
-        best-effort guess at how Polymarket's crypto up/down markets are
-        tagged on the Gamma API, not a confirmed fact. If this starts
-        raising NoActiveMarketError in a real run, the first thing to
-        check is this query against https://gamma-api.polymarket.com's
-        actual, current response shape — not this code's logic.
+        UNVERIFIED (see module docstring): list_markets() has no direct
+        keyword-search parameter, so "bitcoin" matching is done
+        client-side against `market.question`. If this starts raising
+        NoActiveMarketError in a real run with bitcoin markets visibly
+        live on polymarket.com, check this filter first — not the
+        reconciliation/risk logic elsewhere in this package.
         """
         now = now or datetime.now(timezone.utc)
-        resp = _requests().get(
-            f"{self._settings.gamma_api_url}/events",
-            params={"active": "true", "closed": "false", "tag": self._settings.asset, "limit": 50},
-            timeout=_REQUEST_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-        events = resp.json()
-        if not isinstance(events, list):
-            raise PolymarketClientError(f"Unexpected /events response shape: {type(events).__name__}")
-
+        client = self._public_client()
         target_seconds = self._settings.market_duration_minutes * 60
-        best: dict[str, Any] | None = None
+        window_end = now + timedelta(seconds=target_seconds * 3)
+
+        best = None
         best_diff: float | None = None
-        for event in events:
-            for market in event.get("markets") or []:
-                parsed = _try_parse_duration(market, now=now)
-                if parsed is None:
-                    continue
-                diff = abs(parsed - target_seconds)
-                if best_diff is None or diff < best_diff:
-                    best, best_diff = market, diff
+        for market in client.list_markets(closed=False, end_date_min=now, end_date_max=window_end, page_size=50):
+            question = (market.question or "").lower()
+            if self._settings.asset not in question:
+                continue
+            state = market.state
+            if state.start_date is None or state.end_date is None or state.end_date <= now:
+                continue
+            duration = (state.end_date - state.start_date).total_seconds()
+            diff = abs(duration - target_seconds)
+            if best_diff is None or diff < best_diff:
+                best, best_diff = market, diff
 
         if best is None:
             raise NoActiveMarketError(
                 f"No open {self._settings.asset} market found near "
                 f"{self._settings.market_duration_minutes} minutes in duration right now."
             )
-        return self._parse_market(best, now=now)
+        return self._to_binary_market(best, now=now)
 
-    def _parse_market(self, raw: dict[str, Any], *, now: datetime) -> BinaryMarket:
-        token_ids = raw.get("clobTokenIds")
-        if isinstance(token_ids, str):
-            import json
-            token_ids = json.loads(token_ids)
-        if not isinstance(token_ids, list) or len(token_ids) != 2:
-            raise PolymarketClientError(f"Market {raw.get('conditionId')!r} does not have exactly 2 outcome tokens")
-
-        condition_id = raw.get("conditionId")
-        close_raw = raw.get("endDate") or raw.get("end_date_iso")
-        if not condition_id or not close_raw:
-            raise PolymarketClientError(f"Market response missing conditionId/endDate: {raw!r}")
-        close_time = datetime.fromisoformat(close_raw.replace("Z", "+00:00"))
+    def _to_binary_market(self, market: Any, *, now: datetime) -> BinaryMarket:
+        if market.condition_id is None:
+            raise PolymarketClientError(f"Market {market.id!r} has no condition_id")
+        yes_token = market.outcomes.yes.token_id
+        no_token = market.outcomes.no.token_id
+        if not yes_token or not no_token:
+            raise PolymarketClientError(f"Market {market.condition_id!r} is missing a token_id for one or both outcomes")
+        close_time = market.state.end_date
+        if close_time is None:
+            raise PolymarketClientError(f"Market {market.condition_id!r} has no end_date")
 
         yes_bid = yes_ask = None
         try:
-            book = self.get_order_book(token_ids[0])
-            yes_bid, yes_ask = book
-        except Exception:  # noqa: BLE001 - price is optional at parse time; callers that need it call get_order_book themselves
+            book = self.get_order_book(str(yes_token))
+            yes_bid, yes_ask = book.best_bid, book.best_ask
+        except Exception:  # noqa: BLE001 - this summary price is a convenience for strategy.py's signal only; get_order_book() is the source of truth callers that need it should call directly
             pass
 
         return BinaryMarket(
-            condition_id=condition_id, question=raw.get("question", ""),
-            token_id_yes=token_ids[0], token_id_no=token_ids[1],
+            condition_id=str(market.condition_id), question=market.question or "",
+            token_id_yes=str(yes_token), token_id_no=str(no_token),
             close_time=close_time, fetched_at=now, yes_bid=yes_bid, yes_ask=yes_ask,
         )
 
-    def get_order_book(self, token_id: str) -> tuple[float | None, float | None]:
-        """Returns (best_bid, best_ask) for one outcome token, in dollars.
-        Uses the CLOB API's public order-book endpoint directly (no
-        credentials needed — this is public market data)."""
-        resp = _requests().get(
-            f"{self._settings.clob_api_url}/book", params={"token_id": token_id}, timeout=_REQUEST_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-        book = resp.json()
-        bids = book.get("bids") or []
-        asks = book.get("asks") or []
-        best_bid = max((float(b["price"]) for b in bids), default=None)
-        best_ask = min((float(a["price"]) for a in asks), default=None)
-        return best_bid, best_ask
-
     def refresh(self, market: BinaryMarket) -> BinaryMarket:
-        """Re-fetches just the order book for an already-known market —
-        far cheaper than find_active_btc_market() for a strategy that's
-        polling the same market every poll_interval_seconds."""
-        yes_bid, yes_ask = self.get_order_book(market.token_id_yes)
+        """Re-fetches just the YES order book for an already-known
+        market — far cheaper than find_active_btc_market() for a
+        strategy polling the same market every poll_interval_seconds."""
         from dataclasses import replace
-        return replace(market, yes_bid=yes_bid, yes_ask=yes_ask, fetched_at=datetime.now(timezone.utc))
+        book = self.get_order_book(market.token_id_yes)
+        return replace(market, yes_bid=book.best_bid, yes_ask=book.best_ask, fetched_at=datetime.now(timezone.utc))
 
-    # --- Order placement (implements gateway.py's PolymarketOrderPlacer) -----
-    def place_order(self, order: OrderRequest) -> dict[str, Any]:
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import BUY, SELL
-
-        client = self._clob_client()
-        side = BUY if order.side == "BUY" else SELL
-        shares = order.size_usd / order.price
-        order_args = OrderArgs(price=order.price, size=shares, side=side, token_id=order.token_id)
-        signed_order = client.create_order(order_args)
-        return client.post_order(signed_order)
+    def get_order_book(self, token_id: str) -> OrderBookSnapshot:
+        """Public data — no credentials needed. Normalizes the SDK's
+        ascending-bids/descending-asks-with-best-at-index[-1] shape
+        into this system's own best-first convention (see module
+        docstring) so that detail never leaks past this file."""
+        client = self._public_client()
+        book = client.get_order_book(token_id=token_id)
+        bids = tuple(BookLevel(price=float(lvl.price), size=float(lvl.size)) for lvl in reversed(book.bids))
+        asks = tuple(BookLevel(price=float(lvl.price), size=float(lvl.size)) for lvl in reversed(book.asks))
+        return OrderBookSnapshot(token_id=token_id, bids=bids, asks=asks, fetched_at=datetime.now(timezone.utc))
 
     def get_resolution(self, condition_id: str) -> str | None:
         """Returns "YES"/"NO" if this market has resolved, else None.
-        UNVERIFIED (see module docstring) — the exact field Gamma uses
-        for the winning outcome on a closed market has not been
-        confirmed against a live response from this environment."""
-        resp = _requests().get(f"{self._settings.gamma_api_url}/markets", params={"condition_ids": condition_id}, timeout=_REQUEST_TIMEOUT_SECONDS)
-        resp.raise_for_status()
-        rows = resp.json()
-        if not rows:
+        UNVERIFIED (see module docstring) — Market's `state.closed` plus
+        `outcomes.yes/no.price` snapping to 0/1 is the best-effort
+        resolution signal available from the verified Market model;
+        confirm against a real resolved market before relying on it."""
+        client = self._public_client()
+        market = client.get_market(id=condition_id)
+        if market is None or not market.state.closed:
             return None
-        row = rows[0]
-        if not row.get("closed"):
+        yes_price = market.outcomes.yes.price
+        if yes_price is None:
             return None
-        outcome = row.get("winningOutcome") or row.get("outcome")
-        if outcome is None:
-            return None
-        return "YES" if str(outcome).strip().upper() in {"YES", "1"} else "NO"
+        return "YES" if yes_price >= 0.5 else "NO"
+
+    # --- Order placement (implements gateway.py's PolymarketOrderPlacer) -----
+    def place_order(self, order: OrderRequest) -> SubmissionOutcome:
+        """Submits an order. Returns a SubmissionOutcome — NOT a fill
+        determination; see models.SubmissionOutcome's docstring and
+        reconciliation.py. Never raises for a rejection the exchange
+        itself reports (ok=False with error_code set); only raises for
+        a transport/client-side failure that never reached a real
+        accept-or-reject decision."""
+        if order.side != "BUY":
+            raise PolymarketClientError("SELL is not supported — v1 scope is entries only (see positions.py)")
+
+        client = self._secure_client()
+        try:
+            response = client.place_market_order(
+                token_id=order.token_id, side="BUY", amount=order.size_usd,
+                max_price=order.max_price, order_type=order.order_type,
+            )
+        except Exception as exc:  # noqa: BLE001 - the SDK raises UserInputError/InsufficientLiquidityError/
+            # InsufficientAllowanceError/SigningError/RequestRejectedError for failures that
+            # never reach an accept-or-reject decision from the exchange at all — there is no
+            # exchange_order_id to reconcile in any of those cases.
+            return SubmissionOutcome(
+                ok=False, exchange_order_id=None, raw_status=None,
+                error_code=type(exc).__name__, error_message=str(exc),
+            )
+
+        if response.ok:
+            return SubmissionOutcome(
+                ok=True, exchange_order_id=str(response.order_id), raw_status=str(response.status),
+                raw={
+                    "making_amount": str(response.making_amount), "taking_amount": str(response.taking_amount),
+                    "trade_ids": list(response.trade_ids),
+                },
+            )
+        return SubmissionOutcome(
+            ok=False, exchange_order_id=None, raw_status=None,
+            error_code=str(response.code), error_message=response.message,
+        )
+
+    # --- Reconciliation (the authoritative fill lookup — see Task 3/5) -------
+    def get_fill_status(self, exchange_order_id: str) -> FillResult:
+        """The ONLY place this system reads "how much actually filled."
+        Always a fresh lookup — never derived from place_order()'s own
+        response. Returns status="unknown" (never "filled") for
+        anything this system can't confidently interpret, per Task 3's
+        "fail closed, do not fabricate a fill."
+        """
+        try:
+            client = self._secure_client()
+            order = client.get_order(order_id=exchange_order_id)
+        except Exception as exc:  # noqa: BLE001 - order-not-found or a transport failure both mean "we don't know" here
+            return FillResult(
+                order_id=exchange_order_id, status="unknown", requested_shares=0.0,
+                filled_shares=0.0, avg_fill_price=None, raw={"lookup_error": str(exc)},
+            )
+
+        requested = float(order.original_size)
+        filled = float(order.size_matched)
+        status_word = (order.status or "").lower()
+
+        if filled <= 0:
+            if "cancel" in status_word:
+                status = "cancelled"
+            elif "expir" in status_word:
+                status = "expired"
+            elif "live" in status_word or "open" in status_word or "matched" in status_word:
+                # "matched" with filled==0 shouldn't happen, but a live/open
+                # order genuinely resting unfilled is a real, valid state —
+                # see models.OrderRequest's docstring: FOK/FAK should never
+                # actually land here (they're never resting), but this path
+                # exists for correctness if that assumption is ever wrong.
+                status = "resting"
+            else:
+                status = "unknown"
+            return FillResult(
+                order_id=exchange_order_id, status=status, requested_shares=requested,
+                filled_shares=0.0, avg_fill_price=None, raw={"status": order.status},
+            )
+
+        avg_price = self._weighted_avg_fill_price(
+            exchange_order_id, token_id=str(order.asset_id), created_at=order.created_at, fallback_price=float(order.price),
+        )
+        status = "filled" if filled >= requested else "partially_filled"
+        return FillResult(
+            order_id=exchange_order_id, status=status, requested_shares=requested,
+            filled_shares=filled, avg_fill_price=avg_price, raw={"status": order.status},
+        )
+
+    def _weighted_avg_fill_price(
+        self, exchange_order_id: str, *, token_id: str, created_at: datetime, fallback_price: float,
+    ) -> float:
+        """Volume-weighted average of this order's own real trades —
+        more precise than OpenOrder.price (the order's limit/bound
+        price, not necessarily what was actually paid across multiple
+        maker counterparties). Falls back to that limit price, clearly
+        documented as an approximation, only if no matching trade is
+        found despite size_matched > 0 (e.g. settlement-record lag) —
+        the FILL itself is still verified via get_order(); only the
+        exact price is approximated in that edge case, which is not
+        the same as fabricating the fill."""
+        client = self._secure_client()
+        window_start = (created_at - timedelta(seconds=5)).isoformat()
+        total_size = 0.0
+        total_notional = 0.0
+        pages_scanned = 0
+        for trade in client.list_account_trades(token_id=token_id, after=window_start):
+            if getattr(trade, "taker_order_id", None) == exchange_order_id:
+                total_size += float(trade.size)
+                total_notional += float(trade.size) * float(trade.price)
+            pages_scanned += 1
+            if pages_scanned >= _MAX_TRADE_PAGES_SCANNED * 50:  # Paginator yields items, not pages; bound by item count
+                break
+        if total_size > 0:
+            return round(total_notional / total_size, 6)
+        return fallback_price
 
     def get_balance_usdc(self) -> float:
         """Best-effort USDC collateral balance check before sizing a
-        real bet — py-clob-client's balance-allowance endpoint. Callers
-        must not assume this succeeds; a risk check that needs a hard
-        balance guarantee should treat an exception here as "unknown,
-        don't trade," not "assume funded."""
-        client = self._clob_client()
-        resp = client.get_balance_allowance()
-        return float(resp.get("balance", 0)) / 1_000_000  # USDC has 6 decimals
-
-
-def _try_parse_duration(market: dict[str, Any], *, now: datetime) -> float | None:
-    """Returns the market's duration in seconds if it has both a start
-    and end time and is currently open, else None. Defensive: Gamma API
-    field names for start time are inconsistent across market types
-    (startDate vs createdAt), so this tries both rather than assuming."""
-    end_raw = market.get("endDate") or market.get("end_date_iso")
-    start_raw = market.get("startDate") or market.get("createdAt")
-    if not end_raw or not start_raw:
-        return None
-    try:
-        end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
-        start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if end <= now:
-        return None  # already closed
-    return (end - start).total_seconds()
+        real bet. Callers must not assume this succeeds; a risk check
+        that needs a hard balance guarantee should treat an exception
+        here as "unknown, don't trade," not "assume funded." Balance is
+        returned in base units (6 decimals for USDC) by the SDK."""
+        client = self._secure_client()
+        balance = client.get_balance_allowance(asset_type="COLLATERAL")
+        return balance.balance / 1_000_000

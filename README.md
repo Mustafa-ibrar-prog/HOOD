@@ -578,11 +578,80 @@ which are a fundamentally different instrument (a YES/NO token pair on
 a central limit order book, settled in USDC on Polygon, no strikes or
 expirations) and run as an **unattended Python process**, not an
 agent-mediated cycle: `src/polymarket/client.py` calls the real
-Polymarket API directly via `py-clob-client` + `requests`, so
-`scripts/run_polymarket_bot.py` can poll and trade on its own without
-an agent relaying data each cycle (unlike the Robinhood side — see "How
-the ~5-minute cadence actually works" above for why that constraint
-exists there but not here).
+Polymarket API directly via `polymarket-client` (the current OFFICIAL
+SDK — see below), so `scripts/run_polymarket_bot.py` can poll and
+trade on its own without an agent relaying data each cycle (unlike the
+Robinhood side — see "How the ~5-minute cadence actually works" above
+for why that constraint exists there but not here). This is a
+real-money system: correctness, fail-closed behavior, and verified API
+behavior are prioritized over speed throughout `src/polymarket/`.
+
+**SDK: `polymarket-client` (import name `polymarket`), not
+`py-clob-client`.** `py-clob-client` is ARCHIVED (its own GitHub README
+carries an explicit "no longer maintained, no longer functional"
+notice) — `polymarket-client`, published by Polymarket Engineering, is
+its real successor and requires Python >=3.11. It's declared as an
+optional `polymarket` extra in `pyproject.toml`
+(`pip install -e ".[polymarket]"`), not a hard dependency, because
+`src/polymarket/client.py` is the ONLY module that imports it, and does
+so lazily (`_sdk()`) — every other module (`models`, `risk`, `strategy`,
+`gateway`, `positions`, `reconciliation`, `settings`, and their tests)
+runs without it installed. See `client.py`'s module docstring for the
+full primary-source verification trail.
+
+**"Placed" is never treated as "filled" (the single most important
+correctness property here).** A submitted order becoming a position
+purely because the exchange *accepted* it is exactly the bug a
+real-money system can't afford. This codebase enforces the split at
+the type level:
+
+- `SubmissionOutcome` (from `gateway.py`/`client.py`) — what the
+  exchange said about *accepting* the order. Never implies a fill.
+- `FillResult` (from `reconciliation.py`'s `client.get_fill_status()`
+  lookup) — the ONLY type a position may be built from, and only ever
+  produced by a fresh, authoritative re-query of the order's real
+  state, never derived from the submission response.
+- Orders default to **FOK** (fill-or-kill): a new entry either fills
+  completely at a price no worse than `max_price`, or nothing happens
+  at all — this removes the ambiguous "market order partially filled"
+  case for new entries by construction. FAK is supported for callers
+  that want partial fills instead; reconciliation handles either
+  correctly.
+- An exchange response this system can't confidently interpret becomes
+  `FillResult(status="unknown")`, which `FillResult.is_fill` always
+  treats as "not filled" — never fabricated as a fill.
+
+**`src/polymarket/reconciliation.py` is the only path from "submitted"
+to "position exists"**, and it closes the specific gap where a pending
+order gets approved and placed (`confirm_and_place()`, possibly in a
+separate process, possibly after a restart) with nothing guaranteeing
+the position ledger ever gets updated from that:
+
+- `reconcile_order()` — reconciles one `PendingLiveOrder` against a
+  fresh fill lookup. Idempotent by two independent, disk-persisted
+  guards: `PendingLiveOrder.fill_reconciled` (primary) and
+  `PolymarketPositionStore.add_if_absent()` keyed on `client_order_id`
+  (secondary) — reconciling the same order twice, including across a
+  restart, can never create two positions.
+- `reconcile_pending_orders()` — sweeps every pending order that
+  reached the exchange but wasn't yet reconciled. `engine.py`'s
+  `run_cycle()` calls this first, every cycle, before proposing
+  anything new, so a restart never loses track of an order placed in a
+  prior process. `scripts/confirm_polymarket_order.py` also calls
+  `reconcile_order()` immediately after placing, so a human running it
+  manually sees the real outcome (filled / partial / rejected /
+  cancelled — never an assumed fill), not just "submitted."
+
+**Order-book liquidity is enforced, not just configured.**
+`POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD` has a precise, executable
+meaning (`models.OrderBookSnapshot.executable_liquidity_usd()`): USD
+notional summed across book levels priced at or below the order's
+`max_price`, on the specific side of the SPECIFIC outcome token being
+bought — never an aggregate across both outcomes, never NO inferred as
+`1 - YES`. `risk.py`'s `check_order_book_liquidity()` refuses entry
+outright when the book can't actually absorb the trade near the
+ceiling price; `engine.py` fetches that exact outcome's own order book
+before every risk check.
 
 **Same safety philosophy as the Robinhood side, reimplemented, not
 reused** (the two systems share no options-specific code, but
@@ -594,34 +663,46 @@ is imported as-is):
 - `POLYMARKET_LIVE_TRADING_CONFIRMED` is a second, independent switch;
   `LivePolymarketGateway` refuses to even construct without it.
 - `POLYMARKET_LIVE_AUTO_EXECUTE` (default `false`) controls whether a
-  risk-cleared order places immediately or stops at `pending_approval`
-  for a separate `confirm_and_place()` call.
+  risk-cleared order places immediately (then is reconciled
+  immediately within the same cycle) or stops at `pending_approval` for
+  a separate `scripts/confirm_polymarket_order.py` call.
 - The emergency-stop file defaults to **STOPPED** with no file present
   — a real order cannot place until someone explicitly clears it.
 - Deterministic risk gates before every new entry: max bet size, max
   daily loss, max open positions, cooldown after an exit, data
-  staleness, max spread, and an entry cutoff before a market's close —
-  see `src/polymarket/risk.py`.
+  staleness, max spread, order-book liquidity, and an entry cutoff
+  before a market's close — see `src/polymarket/risk.py`.
+- Credentials fail closed (`settings.py`): `POLYMARKET_PRIVATE_KEY` is
+  ALWAYS required for live trading (every order is signed by it; the
+  API-key triple below can never substitute), and
+  `POLYMARKET_API_KEY`/`SECRET`/`PASSPHRASE` must be all-set or
+  all-unset — a partial triple is rejected at startup as a
+  configuration mistake, not guessed at.
 
 **Not independently verified against the real API.** This was built in
 an environment whose network egress policy blocks `polymarket.com`
 outright (confirmed on both `gamma-api.polymarket.com` and
 `clob.polymarket.com`), so none of the live-network code paths in
-`src/polymarket/client.py` have actually been run against Polymarket.
-Before trusting this with real funds:
+`src/polymarket/client.py` have actually been run against Polymarket —
+everything is instead verified against the SDK's real, current source
+code. Before trusting this with real funds:
 
-1. `pip install py-clob-client requests` (declared in `pyproject.toml`;
-   not installed in the environment this was written in).
+1. `pip install -e ".[polymarket]"` (the `polymarket-client` SDK is an
+   optional extra — see above; not installed in the environment this
+   was written in, and requires Python >=3.11).
 2. Copy `.env.polymarket.example` values into your real `.env` and fill
    in credentials and risk limits — the defaults are deliberately tiny
    placeholders, not a recommendation.
 3. Run `python3 scripts/verify_polymarket_setup.py` — a read-only check
    (never places an order) that confirms market discovery, the order
-   book, and credentials actually work against the live API before you
-   run the bot for real.
+   book, per-outcome executable liquidity, and credentials actually
+   work against the live API before you run the bot for real.
 4. Only then: `python3 scripts/run_polymarket_bot.py` (add `--once` to
    run a single cycle first and inspect `logs/polymarket/decisions.jsonl`
-   before leaving it running unattended).
+   before leaving it running unattended). With auto-execute off (the
+   default), approve or reject a pending order with
+   `scripts/confirm_polymarket_order.py` /
+   `scripts/reject_polymarket_order.py`.
 
 The momentum-continuation strategy in `src/polymarket/strategy.py` is a
 v1 starting point (reads the market's own implied-probability trend

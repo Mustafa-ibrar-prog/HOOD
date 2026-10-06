@@ -3,19 +3,37 @@ from environment variables (optionally via a .env file, same minimal
 loader convention as src/config/settings.py) — no other module here
 should read os.environ directly.
 
-Credentials: Polymarket's CLOB requires an L2 API key (key/secret/
-passphrase) derived from a signed message by a Polygon wallet. Two ways
-to provide that here:
+Credentials (verified against polymarket-client's real
+SecureClient.create() signature — see client.py's module docstring for
+the research trail):
+
+  - POLYMARKET_PRIVATE_KEY is ALWAYS required for live trading. Every
+    order is an EIP-712 signature from this wallet; there is no
+    credential-only path that skips it, unlike the old (archived)
+    py-clob-client, where some flows could get away with just an API
+    key. Never paste a real private key into a chat session or commit
+    it anywhere — set it as a real environment variable or in a local,
+    gitignored .env file only.
   - POLYMARKET_API_KEY / POLYMARKET_API_SECRET / POLYMARKET_API_PASSPHRASE
-    plus POLYMARKET_FUNDER_ADDRESS, if you've already derived L2 creds
-    (py-clob-client's create_or_derive_api_creds, run once, out of band).
-  - POLYMARKET_PRIVATE_KEY, if you want this process to derive L2 creds
-    itself on startup via py-clob-client. Never paste a real private key
-    into a chat session or commit it anywhere — set it as a real
-    environment variable or in a local, gitignored .env file only.
-Both are optional at the Settings level (None if unset) so from_env()
-never raises just because credentials aren't configured yet; client.py
-is where a missing credential actually blocks a live call.
+    are OPTIONAL. If all three are set, they're passed as pre-derived
+    L2 API credentials (skips re-deriving them via a signed request on
+    every process start). If unset, the SDK derives them itself from
+    the private key at startup. Providing only SOME of the three is a
+    configuration mistake, not a valid partial state — see
+    __post_init__, which fails closed on it rather than guessing which
+    one you meant to set.
+  - POLYMARKET_FUNDER_ADDRESS is optional: the wallet to trade on behalf
+    of, when it differs from the private key's own address (e.g. a
+    Polymarket-issued proxy/Safe wallet). Maps to SecureClient.create()'s
+    `wallet` parameter.
+
+This module intentionally does NOT expose clob_api_url/gamma_api_url/
+chain_id as independent settings (an earlier version did). The SDK
+bundles those together as one `Environment` object (only `PRODUCTION`
+is currently used — see client.py); letting them be set independently
+risked a real, dangerous mismatch (e.g. a overridden host paired with
+the wrong chain_id). There is currently no supported way to point this
+system at anything other than real, production Polymarket.
 """
 
 from __future__ import annotations
@@ -28,6 +46,7 @@ from typing import Mapping
 TRADING_MODE_PAPER = "paper"
 TRADING_MODE_LIVE = "live"
 VALID_TRADING_MODES = frozenset({TRADING_MODE_PAPER, TRADING_MODE_LIVE})
+VALID_ORDER_TYPES = frozenset({"FOK", "FAK"})
 
 
 class PolymarketConfigError(ValueError):
@@ -108,12 +127,6 @@ class PolymarketSettings:
     api_secret: str | None
     api_passphrase: str | None
     funder_address: str | None
-    # https://clob.polymarket.com by default; override only for a
-    # documented alternate deployment (e.g. a testnet), never to point at
-    # something that merely claims to be Polymarket.
-    clob_api_url: str
-    gamma_api_url: str
-    chain_id: int
 
     # --- Risk controls — deliberately tiny defaults. Read every one of
     # these yourself in .env.polymarket.example before going live; they
@@ -124,7 +137,25 @@ class PolymarketSettings:
     cooldown_seconds_after_exit: int
     stale_data_max_seconds: float
     max_spread_pct: float
+    # Minimum EXECUTABLE liquidity (USD notional, price x size, summed
+    # across book levels at or better than the order's max_price) on the
+    # side of the book a new entry would consume. See
+    # models.OrderBookSnapshot.executable_liquidity_usd and risk.py's
+    # check_order_book_liquidity — this has a single, precise meaning
+    # and is evaluated against the SPECIFIC outcome token being bought,
+    # never an aggregate across both sides or both outcomes.
     min_order_book_liquidity_usd: float
+    # How far (as a fraction of the reference price) a market order's
+    # max_price ceiling is allowed to sit above the current best ask
+    # (BUY) — bounds slippage on a FOK/FAK order beyond just "the order
+    # either fills at an acceptable price or doesn't happen."
+    max_price_slippage_pct: float
+
+    # --- Order execution -----------------------------------------------------
+    # FOK (fill-or-kill) is the default — see models.OrderRequest's
+    # docstring for why: it removes the ambiguous "market order partially
+    # filled" case for new entries by construction.
+    default_order_type: str
 
     # --- Market selection --------------------------------------------------
     # The underlying this system trades. Only "bitcoin" is implemented
@@ -132,8 +163,8 @@ class PolymarketSettings:
     asset: str
     # Target market duration in minutes. find_active_btc_market() uses
     # this to pick among whatever short-duration crypto markets are
-    # actually live — see the module __init__ warning: this has not been
-    # verified against the real API from this environment.
+    # actually live — see client.py's module docstring: this has not
+    # been run against the real API from this environment.
     market_duration_minutes: int
     # How close to a market's close time this system still allows a NEW
     # entry — mirrors entry_cutoff_time's spirit (don't open a fresh
@@ -148,12 +179,18 @@ class PolymarketSettings:
     pending_orders_file: str
     emergency_stop_file: str
     daily_pnl_file: str
+    positions_file: str
 
     def __post_init__(self) -> None:
         if self.trading_mode not in VALID_TRADING_MODES:
             raise PolymarketConfigError(
                 f"POLYMARKET_TRADING_MODE={self.trading_mode!r} is invalid; "
                 f"must be one of {sorted(VALID_TRADING_MODES)}"
+            )
+        if self.default_order_type not in VALID_ORDER_TYPES:
+            raise PolymarketConfigError(
+                f"POLYMARKET_DEFAULT_ORDER_TYPE={self.default_order_type!r} is invalid; "
+                f"must be one of {sorted(VALID_ORDER_TYPES)}"
             )
         if self.max_bet_usd <= 0:
             raise PolymarketConfigError("POLYMARKET_MAX_BET_USD must be > 0")
@@ -167,14 +204,49 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_MAX_SPREAD_PCT must be between 0 and 1 (exclusive)")
         if self.min_order_book_liquidity_usd < 0:
             raise PolymarketConfigError("POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD must be >= 0")
+        if not 0 <= self.max_price_slippage_pct < 1:
+            raise PolymarketConfigError("POLYMARKET_MAX_PRICE_SLIPPAGE_PCT must be between 0 and 1 (exclusive of 1)")
         if self.market_duration_minutes <= 0:
             raise PolymarketConfigError("POLYMARKET_MARKET_DURATION_MINUTES must be > 0")
         if self.entry_cutoff_seconds_before_close < 0:
             raise PolymarketConfigError("POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE must be >= 0")
         if self.poll_interval_seconds <= 0:
             raise PolymarketConfigError("POLYMARKET_POLL_INTERVAL_SECONDS must be > 0")
-        if self.chain_id <= 0:
-            raise PolymarketConfigError("POLYMARKET_CHAIN_ID must be > 0")
+
+        # --- Fail-closed credential checks (Task 7) --------------------------
+        # The API-key triple is all-or-nothing, in EITHER mode: a partial
+        # triple is always a configuration mistake (e.g. a typo'd env var
+        # name), never a valid "use 2 of 3" state, so it's rejected
+        # regardless of paper/live — catching it here is strictly earlier
+        # and clearer than letting client.py discover it mid-request.
+        api_parts = (self.api_key, self.api_secret, self.api_passphrase)
+        if any(api_parts) and not all(api_parts):
+            raise PolymarketConfigError(
+                "POLYMARKET_API_KEY/POLYMARKET_API_SECRET/POLYMARKET_API_PASSPHRASE must be "
+                "all set or all unset -- a partial set is never valid (verified against "
+                "polymarket-client's ApiKeyCreds, which requires all three)."
+            )
+        # private_key is required for ANY live trading — verified against
+        # SecureClient.create()'s real signature: private_key is a
+        # required keyword argument there even when pre-derived
+        # `credentials` are also supplied, because signing an order
+        # always needs the private key regardless of how L2 REST auth is
+        # established. This is checked here, at config-construction
+        # time, specifically so a misconfigured deployment fails before
+        # ever reaching the network, not with an opaque error from
+        # inside client.py.
+        if self.is_live and not self.private_key:
+            raise PolymarketConfigError(
+                "POLYMARKET_TRADING_MODE=live requires POLYMARKET_PRIVATE_KEY to be set — "
+                "every order is signed by this wallet; the API key triple alone cannot "
+                "substitute for it. See .env.polymarket.example."
+            )
+        if self.private_key is not None and not self.private_key.startswith("0x"):
+            raise PolymarketConfigError(
+                "POLYMARKET_PRIVATE_KEY must be a 0x-prefixed hex string — refusing to proceed "
+                "with a value that cannot be a valid EVM private key, rather than let it fail "
+                "unpredictably later inside the SDK's signer."
+            )
 
     @property
     def is_paper(self) -> bool:
@@ -199,9 +271,6 @@ class PolymarketSettings:
             api_secret=_get_optional_str(env, "POLYMARKET_API_SECRET"),
             api_passphrase=_get_optional_str(env, "POLYMARKET_API_PASSPHRASE"),
             funder_address=_get_optional_str(env, "POLYMARKET_FUNDER_ADDRESS"),
-            clob_api_url=_get_str(env, "POLYMARKET_CLOB_API_URL", "https://clob.polymarket.com"),
-            gamma_api_url=_get_str(env, "POLYMARKET_GAMMA_API_URL", "https://gamma-api.polymarket.com"),
-            chain_id=_get_int(env, "POLYMARKET_CHAIN_ID", 137),  # Polygon mainnet
             max_bet_usd=_get_float(env, "POLYMARKET_MAX_BET_USD", 5.0),
             max_daily_loss_usd=_get_float(env, "POLYMARKET_MAX_DAILY_LOSS_USD", 20.0),
             max_open_positions=_get_int(env, "POLYMARKET_MAX_OPEN_POSITIONS", 1),
@@ -209,6 +278,8 @@ class PolymarketSettings:
             stale_data_max_seconds=_get_float(env, "POLYMARKET_STALE_DATA_MAX_SECONDS", 20.0),
             max_spread_pct=_get_float(env, "POLYMARKET_MAX_SPREAD_PCT", 0.05),
             min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 25.0),
+            max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
+            default_order_type=_get_str(env, "POLYMARKET_DEFAULT_ORDER_TYPE", "FOK").upper(),
             asset=_get_str(env, "POLYMARKET_ASSET", "bitcoin").lower(),
             market_duration_minutes=_get_int(env, "POLYMARKET_MARKET_DURATION_MINUTES", 15),
             entry_cutoff_seconds_before_close=_get_int(env, "POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", 120),
@@ -218,6 +289,7 @@ class PolymarketSettings:
             pending_orders_file=_get_str(env, "POLYMARKET_PENDING_ORDERS_FILE", "logs/polymarket/pending_orders.json"),
             emergency_stop_file=_get_str(env, "POLYMARKET_EMERGENCY_STOP_FILE", "logs/polymarket/emergency_stop.json"),
             daily_pnl_file=_get_str(env, "POLYMARKET_DAILY_PNL_FILE", "logs/polymarket/daily_pnl.json"),
+            positions_file=_get_str(env, "POLYMARKET_POSITIONS_FILE", "logs/polymarket/open_positions.json"),
         )
 
 

@@ -9,11 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from src.polymarket import reconciliation
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
-from src.polymarket.gateway import ExecutionGateway, LivePolymarketGateway
+from src.polymarket.gateway import ExecutionGateway
 from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import BinaryMarket, OrderRequest
-from src.polymarket.positions import OpenPosition, PolymarketPositionStore
+from src.polymarket.pending import PolymarketPendingOrderStore
+from src.polymarket.positions import PolymarketPositionStore
 from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
@@ -27,6 +29,7 @@ class CycleReport:
     market_question: str | None = None
     entered: bool = False
     settled_count: int = 0
+    reconciled_count: int = 0
 
 
 @dataclass
@@ -64,7 +67,8 @@ def settle_resolved_positions(
             continue  # resolved-by-clock but not yet reflected by the API; try again next cycle
 
         won = winner == position.outcome
-        pnl = (position.shares - position.size_usd) if won else -position.size_usd
+        cost = position.filled_size_usd  # actual cost paid, from the verified fill — not the requested size
+        pnl = (position.filled_shares - cost) if won else -cost
         decision_logger.log_decision(
             kind="position_settled",
             reason=f"{position.outcome} on {position.condition_id} {'WON' if won else 'LOST'}: pnl=${pnl:.2f}",
@@ -90,10 +94,23 @@ def run_cycle(
     decision_logger: PolymarketDecisionLogger,
     state_store: DailyPnlStateStore,
     position_store: PolymarketPositionStore,
+    pending_store: PolymarketPendingOrderStore,
     history: MarketHistory,
     now: datetime | None = None,
 ) -> CycleReport:
     now = now or datetime.now(timezone.utc)
+
+    # Task 5: sweep for any order placed in a PRIOR cycle (or a prior
+    # process, if the bot restarted) that reached the exchange but was
+    # never reconciled — e.g. confirm_and_place() was called from a
+    # separate approval step after run_cycle() already returned. Always
+    # runs first, before this cycle proposes anything new, so the
+    # position/state ledger a new trade's risk checks read from (open
+    # position count, daily P&L) reflects reality.
+    reconciled = reconciliation.reconcile_pending_orders(
+        client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger, now=now,
+    )
 
     settled = settle_resolved_positions(
         client=client, position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
@@ -103,7 +120,7 @@ def run_cycle(
         market = client.find_active_btc_market(now=now)
     except NoActiveMarketError as exc:
         decision_logger.log_decision(kind="no_trade", reason=str(exc))
-        return CycleReport(ran=True, skipped_reason=str(exc), settled_count=settled)
+        return CycleReport(ran=True, skipped_reason=str(exc), settled_count=settled, reconciled_count=reconciled)
 
     recent_mids = history.observe(market)
 
@@ -113,35 +130,82 @@ def run_cycle(
             kind="no_trade", reason="No qualifying setup this cycle",
             evidence={"question": market.question, "yes_mid": market.yes_mid, "samples": len(recent_mids)},
         )
-        return CycleReport(ran=True, market_question=market.question, settled_count=settled)
+        return CycleReport(ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled)
+
+    token_id = market.token_id_for(candidate.thesis.outcome)
+    # The outcome's OWN order book — never inferred from the other side,
+    # never approximated from BinaryMarket.yes_bid/yes_ask (see
+    # models.OrderBookSnapshot's and BinaryMarket's docstrings). This is
+    # the only book the liquidity check and the order's max_price may be
+    # computed from.
+    order_book = client.get_order_book(token_id)
+    if order_book.best_ask is None:
+        decision_logger.log_decision(
+            kind="no_trade",
+            reason=f"No ask-side liquidity in {candidate.thesis.outcome}'s order book on {market.condition_id}",
+            evidence={"token_id": token_id},
+        )
+        return CycleReport(ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled)
+
+    # Hard ceiling the exchange will not cross, anchored to the REAL best
+    # ask (not the strategy's own suggested_entry_price, which for NO is
+    # only a `1 - yes_bid` estimate) plus a small configured slippage
+    # allowance. Clamped below 1.0 — OrderRequest requires max_price < 1.0.
+    max_price = round(min(order_book.best_ask * (1 + settings.max_price_slippage_pct), 0.99), 4)
 
     state = state_store.load(today=now.date())
-    decision = risk_manager.evaluate_new_trade(size_usd=candidate.suggested_size_usd, market=market, state=state, now=now)
+    decision = risk_manager.evaluate_new_trade(
+        size_usd=candidate.suggested_size_usd, market=market, state=state,
+        order_book=order_book, side="BUY", max_price=max_price, now=now,
+    )
     if not decision.allowed:
         decision_logger.log_risk_block(decision, context="new_trade")
-        return CycleReport(ran=True, market_question=market.question, settled_count=settled)
+        return CycleReport(ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled)
 
     order = OrderRequest(
-        token_id=market.token_id_for(candidate.thesis.outcome), outcome=candidate.thesis.outcome, side="BUY",
-        price=candidate.suggested_entry_price, size_usd=candidate.suggested_size_usd, reason=candidate.thesis.catalyst,
+        condition_id=market.condition_id, token_id=token_id, outcome=candidate.thesis.outcome, side="BUY",
+        size_usd=candidate.suggested_size_usd, max_price=max_price, close_time=market.close_time,
+        reason=candidate.thesis.catalyst, order_type=settings.default_order_type,
     )
     result = gateway.submit_order(order)
 
-    if result.status in {"simulated_fill", "placed"}:
-        shares = candidate.suggested_size_usd / candidate.suggested_entry_price
-        position_store.add(OpenPosition(
-            condition_id=market.condition_id, token_id=order.token_id, outcome=candidate.thesis.outcome,
-            entry_price=candidate.suggested_entry_price, size_usd=candidate.suggested_size_usd, shares=shares,
-            opened_at=now, close_time=market.close_time,
-        ))
-        state.trades_opened += 1
-        state.open_position_count += 1
-        state_store.save(state)
-    elif result.status == "awaiting_approval" and isinstance(gateway, LivePolymarketGateway):
-        # Pending approval doesn't open a position yet — confirm_and_place()
-        # (called separately, per gateway.py's design) does, once approved.
-        # live_auto_execute=True skips this branch since result.status would
-        # already be "placed" by the time submit_order() returns.
-        pass
+    entered = False
+    if result.status == "simulated_fill":
+        # Paper mode: gateway.py already built the synthetic FillResult
+        # directly (nothing to reconcile for a simulation — see
+        # gateway.py's docstring), but it must still become a position
+        # through the exact same idempotent path reconciliation.py uses
+        # for real fills, never a second, parallel way to create one.
+        assert result.fill_result is not None
+        position = reconciliation.record_fill(
+            result.fill_result, order, result.fill_result.order_id,
+            position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
+        )
+        entered = position is not None
+    elif result.status == "submitted":
+        # live_auto_execute=True: the order already reached the exchange
+        # this cycle. Reconcile it immediately rather than waiting for
+        # the next cycle's sweep, so this cycle's own report reflects
+        # what actually happened, not just what was submitted.
+        pending_order_id = result.extra.get("pending_order_id") if result.extra else None
+        pending = pending_store.get(pending_order_id) if pending_order_id else None
+        if pending is not None:
+            fill = reconciliation.reconcile_order(
+                pending, client=client, pending_store=pending_store, position_store=position_store,
+                state_store=state_store, decision_logger=decision_logger, now=now,
+            )
+            entered = bool(fill and fill.is_fill)
+            reconciled += 1
+    # result.status == "awaiting_approval": nothing to reconcile yet — a
+    # separate confirm_and_place() call (or a later
+    # reconcile_pending_orders() sweep, including after a restart) picks
+    # this up once a human approves it and it actually reaches the
+    # exchange. result.status == "rejected"/"failed": gateway.py already
+    # marked the pending order fill_reconciled=True (nothing to
+    # reconcile — the exchange never accepted it, or it never reached
+    # the exchange at all).
 
-    return CycleReport(ran=True, market_question=market.question, entered=result.status in {"simulated_fill", "placed"}, settled_count=settled)
+    return CycleReport(
+        ran=True, market_question=market.question, entered=entered,
+        settled_count=settled, reconciled_count=reconciled,
+    )

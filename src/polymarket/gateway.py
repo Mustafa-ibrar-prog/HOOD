@@ -1,30 +1,46 @@
 """The execution layer's safety boundary — mirrors
-src/execution/gateway.py's design exactly, adapted for one real
-difference: on Robinhood, nothing in this Python process can call an
-MCP order tool (only the orchestrating agent can), so LiveOrderPlacer
-there is injected by something bridging that gap per-call. Polymarket
-has no such constraint — client.py's PolymarketClient makes real HTTP
-calls directly (via py-clob-client), so IT is the live order placer,
-running unattended in scripts/run_polymarket_bot.py's loop with no
-agent in the loop. That is exactly why every guard below matters more
-here, not less: there is no human-in-the-loop agent turn to catch a
-mistake before it reaches the network.
+src/execution/gateway.py's design, adapted for one real difference: on
+Robinhood, nothing in this Python process can call an MCP order tool
+(only the orchestrating agent can), so LiveOrderPlacer there is
+injected by something bridging that gap per-call. Polymarket has no
+such constraint — client.py's PolymarketClient makes real HTTP calls
+directly, so IT is the live order placer, running unattended in
+scripts/run_polymarket_bot.py's loop with no agent in the loop. That is
+exactly why every guard below matters more here, not less: there is no
+human-in-the-loop agent turn to catch a mistake before it reaches the
+network.
+
+Scope, deliberately narrow (Task 3): this module's job stops at
+SUBMISSION. `_place_pending()` records exactly what the exchange said
+about accepting the order (via PolymarketOrderPlacer.place_order() ->
+SubmissionOutcome) and nothing more — it never calls get_fill_status,
+never creates a position, never touches position_store or
+state_store. Determining whether an accepted order actually FILLED,
+and updating the position ledger accordingly, is reconciliation.py's
+job alone, called by engine.py after submit_order()/confirm_and_place()
+return. Keeping these separate is what makes "submitted" and "filled"
+impossible to conflate by construction — see models.OrderResult's
+docstring.
 
 THIS IS THE ONLY MODULE THAT MAY EVER CALL PolymarketOrderPlacer.place_order.
 
   - PaperPolymarketGateway: the only one safe to run unattended without
-    live_trading_confirmed. Never calls place_order. Always a simulated
-    fill at the requested price, logged like a real one.
+    live_trading_confirmed. Never calls place_order. Returns a
+    synthetic, clearly-labeled FillResult (status="filled") directly —
+    paper mode has no submission/fill gap to begin with, since nothing
+    real was ever submitted.
 
-  - LivePolymarketGateway: real order placement. submit_order() NEVER
+  - LivePolymarketGateway: real order submission. submit_order() NEVER
     calls place_order directly from its own body — it always creates a
     PendingLiveOrder and persists it first, so there is a full audit
     trail no matter what happens next. What happens next depends on
     settings.live_auto_execute (default False): stop at pending_approval
-    and require a separate confirm_and_place() call, or (True) place
+    and require a separate confirm_and_place() call, or (True) submit
     immediately once the risk gate clears, recorded as approved_by=
     "system:auto_execute" either way so the log always shows whether a
-    human step happened.
+    human step happened. Either way, the returned OrderResult's
+    fill_result is always None — engine.py must call
+    reconciliation.reconcile_order() to find out what actually filled.
 
 Independent, deliberately overlapping guards (a bug in one must not
 silently remove another):
@@ -41,19 +57,20 @@ silently remove another):
      defaulting to STOPPED, checked immediately before every real call,
      unbypassable by live_auto_execute or by strategy code (strategy.py
      never sees this store).
-  5. Every step (pending, approved, rejected, expired, placed, failed)
-     is written to the decision/audit log.
+  5. Every step (pending, submitted, rejected, expired, failed) is
+     written to the decision/audit log.
 """
 
 from __future__ import annotations
 
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Protocol
 
 from src.execution.emergency_stop import EmergencyStopStore
 from src.polymarket.logger import PolymarketDecisionLogger
-from src.polymarket.models import OrderRequest, OrderResult, PendingLiveOrder
+from src.polymarket.models import FillResult, OrderRequest, OrderResult, PendingLiveOrder, SubmissionOutcome
 from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.settings import PolymarketSettings
 
@@ -79,7 +96,7 @@ class PolymarketOrderPlacer(Protocol):
     same as live_client.py's LiveOrderPlacer, so gateway.py's tests can
     inject a fake instead of a real network client."""
 
-    def place_order(self, order: OrderRequest) -> dict[str, Any]: ...
+    def place_order(self, order: OrderRequest) -> SubmissionOutcome: ...
 
 
 class ExecutionGateway(ABC):
@@ -89,8 +106,10 @@ class ExecutionGateway(ABC):
 
 
 class PaperPolymarketGateway(ExecutionGateway):
-    """Simulates a fill at the caller-supplied limit price. Never calls
-    PolymarketOrderPlacer.place_order."""
+    """Simulates a fill at the order's max_price. Never calls
+    PolymarketOrderPlacer.place_order. The only gateway whose
+    OrderResult carries a non-None fill_result directly — there is
+    nothing to reconcile for a simulation."""
 
     def __init__(self, settings: PolymarketSettings, decision_logger: PolymarketDecisionLogger):
         self._settings = settings
@@ -98,10 +117,12 @@ class PaperPolymarketGateway(ExecutionGateway):
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
         assert_paper_mode(self._settings)
-        result = OrderResult(
-            status="simulated_fill", request=order,
-            filled_price=order.price, filled_at=datetime.now(timezone.utc),
+        shares = round(order.size_usd / order.max_price, 6)
+        fill = FillResult(
+            order_id=f"paper:{uuid.uuid4()}", status="filled",
+            requested_shares=shares, filled_shares=shares, avg_fill_price=order.max_price,
         )
+        result = OrderResult(status="simulated_fill", request=order, fill_result=fill)
         self._decision_logger.log_simulated_order(result)
         return result
 
@@ -141,7 +162,7 @@ class LivePolymarketGateway(ExecutionGateway):
         self._decision_logger.log_pending_order(pending)
 
         if self._settings.live_auto_execute and self._order_placer is not None:
-            return self._place_pending(pending, self._order_placer, approved_by="system:auto_execute")
+            return self._submit_pending(pending, self._order_placer, approved_by="system:auto_execute")
 
         return OrderResult(
             status="awaiting_approval", request=order,
@@ -151,6 +172,13 @@ class LivePolymarketGateway(ExecutionGateway):
     def confirm_and_place(
         self, pending_order_id: str, order_placer: PolymarketOrderPlacer, *, approved_by: str, now: datetime | None = None,
     ) -> OrderResult:
+        """Submits a pending order that stopped at awaiting_approval.
+        IMPORTANT: this only submits — it does not reconcile. The
+        caller must separately call reconciliation.reconcile_order()
+        (or let the next reconcile_pending_orders() sweep pick it up)
+        to find out whether it actually filled before assuming
+        anything about a resulting position. See this module's
+        docstring and Task 5."""
         if not self._settings.is_live or not self._settings.live_trading_confirmed:
             raise LiveTradingDisabledError(
                 "POLYMARKET_TRADING_MODE=live and POLYMARKET_LIVE_TRADING_CONFIRMED=true are both "
@@ -171,17 +199,21 @@ class LivePolymarketGateway(ExecutionGateway):
                 "refusing to place it. A 15-minute market moves fast; an expired pending order "
                 "needs a fresh cycle to re-propose it against current data, not a stale approval."
             )
-        return self._place_pending(pending, order_placer, approved_by=approved_by, now=now)
+        return self._submit_pending(pending, order_placer, approved_by=approved_by, now=now)
 
-    def _place_pending(
+    def _submit_pending(
         self, pending: PendingLiveOrder, order_placer: PolymarketOrderPlacer, *, approved_by: str, now: datetime | None = None,
     ) -> OrderResult:
+        """The ONLY method in this codebase that calls
+        PolymarketOrderPlacer.place_order. Records the SubmissionOutcome
+        verbatim and nothing more — see module docstring for why fill
+        determination is deliberately out of scope here."""
         now = now or datetime.now(timezone.utc)
         order = pending.order
         if self._emergency_stop_store is None or self._emergency_stop_store.is_stopped():
             exc = LiveTradingDisabledError(
                 "Emergency stop is active (or no emergency-stop store was configured) — "
-                "refusing to place a live order. See src/execution/emergency_stop.py."
+                "refusing to submit a live order. See src/execution/emergency_stop.py."
             )
             failed = pending.with_status("failed", decided_at=now, decided_by=approved_by, error=str(exc))
             self._pending_store.update(failed)
@@ -189,18 +221,35 @@ class LivePolymarketGateway(ExecutionGateway):
             raise exc
 
         try:
-            raw = order_placer.place_order(order)
-        except Exception as exc:  # noqa: BLE001 - record the failure in the audit trail, then re-raise
+            outcome = order_placer.place_order(order)
+        except Exception as exc:  # noqa: BLE001 - a transport/client exception that never reached an exchange decision
             failed = pending.with_status("failed", decided_at=now, decided_by=approved_by, error=str(exc))
             self._pending_store.update(failed)
             self._decision_logger.log_pending_order(failed)
             raise
 
-        result = OrderResult(status="placed", request=order, filled_at=now, raw=raw)
-        placed = pending.with_status("placed", decided_at=now, decided_by=approved_by)
-        self._pending_store.update(placed)
-        self._decision_logger.log_live_order_placed(placed, result)
-        return result
+        if not outcome.ok:
+            # A clean rejection FROM the exchange (not an exception) — e.g.
+            # fok_not_filled, not_enough_balance. No exchange_order_id, so
+            # there is nothing for reconciliation to look up; this is
+            # already a known-terminal, known-no-position outcome.
+            rejected = pending.with_status(
+                "rejected", decided_at=now, decided_by=approved_by,
+                error=f"{outcome.error_code}: {outcome.error_message}", fill_reconciled=True,
+            )
+            self._pending_store.update(rejected)
+            self._decision_logger.log_pending_order(rejected)
+            return OrderResult(status="rejected", request=order, submission=outcome, error=rejected.error)
+
+        submitted = pending.with_status(
+            "submitted", decided_at=now, decided_by=approved_by, exchange_order_id=outcome.exchange_order_id,
+        )
+        self._pending_store.update(submitted)
+        self._decision_logger.log_pending_order(submitted)
+        return OrderResult(
+            status="submitted", request=order, submission=outcome,
+            extra={"pending_order_id": pending.id, "exchange_order_id": outcome.exchange_order_id},
+        )
 
     def reject_pending(self, pending_order_id: str, *, reason: str, rejected_by: str, now: datetime | None = None) -> PendingLiveOrder:
         now = now or datetime.now(timezone.utc)
@@ -209,7 +258,7 @@ class LivePolymarketGateway(ExecutionGateway):
             raise PendingOrderNotActionableError(f"No pending order {pending_order_id!r} found")
         if pending.status != "awaiting_approval":
             raise PendingOrderNotActionableError(f"Pending order {pending_order_id!r} is {pending.status!r}, not awaiting_approval — nothing to reject.")
-        rejected = pending.with_status("rejected", decided_at=now, decided_by=rejected_by, error=reason)
+        rejected = pending.with_status("rejected", decided_at=now, decided_by=rejected_by, error=reason, fill_reconciled=True)
         self._pending_store.update(rejected)
         self._decision_logger.log_pending_order(rejected)
         return rejected

@@ -58,14 +58,18 @@ def main() -> int:
     risk_manager = PolymarketRiskManager(settings)
     decision_logger = PolymarketDecisionLogger(Path(settings.decision_log_file))
     state_store = DailyPnlStateStore(Path(settings.daily_pnl_file))
-    position_store = PolymarketPositionStore(Path(settings.log_dir) / "open_positions.json")
+    position_store = PolymarketPositionStore(Path(settings.positions_file))
+    # Always constructed, even in paper mode: run_cycle()'s restart-safety
+    # sweep (reconcile_pending_orders) needs a store to sweep, even though
+    # paper mode itself never creates a pending order in it (see
+    # gateway.py's PaperPolymarketGateway — it never calls place_order).
+    pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file))
     history = MarketHistory()
 
     order_placer = client if settings.is_live else None
     emergency_stop_store = EmergencyStopStore(Path(settings.emergency_stop_file))
-    pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file)) if settings.is_live else None
     gateway = get_execution_gateway(
-        settings, decision_logger, pending_store=pending_store,
+        settings, decision_logger, pending_store=pending_store if settings.is_live else None,
         order_placer=order_placer, emergency_stop_store=emergency_stop_store,
     )
 
@@ -84,10 +88,13 @@ def main() -> int:
             report = run_cycle(
                 settings=settings, client=client, strategy=strategy, risk_manager=risk_manager,
                 gateway=gateway, decision_logger=decision_logger, state_store=state_store,
-                position_store=position_store, history=history,
+                position_store=position_store, pending_store=pending_store, history=history,
             )
             cycles += 1
-            print(f"cycle {cycles}: ran={report.ran} market={report.market_question!r} entered={report.entered} settled={report.settled_count}")
+            print(
+                f"cycle {cycles}: ran={report.ran} market={report.market_question!r} entered={report.entered} "
+                f"settled={report.settled_count} reconciled={report.reconciled_count}"
+            )
             if args.once or (args.max_cycles is not None and cycles >= args.max_cycles):
                 break
             time.sleep(settings.poll_interval_seconds)

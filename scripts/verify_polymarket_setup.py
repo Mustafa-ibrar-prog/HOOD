@@ -4,14 +4,21 @@ access to polymarket.com, before trusting anything in src/polymarket/
 with real funds. Never places an order; only reads.
 
 Checks, in order, stopping at the first failure:
-  1. Can reach the Gamma API at all.
+  1. polymarket-client (import name `polymarket`) is installed.
   2. find_active_btc_market() actually finds a real, currently-open
      market near the configured duration — this is the single
-     least-verified assumption in client.py (the tag/slug query was
-     written without ever seeing a live response).
-  3. The market's order book has a real, two-sided quote.
-  4. If credentials are configured: py-clob-client can authenticate and
-     fetch a balance (does NOT place an order).
+     least-verified assumption in client.py (written without ever
+     seeing a live response from this sandboxed environment — see
+     client.py's module docstring).
+  3. The market's own YES order book has a real, two-sided quote.
+  4. The SPECIFIC outcome token this system would actually buy right
+     now (whichever side momentum currently favors) has real,
+     executable liquidity on its own book — the same
+     OrderBookSnapshot.executable_liquidity_usd() check risk.py's
+     check_order_book_liquidity() runs before every real trade (Task
+     6). This is read-only: it reports the number, it never trades on it.
+  5. If credentials are configured: the SDK can authenticate and fetch
+     a balance (does NOT place an order).
 
 Usage:
     python3 scripts/verify_polymarket_setup.py
@@ -32,32 +39,50 @@ def main() -> int:
     settings = PolymarketSettings.from_env()
     client = PolymarketClient(settings)
 
-    print(f"[1/4] Gamma API reachable at {settings.gamma_api_url} ...")
+    print("[1/5] polymarket-client importable ...")
+    try:
+        import polymarket  # noqa: F401
+    except ImportError as exc:
+        print(f"      FAILED: {exc}\n      Run: pip install polymarket-client")
+        return 1
+    print("      OK")
+
+    print(f"[2/5] Finding an open {settings.asset!r} market near {settings.market_duration_minutes} minutes ...")
     try:
         market = client.find_active_btc_market()
     except NoActiveMarketError as exc:
         print(f"      Reached the API, but found no matching market: {exc}")
-        print("      This means either no bitcoin market near "
-              f"{settings.market_duration_minutes} minutes is currently live, or the "
-              "Gamma API query in client.py's find_active_btc_market() needs adjusting "
-              "to match the real response shape. Inspect the raw /events response by hand next.")
+        print("      This means either no matching market is currently live, or the "
+              "list_markets() filtering in client.py's find_active_btc_market() needs "
+              "adjusting to match the real response shape. Inspect a raw list_markets() "
+              "call by hand next.")
         return 1
     except PolymarketClientError as exc:
         print(f"      FAILED: {exc}")
         return 1
     print(f"      OK — found: {market.question!r} (condition_id={market.condition_id}, closes in {market.seconds_to_close:.0f}s)")
 
-    print("[2/4] Order book has a real, two-sided quote ...")
+    print("[3/5] YES order book has a real, two-sided quote ...")
     if market.yes_bid is None or market.yes_ask is None:
         print(f"      FAILED: yes_bid={market.yes_bid} yes_ask={market.yes_ask} — book may be empty or get_order_book() needs adjusting")
         return 1
     print(f"      OK — yes_bid={market.yes_bid} yes_ask={market.yes_ask} yes_mid={market.yes_mid} spread={market.yes_spread_pct}")
 
-    print("[3/4] Re-fetching the same market (refresh path) ...")
-    refreshed = client.refresh(market)
-    print(f"      OK — fetched_at updated, data_age_seconds={refreshed.data_age_seconds:.1f}")
+    print("[4/5] Executable liquidity on each outcome's OWN book (read-only; this does not trade) ...")
+    for outcome, token_id in (("YES", market.token_id_yes), ("NO", market.token_id_no)):
+        book = client.get_order_book(token_id)
+        if book.best_ask is None:
+            print(f"      {outcome}: no ask-side liquidity at all (best_bid={book.best_bid})")
+            continue
+        max_price = round(book.best_ask * (1 + settings.max_price_slippage_pct), 4)
+        liquidity = book.executable_liquidity_usd(side="BUY", max_price=max_price)
+        meets = liquidity >= settings.min_order_book_liquidity_usd
+        print(
+            f"      {outcome}: best_ask={book.best_ask} executable_liquidity=${liquidity:.2f} at/below ${max_price:.4f} "
+            f"({'meets' if meets else 'BELOW'} the configured ${settings.min_order_book_liquidity_usd:.2f} minimum)"
+        )
 
-    print("[4/4] Credential check (balance lookup, no order placed) ...")
+    print("[5/5] Credential check (balance lookup, no order placed) ...")
     if not (settings.private_key or (settings.api_key and settings.api_secret and settings.api_passphrase)):
         print("      SKIPPED — no credentials configured (fine if you only plan to run in paper mode for now).")
     else:
@@ -69,8 +94,8 @@ def main() -> int:
             return 1
 
     print("\nAll checks passed. This does not guarantee the strategy is profitable — "
-          "it only confirms the plumbing (market discovery, order book, credentials) works "
-          "against the real API.")
+          "it only confirms the plumbing (market discovery, order book, liquidity, "
+          "credentials) works against the real API.")
     return 0
 
 

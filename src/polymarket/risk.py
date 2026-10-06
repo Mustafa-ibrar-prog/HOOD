@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from src.polymarket.models import BinaryMarket
+from src.polymarket.models import BinaryMarket, OrderBookSnapshot
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlState
 
@@ -109,8 +109,30 @@ class PolymarketRiskManager:
             else f"Only {remaining:.0f}s to close — past entry cutoff ({self._settings.entry_cutoff_seconds_before_close}s); no new entries this close to resolution",
         )
 
+    def check_order_book_liquidity(
+        self, order_book: OrderBookSnapshot, *, side: str, max_price: float,
+    ) -> RiskCheckResult:
+        """Task 6: refuse entry when the specific side/outcome actually
+        being bought can't absorb the order near our own ceiling price.
+        `order_book` MUST be the order book of the exact token we're
+        about to buy (never an aggregate, never the other outcome, never
+        `1 - other_side`) — see OrderBookSnapshot's module docstring and
+        executable_liquidity_usd(). An empty, one-sided, or malformed
+        (e.g. a level with size 0, or no levels at all) book naturally
+        yields 0.0 liquidity here and correctly fails this check, rather
+        than raising or silently passing."""
+        liquidity = order_book.executable_liquidity_usd(side=side, max_price=max_price)
+        threshold = self._settings.min_order_book_liquidity_usd
+        ok = liquidity >= threshold
+        return RiskCheckResult(
+            "ORDER_BOOK_LIQUIDITY", ok,
+            f"${liquidity:.2f} executable liquidity at/below ${max_price:.4f} meets ${threshold:.2f} minimum" if ok
+            else f"Only ${liquidity:.2f} executable liquidity at/below ${max_price:.4f} — below ${threshold:.2f} minimum",
+        )
+
     def evaluate_new_trade(
-        self, *, size_usd: float, market: BinaryMarket, state: DailyPnlState, now: datetime | None = None,
+        self, *, size_usd: float, market: BinaryMarket, state: DailyPnlState,
+        order_book: OrderBookSnapshot, side: str, max_price: float, now: datetime | None = None,
     ) -> RiskDecision:
         now = now or datetime.now(timezone.utc)
         results = (
@@ -121,5 +143,6 @@ class PolymarketRiskManager:
             self.check_data_freshness(market),
             self.check_spread(market),
             self.check_entry_cutoff(market),
+            self.check_order_book_liquidity(order_book, side=side, max_price=max_price),
         )
         return RiskDecision(allowed=all(r.passed for r in results), results=results)

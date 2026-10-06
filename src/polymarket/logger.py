@@ -52,13 +52,10 @@ class PolymarketDecisionLogger:
         })
 
     def log_simulated_order(self, result: OrderResult) -> None:
-        self._write({"kind": "simulated_order", "status": result.status, "order": result.request, "filled_price": result.filled_price})
+        self._write({"kind": "simulated_order", "status": result.status, "order": result.request, "fill_result": result.fill_result})
 
     def log_pending_order(self, pending: PendingLiveOrder) -> None:
         self._write({"kind": "pending_order", "pending_order": pending})
-
-    def log_live_order_placed(self, pending: PendingLiveOrder, result: OrderResult) -> None:
-        self._write({"kind": "live_order_placed", "pending_order": pending, "result_status": result.status, "raw": dict(result.raw or {})})
 
     def read_all(self) -> list[dict[str, Any]]:
         if not self._path.is_file():

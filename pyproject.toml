@@ -3,17 +3,30 @@ name = "hood-options-trader"
 version = "0.1.0"
 description = "Paper/dry-run options trading foundation built on the HOOD (Robinhood) MCP connection."
 requires-python = ">=3.10"
-dependencies = [
-    # Polymarket BTC 15-minute system (src/polymarket/) only — the
-    # Robinhood/options code above has zero dependencies by design
-    # (it never calls an API directly; see src/live_bridge.py).
-    "py-clob-client>=0.19",
-    "requests>=2.31",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+# Polymarket BTC 15-minute system (src/polymarket/) only — the
+# Robinhood/options code above has zero network dependencies by design
+# (it never calls an API directly; see src/live_bridge.py). client.py
+# imports this lazily (see its `_sdk()` helper) specifically so every
+# OTHER module in src/polymarket/ (models, risk, strategy, gateway,
+# positions, reconciliation, settings) and their tests run without it
+# installed — only actually running the bot, or
+# scripts/verify_polymarket_setup.py, needs this extra.
+#
+# `polymarket-client` (PyPI; import name `polymarket`) is the current
+# OFFICIAL SDK, published by Polymarket Engineering. It supersedes the
+# now-ARCHIVED `py-clob-client` — see client.py's module docstring for
+# the verification trail. It requires Python >=3.11; this project's own
+# requires-python stays >=3.10 since that only gates the Robinhood/
+# options code above, and pip/uv already enforce polymarket-client's
+# own floor automatically when this extra is installed.
+polymarket = [
+    "polymarket-client>=0.12.0",
 ]
 
 [tool.pytest.ini_options]
