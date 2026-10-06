@@ -77,16 +77,27 @@ def test_no_order_book_or_trade_direction_code_exists_anywhere_in_src_or_scripts
     matrix, which documents the SAME live-only Level-2/order-book finding
     from a data-architecture angle — see src/data/source_profile.py's
     'Level 2 order book' row). Neither actually implements order-book
-    code."""
+    code.
+
+    src/polymarket/ is exempt for a different reason: this finding is
+    specifically about Robinhood/HOOD's data capability (Part E/D proved
+    HOOD never exposes order-book/Level-2 data, so any code claiming to
+    use it would have to be fabricating). Polymarket's CLOB API is a
+    genuine, real, public central limit order book -- get_order_book()
+    there is a real capability for a different venue, not a regression
+    of this finding about Robinhood."""
     forbidden_terms = ("order_book", "order book", "level2", "level 2", "trade_direction", "signed_volume", "order_imbalance")
     exempt_files = {
         REPO_ROOT / "scripts" / "phase14_step0_microstructure_data_audit.py",
         REPO_ROOT / "src" / "data" / "source_profile.py",
         REPO_ROOT / "scripts" / "phase15_data_architecture_audit.py",
+        REPO_ROOT / "scripts" / "run_polymarket_bot.py",
+        REPO_ROOT / "scripts" / "verify_polymarket_setup.py",
     }
+    exempt_dirs = {REPO_ROOT / "src" / "polymarket"}
     for directory in ("src", "scripts"):
         for path in (REPO_ROOT / directory).rglob("*.py"):
-            if path in exempt_files:
+            if path in exempt_files or any(d in path.parents for d in exempt_dirs):
                 continue
             source = path.read_text()
             for term in forbidden_terms:

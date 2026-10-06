@@ -567,3 +567,67 @@ If you want to go back to the gated (human-approval-required) posture,
 either set `LIVE_AUTO_EXECUTE=false` in `.env`, or ask — the cron tick's
 prompt can be reverted to stop at `pending_approval` and wait for an
 explicit confirm/reject the same way it did before 2026-08-17.
+
+## Polymarket BTC 15-minute system (`src/polymarket/`)
+
+A second, separate trading system living alongside everything above —
+not a replacement, and not built from the same code. Everything above
+this section is about Robinhood options and is untouched. This one
+trades Polymarket's short-duration Bitcoin up/down binary markets,
+which are a fundamentally different instrument (a YES/NO token pair on
+a central limit order book, settled in USDC on Polygon, no strikes or
+expirations) and run as an **unattended Python process**, not an
+agent-mediated cycle: `src/polymarket/client.py` calls the real
+Polymarket API directly via `py-clob-client` + `requests`, so
+`scripts/run_polymarket_bot.py` can poll and trade on its own without
+an agent relaying data each cycle (unlike the Robinhood side — see "How
+the ~5-minute cadence actually works" above for why that constraint
+exists there but not here).
+
+**Same safety philosophy as the Robinhood side, reimplemented, not
+reused** (the two systems share no options-specific code, but
+`src/execution/emergency_stop.py`'s `EmergencyStopStore` is generic and
+is imported as-is):
+
+- `POLYMARKET_TRADING_MODE` defaults to `paper` — no real order is ever
+  placed.
+- `POLYMARKET_LIVE_TRADING_CONFIRMED` is a second, independent switch;
+  `LivePolymarketGateway` refuses to even construct without it.
+- `POLYMARKET_LIVE_AUTO_EXECUTE` (default `false`) controls whether a
+  risk-cleared order places immediately or stops at `pending_approval`
+  for a separate `confirm_and_place()` call.
+- The emergency-stop file defaults to **STOPPED** with no file present
+  — a real order cannot place until someone explicitly clears it.
+- Deterministic risk gates before every new entry: max bet size, max
+  daily loss, max open positions, cooldown after an exit, data
+  staleness, max spread, and an entry cutoff before a market's close —
+  see `src/polymarket/risk.py`.
+
+**Not independently verified against the real API.** This was built in
+an environment whose network egress policy blocks `polymarket.com`
+outright (confirmed on both `gamma-api.polymarket.com` and
+`clob.polymarket.com`), so none of the live-network code paths in
+`src/polymarket/client.py` have actually been run against Polymarket.
+Before trusting this with real funds:
+
+1. `pip install py-clob-client requests` (declared in `pyproject.toml`;
+   not installed in the environment this was written in).
+2. Copy `.env.polymarket.example` values into your real `.env` and fill
+   in credentials and risk limits — the defaults are deliberately tiny
+   placeholders, not a recommendation.
+3. Run `python3 scripts/verify_polymarket_setup.py` — a read-only check
+   (never places an order) that confirms market discovery, the order
+   book, and credentials actually work against the live API before you
+   run the bot for real.
+4. Only then: `python3 scripts/run_polymarket_bot.py` (add `--once` to
+   run a single cycle first and inspect `logs/polymarket/decisions.jsonl`
+   before leaving it running unattended).
+
+The momentum-continuation strategy in `src/polymarket/strategy.py` is a
+v1 starting point (reads the market's own implied-probability trend
+since it opened, not an external BTC price feed), not a validated edge
+— tune `MomentumConfig` once you can see it trade against real markets.
+Position handling is deliberately "buy and hold to resolution" for v1;
+selling back into the order book before a market resolves is a real
+Polymarket feature and a natural v2, not built here (see
+`src/polymarket/positions.py`'s module docstring).
