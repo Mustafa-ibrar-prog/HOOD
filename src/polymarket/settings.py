@@ -169,6 +169,14 @@ class PolymarketSettings:
     us_api_base_url: str
     us_gateway_base_url: str
 
+    # --- Manual market override (US venue only), see us_client.py's
+    # find_active_btc_market()/manual-override docstring. TEMPORARY,
+    # test-only: when set, find_active_btc_market() retrieves ONLY this
+    # exact market/event by slug -- never a search, never "closest
+    # available," never a silent fallback to BTC 15m discovery. Unset
+    # (the default) leaves BTC 15m discovery completely unaffected.
+    us_market_slug: str | None
+
     # --- Risk controls — deliberately tiny defaults. Read every one of
     # these yourself in .env.polymarket.example before going live; they
     # are placeholders, not a recommendation. ------------------------------
@@ -357,6 +365,7 @@ class PolymarketSettings:
             us_secret_key=_get_optional_str(env, "POLYMARKET_US_SECRET_KEY"),
             us_api_base_url=_get_str(env, "POLYMARKET_US_API_BASE_URL", DEFAULT_US_API_BASE_URL),
             us_gateway_base_url=_get_str(env, "POLYMARKET_US_GATEWAY_BASE_URL", DEFAULT_US_GATEWAY_BASE_URL),
+            us_market_slug=_get_optional_str(env, "POLYMARKET_US_MARKET_SLUG"),
             max_bet_usd=_get_float(env, "POLYMARKET_MAX_BET_USD", 5.0),
             max_daily_loss_usd=_get_float(env, "POLYMARKET_MAX_DAILY_LOSS_USD", 20.0),
             max_open_positions=_get_int(env, "POLYMARKET_MAX_OPEN_POSITIONS", 1),

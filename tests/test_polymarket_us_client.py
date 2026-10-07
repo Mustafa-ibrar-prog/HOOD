@@ -83,11 +83,15 @@ class _FakeMarkets:
 
 
 class _FakeOrders:
-    def __init__(self, *, create_response=None, create_exc=None, retrieve_responses=None):
+    def __init__(self, *, create_response=None, create_exc=None, retrieve_responses=None,
+                 preview_response=None, preview_exc=None):
         self.create_response = create_response
         self.create_exc = create_exc
         self.retrieve_responses = retrieve_responses or {}
+        self.preview_response = preview_response
+        self.preview_exc = preview_exc
         self.create_calls: list = []
+        self.preview_calls: list = []
 
     def create(self, params):
         self.create_calls.append(params)
@@ -102,6 +106,12 @@ class _FakeOrders:
         if isinstance(resp, Exception):
             raise resp
         return resp
+
+    def preview(self, params):
+        self.preview_calls.append(params)
+        if self.preview_exc:
+            raise self.preview_exc
+        return self.preview_response
 
 
 class _FakeAccount:
@@ -405,6 +415,148 @@ def test_discovery_rolls_over_to_the_next_window_automatically(tmp_path):
     assert second.condition_id == slug_1215
 
 
+# --- 2b. Manual market override (POLYMARKET_US_MARKET_SLUG) -----------------
+
+def _market_detail(*, slug, title="Some Market", outcome="YES", active=True, closed=False, event_slug=None) -> dict:
+    return {
+        "id": 1, "slug": slug, "title": title, "outcome": outcome, "description": "",
+        "active": active, "closed": closed, "liquidity": 100.0, "volume": 100.0,
+        "eventSlug": event_slug, "team": None,
+    }
+
+
+def test_manual_override_unset_leaves_btc_discovery_unaffected(tmp_path):
+    """No POLYMARKET_US_MARKET_SLUG -> the existing deterministic BTC
+    15m path runs exactly as before; the manual-override machinery is
+    never even consulted."""
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    slug = _btc_15m_slug(window_start)
+    event = _event(slug=slug, start=window_start, end=window_end, market_slug=slug)
+    sdk = _FakeSDKClient(events=_FakeEvents({slug: {"event": event}}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)  # no POLYMARKET_US_MARKET_SLUG
+    market = client.find_active_btc_market(now=now)
+    assert market.condition_id == slug
+
+
+def test_manual_override_exact_slug_found_as_a_market(tmp_path):
+    """The override slug resolves directly via markets.retrieve_by_slug
+    -- the common case, since that's the resource actually needed to trade."""
+    slug = "some-arbitrary-market-2026"
+    event_slug = "some-arbitrary-event-2026"
+    market_detail = _market_detail(slug=slug, title="Some Arbitrary Market", event_slug=event_slug)
+    start = datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 10, 7, 9, 30, tzinfo=timezone.utc)
+    event = _event(slug=event_slug, title="Some Arbitrary Event", start=start, end=end, market_slug=slug)
+    sdk = _FakeSDKClient(
+        markets=_FakeMarkets(details={slug: {"market": market_detail}}),
+        events=_FakeEvents({event_slug: {"event": event}}),
+    )
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    market = client.find_active_btc_market()
+    assert market.condition_id == slug
+    assert market.token_id_yes == market.token_id_no == slug
+    assert market.close_time == end
+    assert market.question == "Some Arbitrary Event"
+
+
+def test_manual_override_exact_slug_found_as_an_event(tmp_path):
+    """The override slug 404s as a market but resolves as an event --
+    its first market is used, mirroring the BTC 15m discovery path."""
+    slug = "some-arbitrary-event-2026"
+    start = datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 10, 7, 9, 30, tzinfo=timezone.utc)
+    market_slug = "some-arbitrary-event-2026-market"
+    event = _event(slug=slug, start=start, end=end, market_slug=market_slug)
+    sdk = _FakeSDKClient(
+        markets=_FakeMarkets(details={}),  # 404s as a market
+        events=_FakeEvents({slug: {"event": event}}),
+    )
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    market = client.find_active_btc_market()
+    assert market.condition_id == market_slug
+
+
+def test_manual_override_never_searches(tmp_path):
+    """No search.query() call of any kind for the manual-override path
+    -- an exact lookup only."""
+    slug = "some-arbitrary-market-2026"
+    market_detail = _market_detail(slug=slug, event_slug="evt")
+    event = _event(slug="evt", start=_NOW, end=_NOW + timedelta(minutes=30), market_slug=slug)
+    search = _FakeSearch({"events": [event]})
+    sdk = _FakeSDKClient(
+        search=search, markets=_FakeMarkets(details={slug: {"market": market_detail}}),
+        events=_FakeEvents({"evt": {"event": event}}),
+    )
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    client.find_active_btc_market()
+    assert search.calls == []
+
+
+def test_manual_override_rejects_missing_market(tmp_path):
+    sdk = _FakeSDKClient(markets=_FakeMarkets(details={}), events=_FakeEvents({}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG="does-not-exist"), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market()
+
+
+def test_manual_override_rejects_mismatched_slug(tmp_path):
+    """markets.retrieve_by_slug() returns a DIFFERENT slug than
+    requested -- never trusted; falls through to the event path, which
+    also fails here -- refuse rather than trade the wrong thing."""
+    slug = "requested-slug"
+    wrong_market = _market_detail(slug="totally-different-slug")
+    sdk = _FakeSDKClient(markets=_FakeMarkets(details={slug: {"market": wrong_market}}), events=_FakeEvents({}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market()
+
+
+def test_manual_override_rejects_inactive_market(tmp_path):
+    slug = "some-market"
+    market_detail = _market_detail(slug=slug, active=False, event_slug="evt")
+    sdk = _FakeSDKClient(markets=_FakeMarkets(details={slug: {"market": market_detail}}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market()
+
+
+def test_manual_override_rejects_closed_market(tmp_path):
+    slug = "some-market"
+    market_detail = _market_detail(slug=slug, closed=True, event_slug="evt")
+    sdk = _FakeSDKClient(markets=_FakeMarkets(details={slug: {"market": market_detail}}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market()
+
+
+def test_manual_override_rejects_when_parent_event_is_closed(tmp_path):
+    slug = "some-market"
+    event_slug = "evt"
+    market_detail = _market_detail(slug=slug, event_slug=event_slug)
+    closed_event = _event(slug=event_slug, start=_NOW, end=_NOW + timedelta(minutes=30),
+                           market_slug=slug, active=False, closed=True)
+    sdk = _FakeSDKClient(
+        markets=_FakeMarkets(details={slug: {"market": market_detail}}),
+        events=_FakeEvents({event_slug: {"event": closed_event}}),
+    )
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market()
+
+
+def test_manual_override_rejects_when_schedule_data_unavailable(tmp_path):
+    """Found as a market, but its parent event can't be fetched at all
+    -- refuse rather than trade without a verified close time."""
+    slug = "some-market"
+    market_detail = _market_detail(slug=slug, event_slug="evt-does-not-exist")
+    sdk = _FakeSDKClient(markets=_FakeMarkets(details={slug: {"market": market_detail}}), events=_FakeEvents({}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market()
+
+
 # --- 3. Outcome identifiers ----------------------------------------------------
 
 def test_outcome_identifiers_are_the_same_slug_for_both_sides(tmp_path):
@@ -519,6 +671,53 @@ def test_sell_side_is_not_supported(tmp_path):
     order = _order_request(side="SELL")
     with pytest.raises(PolymarketUSClientError):
         client.place_order(order)
+
+
+# --- 5b. Order preview (orders.preview() -- never places anything) ----------
+
+def test_preview_order_succeeds_and_never_calls_create(tmp_path):
+    preview_order_detail = {
+        "id": "preview-only", "marketSlug": "btc-updown-15m", "state": "ORDER_STATE_NEW",
+        "price": _amount("0.55"), "quantity": 9, "avgPx": None,
+    }
+    sdk = _FakeSDKClient(orders=_FakeOrders(preview_response={"order": preview_order_detail}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(size_usd=5.0, max_price=0.55)
+    result = client.preview_order(order)
+    assert result == preview_order_detail
+    assert sdk.orders.create_calls == []  # preview never places anything
+
+
+def test_preview_order_uses_the_exact_same_params_as_place_order(tmp_path):
+    """Preview and a real submission must request identically-shaped
+    parameters -- otherwise a 'successful' preview wouldn't mean anything."""
+    sdk = _FakeSDKClient(
+        orders=_FakeOrders(preview_response={"order": {}}, create_response={"id": "ord-1", "executions": []}),
+    )
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(outcome="NO", size_usd=5.0, max_price=0.60, order_type="FOK")
+    client.preview_order(order)
+    client.place_order(order)
+    preview_params = sdk.orders.preview_calls[0]["request"]
+    create_params = sdk.orders.create_calls[0]
+    assert preview_params == create_params
+
+
+def test_preview_order_raises_for_a_too_small_order(tmp_path):
+    sdk = _FakeSDKClient(orders=_FakeOrders(preview_response={"order": {}}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(size_usd=0.40, max_price=0.97)  # floor(0.40/0.97) == 0
+    with pytest.raises(PolymarketUSClientError):
+        client.preview_order(order)
+    assert sdk.orders.preview_calls == []  # never even attempted
+
+
+def test_preview_order_propagates_a_failure(tmp_path):
+    sdk = _FakeSDKClient(orders=_FakeOrders(preview_exc=_AuthenticationError("no credentials")))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request()
+    with pytest.raises(_AuthenticationError):
+        client.preview_order(order)
 
 
 # --- 6. Submission response vs. authoritative fill (Task 3) ------------------

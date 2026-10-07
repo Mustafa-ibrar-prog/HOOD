@@ -19,6 +19,17 @@ Usage:
     python3 scripts/verify_polymarket_setup.py
     python3 scripts/verify_polymarket_setup.py --debug-discovery
     python3 scripts/verify_polymarket_setup.py --debug-exact-slug
+    python3 scripts/verify_polymarket_setup.py --market-slug <SLUG>
+
+--market-slug SLUG (POLYMARKET_VENUE=us only) verifies ONE exact
+market/event you choose yourself — e.g. a slug copied from the
+Polymarket US app — instead of running BTC 15m discovery. Equivalent
+to setting POLYMARKET_US_MARKET_SLUG for this run only (see
+settings.py's and us_client.py's module docstrings on the manual
+override: no search, no "closest available," the exact slug only).
+Runs every other check (order book, liquidity, resolution,
+authentication, balance) against that exact market. Still never
+places an order.
 
 --debug-discovery (POLYMARKET_VENUE=us only) additionally dumps raw,
 PUBLIC market/event/series metadata from the live search.query(),
@@ -48,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -234,11 +246,25 @@ def main() -> int:
         "--debug-exact-slug", action="store_true",
         help="Diagnose the exact events.retrieve_by_slug()/markets.retrieve_by_slug() request find_active_btc_market() makes.",
     )
+    parser.add_argument(
+        "--market-slug", default=None, metavar="SLUG",
+        help=(
+            "Manually verify ONE exact market/event by slug (POLYMARKET_VENUE=us only) instead of "
+            "BTC 15m discovery -- e.g. a slug you copied from the Polymarket US app. Read-only; never "
+            "places an order. Equivalent to setting POLYMARKET_US_MARKET_SLUG for this run only."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.market_slug:
+        os.environ["POLYMARKET_US_MARKET_SLUG"] = args.market_slug
 
     settings = PolymarketSettings.from_env()
     client = get_polymarket_client(settings)
     print(f"POLYMARKET_VENUE={settings.venue} ({type(client).__name__})")
+    if settings.us_market_slug:
+        print(f"MANUAL MARKET OVERRIDE ACTIVE — verifying exactly POLYMARKET_US_MARKET_SLUG={settings.us_market_slug!r} "
+              "instead of BTC 15m discovery.")
     print()
 
     if args.debug_discovery:
@@ -259,7 +285,8 @@ def main() -> int:
         _report("SDK importable", "FAIL", f"{exc} — run: pip install -e \".[polymarket]\"")
         return _finish()
 
-    # --- 2. API connectivity + market discovery ------------------------------
+    # --- 2. API connectivity + market discovery (or the exact manual override) -
+    discovery_label = "Manual market verification" if settings.us_market_slug else "BTC market discovery"
     market = None
     try:
         market = client.find_active_btc_market()
@@ -268,23 +295,36 @@ def main() -> int:
             f"reached the venue's public market-discovery endpoint",
         )
         _report(
-            "BTC market discovery", "PASS",
+            discovery_label, "PASS",
             f"{market.question!r} (condition_id={market.condition_id}, closes in {market.seconds_to_close:.0f}s)",
         )
+        print(f"  title:        {market.question}")
+        print(f"  slug:         {market.condition_id}")
+        print(f"  endTime:      {market.close_time.isoformat()} (closes in {market.seconds_to_close:.0f}s)")
+        print("                (startTime isn't retained on BinaryMarket; see --debug-exact-slug for the raw event)")
+        if settings.is_us_venue:
+            print("  directions:   YES -> ORDER_INTENT_BUY_LONG, NO -> ORDER_INTENT_BUY_SHORT "
+                  "(one contract, one order book — see us_client.py)")
+        else:
+            print(f"  YES token:    {market.token_id_yes}")
+            print(f"  NO token:     {market.token_id_no}")
     except NoActiveMarketError as exc:
         _report("API connectivity", "PASS", "reached the venue; no exception — the venue responded")
-        _report(
-            "BTC market discovery", "FAIL",
-            f"{exc} — either no matching market is live right now, or (for POLYMARKET_VENUE=us "
-            "especially) this product may not exist on this venue; verify the catalog by hand "
-            "with search.query()/events.list() before assuming the discovery filter is wrong.",
-        )
+        if settings.us_market_slug:
+            _report(discovery_label, "FAIL", str(exc))
+        else:
+            _report(
+                discovery_label, "FAIL",
+                f"{exc} — either no matching market is live right now, or (for POLYMARKET_VENUE=us "
+                "especially) this product may not exist on this venue; verify the catalog by hand "
+                "with search.query()/events.list() before assuming the discovery filter is wrong.",
+            )
     except PolymarketClientError as exc:
         _report("API connectivity", "FAIL", str(exc))
-        _report("BTC market discovery", "SKIPPED", "API connectivity failed")
+        _report(discovery_label, "SKIPPED", "API connectivity failed")
     except Exception as exc:  # noqa: BLE001 - this script's whole job is to surface exactly this kind of failure
         _report("API connectivity", "FAIL", f"{type(exc).__name__}: {exc}")
-        _report("BTC market discovery", "SKIPPED", "API connectivity failed")
+        _report(discovery_label, "SKIPPED", "API connectivity failed")
 
     # --- 3. Order book + executable liquidity, for EACH outcome's own book ---
     if market is not None:

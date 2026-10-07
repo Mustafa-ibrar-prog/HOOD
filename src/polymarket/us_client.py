@@ -197,6 +197,14 @@ class PolymarketUSClientError(PolymarketClientError):
     pass
 
 
+class _OrderTooSmallError(PolymarketUSClientError):
+    """Internal signal from _build_create_order_params() — caught by
+    place_order() and converted into a SubmissionOutcome(ok=False);
+    left to propagate from preview_order() since that method's whole
+    contract is "raise if this order could never actually be placed."
+    """
+
+
 def _sdk():
     """Lazy import of polymarket-us, so pure-logic modules/tests never
     need it installed — same convention as client.py's _sdk()."""
@@ -299,8 +307,19 @@ class PolymarketUSClient:
         _verify_expected_event), this sits the cycle out
         (NoActiveMarketError) rather than trading anything else —
         "no trade" is always a safe outcome; a wrong market never is.
+
+        MANUAL OVERRIDE: when settings.us_market_slug is set (TEMPORARY,
+        test-only — see settings.py's module docstring), this method
+        retrieves ONLY that exact market/event instead, via
+        _get_manual_override_market() — BTC 15m discovery below is
+        completely bypassed, not just de-prioritized. Unsetting
+        us_market_slug restores the exact behavior documented above
+        with zero other change.
         """
         now = now or datetime.now(timezone.utc)
+        if self._settings.us_market_slug:
+            return self._get_manual_override_market(self._settings.us_market_slug, now=now)
+
         window_start, window_end = self._current_window(now)
         expected_slug = self._expected_event_slug(window_start)
 
@@ -318,7 +337,82 @@ class PolymarketUSClient:
 
         event = response.get("event") or {}
         self._verify_expected_event(event, expected_slug=expected_slug, window_start=window_start, window_end=window_end)
-        return self._to_binary_market(event, now=now)
+        markets = event.get("markets") or []
+        if not markets:
+            raise PolymarketUSClientError(f"Event {expected_slug!r} has no markets")
+        return self._to_binary_market(event, markets[0], now=now)
+
+    def _get_manual_override_market(self, slug: str, *, now: datetime) -> BinaryMarket:
+        """TEMPORARY, test-only exact-market override (see settings.py's
+        module docstring on POLYMARKET_US_MARKET_SLUG). Retrieves ONLY
+        this exact slug — no search, no "closest available," no
+        fallback to BTC 15m discovery.
+
+        Tries `slug` as a MARKET slug first (that's what's actually
+        needed to trade — see place_order()/get_order_book()), falling
+        back to an EVENT-slug lookup (taking its first market) if that
+        doesn't resolve, since this codebase does not assume which
+        resource an arbitrary slug copied from the live app belongs to
+        — see this module's "NOT independently verified" item on the
+        BTC 15m slug's own resource, which applies equally here.
+        Either way, the result's own slug/active/closed fields are
+        verified before being trusted; anything that doesn't resolve
+        and verify cleanly raises NoActiveMarketError rather than
+        silently falling back to something else.
+        """
+        client = self._client()
+
+        market: dict | None = None
+        event: dict | None = None
+        try:
+            market_response = client.markets.retrieve_by_slug(slug)
+            candidate = market_response.get("market") or {}
+            if candidate.get("slug") == slug:
+                market = candidate
+        except Exception:  # noqa: BLE001 - not found as a market; try as an event next
+            pass
+
+        if market is not None:
+            event_slug = market.get("eventSlug")
+            if event_slug:
+                try:
+                    event_response = client.events.retrieve_by_slug(event_slug)
+                    event = event_response.get("event")
+                except Exception:  # noqa: BLE001 - schedule data unavailable; handled by the check below
+                    event = None
+        else:
+            try:
+                event_response = client.events.retrieve_by_slug(slug)
+            except Exception as exc:  # noqa: BLE001
+                raise NoActiveMarketError(
+                    f"POLYMARKET_US_MARKET_SLUG={slug!r} was not found as either a market "
+                    f"(markets.retrieve_by_slug) or an event (events.retrieve_by_slug): "
+                    f"{type(exc).__name__}: {exc}. Verify the exact slug from the Polymarket US app."
+                ) from exc
+            event = event_response.get("event")
+            if event is None or event.get("slug") != slug:
+                raise NoActiveMarketError(
+                    f"POLYMARKET_US_MARKET_SLUG={slug!r}: events.retrieve_by_slug() returned a "
+                    "mismatched or empty event — refusing to trade it."
+                )
+            markets = event.get("markets") or []
+            if not markets:
+                raise NoActiveMarketError(f"Event {slug!r} has no markets to trade.")
+            market = markets[0]
+
+        if market is None:
+            raise NoActiveMarketError(f"POLYMARKET_US_MARKET_SLUG={slug!r} could not be resolved to a market.")
+        if not market.get("active") or market.get("closed"):
+            raise NoActiveMarketError(f"Market {market.get('slug')!r} exists but is not active/open right now.")
+        if event is None:
+            raise NoActiveMarketError(
+                f"POLYMARKET_US_MARKET_SLUG={slug!r}: could not determine schedule (parent event) "
+                "data — refusing to trade without a verified close time."
+            )
+        if not event.get("active") or event.get("closed"):
+            raise NoActiveMarketError(f"Event {event.get('slug')!r} exists but is not active/open right now.")
+
+        return self._to_binary_market(event, market, now=now)
 
     def _current_window(self, now: datetime) -> tuple[datetime, datetime]:
         """Floors `now` to the start of the current
@@ -376,11 +470,7 @@ class PolymarketUSClient:
                 f"window end {window_end.isoformat()}."
             )
 
-    def _to_binary_market(self, event: dict, *, now: datetime) -> BinaryMarket:
-        markets = event.get("markets") or []
-        if not markets:
-            raise PolymarketUSClientError(f"Event {event.get('slug')!r} has no markets")
-        market = markets[0]
+    def _to_binary_market(self, event: dict, market: dict, *, now: datetime) -> BinaryMarket:
         slug = market.get("slug")
         if not slug:
             raise PolymarketUSClientError(f"Event {event.get('slug')!r}'s market has no slug")
@@ -439,13 +529,10 @@ class PolymarketUSClient:
             return None
         return "YES" if float(value) >= 0.5 else "NO"
 
-    # --- Order placement (implements gateway.py's PolymarketOrderPlacer) -----
-    def place_order(self, order: OrderRequest) -> SubmissionOutcome:
-        """Submits an order. Returns a SubmissionOutcome — NOT a fill
-        determination; see models.SubmissionOutcome's docstring and
-        reconciliation.py. The response's own `executions` are
-        deliberately ignored here for exactly that reason — see module
-        docstring: get_fill_status() always re-queries fresh."""
+    def _build_create_order_params(self, order: OrderRequest) -> dict:
+        """Shared by place_order() and preview_order() so a preview
+        reflects EXACTLY what a real submission would send — never two
+        independent constructions that could silently diverge."""
         if order.side != "BUY":
             raise PolymarketUSClientError("SELL is not supported — v1 scope is entries only (see positions.py)")
         intent = _INTENT_FOR_OUTCOME.get(order.outcome)
@@ -461,24 +548,34 @@ class PolymarketUSClient:
         # the actual spend is never more than size_usd.
         quantity = int(order.size_usd // order.max_price)
         if quantity <= 0:
+            raise _OrderTooSmallError(
+                f"size_usd={order.size_usd} / max_price={order.max_price} rounds down to 0 whole "
+                "contracts — refusing to submit a zero-quantity order."
+            )
+        return {
+            "marketSlug": order.token_id, "intent": intent, "type": "ORDER_TYPE_LIMIT",
+            "price": {"value": f"{order.max_price:.2f}", "currency": "USD"},
+            "quantity": quantity, "tif": tif,
+        }
+
+    # --- Order placement (implements gateway.py's PolymarketOrderPlacer) -----
+    def place_order(self, order: OrderRequest) -> SubmissionOutcome:
+        """Submits an order. Returns a SubmissionOutcome — NOT a fill
+        determination; see models.SubmissionOutcome's docstring and
+        reconciliation.py. The response's own `executions` are
+        deliberately ignored here for exactly that reason — see module
+        docstring: get_fill_status() always re-queries fresh."""
+        try:
+            params = self._build_create_order_params(order)
+        except _OrderTooSmallError as exc:
             return SubmissionOutcome(
-                ok=False, exchange_order_id=None, raw_status=None, error_code="quantity_too_small",
-                error_message=(
-                    f"size_usd={order.size_usd} / max_price={order.max_price} rounds down to 0 "
-                    "whole contracts — refusing to submit a zero-quantity order."
-                ),
+                ok=False, exchange_order_id=None, raw_status=None,
+                error_code="quantity_too_small", error_message=str(exc),
             )
 
         client = self._client()
         try:
-            response = client.orders.create({
-                "marketSlug": order.token_id,
-                "intent": intent,
-                "type": "ORDER_TYPE_LIMIT",
-                "price": {"value": f"{order.max_price:.2f}", "currency": "USD"},
-                "quantity": quantity,
-                "tif": tif,
-            })
+            response = client.orders.create(params)
         except Exception as exc:  # noqa: BLE001 - the SDK raises AuthenticationError/BadRequestError/
             # RateLimitError/NotFoundError/APITimeoutError/APIConnectionError/PermissionDeniedError/
             # InternalServerError for failures that never reach an accept-or-reject decision from the
@@ -498,6 +595,25 @@ class PolymarketUSClient:
             ok=True, exchange_order_id=str(order_id), raw_status="submitted",
             raw={"executions": response.get("executions", [])},
         )
+
+    def preview_order(self, order: OrderRequest) -> dict:
+        """Read-only dry run via orders.preview() — a genuine,
+        documented, order-safe endpoint distinct from orders.create();
+        NEVER places anything. Uses the EXACT SAME parameter
+        construction as place_order() (_build_create_order_params), so
+        a preview reflects precisely what a real submission would
+        send. Returns the raw PreviewOrderResponse's `order` dict (the
+        SDK's own projected Order shape) for a caller to inspect — this
+        is a manual-test/diagnostic helper (see
+        scripts/manual_polymarket_us_test.py), not part of the
+        automated engine.py/gateway.py path, which is why it returns a
+        raw dict rather than a models.py type. Raises on an invalid or
+        too-small order — never silently "previews" something that
+        could never actually be submitted."""
+        params = self._build_create_order_params(order)
+        client = self._client()
+        response = client.orders.preview({"request": params})
+        return response.get("order") or {}
 
     # --- Reconciliation (the authoritative fill lookup — see Task 3/5) -------
     def get_fill_status(self, exchange_order_id: str) -> FillResult:
