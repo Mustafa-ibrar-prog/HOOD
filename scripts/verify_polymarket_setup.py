@@ -18,6 +18,7 @@ means that part was never exercised.
 Usage:
     python3 scripts/verify_polymarket_setup.py
     python3 scripts/verify_polymarket_setup.py --debug-discovery
+    python3 scripts/verify_polymarket_setup.py --debug-exact-slug
 
 --debug-discovery (POLYMARKET_VENUE=us only) additionally dumps raw,
 PUBLIC market/event/series metadata from the live search.query(),
@@ -27,6 +28,20 @@ actual live response shape instead of guessed at. These are all
 unauthenticated public-gateway calls; nothing printed ever includes
 POLYMARKET_US_KEY_ID/SECRET_KEY, any header, or any account-specific
 data — only public market/event/series fields.
+
+--debug-exact-slug (POLYMARKET_VENUE=us only) diagnoses the EXACT
+deterministic-slug API request find_active_btc_market() makes (see
+us_client.py), using that same production code's own
+_current_window()/_expected_event_slug() so the slug tested is
+guaranteed identical to what a real cycle would compute — never a
+second, possibly-different implementation. For the previous, current,
+and next 15-minute window, it tries the computed slug against BOTH
+events.retrieve_by_slug() AND markets.retrieve_by_slug(), printing the
+full raw response or the exact exception (type, message, and
+status_code/request_id if the SDK's error carries them) for each —
+so a wrong-resource guess (event vs. market) or an off-by-one window
+is visible directly, instead of guessed at. Also public-gateway calls;
+same no-credentials-printed guarantee as --debug-discovery.
 """
 
 from __future__ import annotations
@@ -34,7 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -153,11 +168,71 @@ def _debug_discovery(settings: PolymarketSettings) -> None:
     print("\n=== END DEBUG DUMP ===\n")
 
 
+def _exception_detail(exc: Exception) -> str:
+    detail = f"{type(exc).__name__}: {exc}"
+    extras = []
+    for attr in ("status_code", "message", "request_id"):
+        val = getattr(exc, attr, None)
+        if val is not None:
+            extras.append(f"{attr}={val!r}")
+    if extras:
+        detail += " (" + ", ".join(extras) + ")"
+    return detail
+
+
+def _debug_exact_slug(settings: PolymarketSettings) -> None:
+    print("=== DEBUG: exact-slug request diagnostic (public gateway data only — no credentials, no account data) ===")
+    if not settings.is_us_venue:
+        print("  (--debug-exact-slug currently only covers POLYMARKET_VENUE=us)")
+        print()
+        return
+
+    us_client = PolymarketUSClient(settings)
+    sdk_client = us_client._client()  # the real polymarket_us.PolymarketUS -- diagnostic use only
+
+    now = datetime.now(timezone.utc)
+    window_start, window_end = us_client._current_window(now)
+    print(f"  now (UTC):       {now.isoformat()}")
+    print(f"  current window:  {window_start.isoformat()} -> {window_end.isoformat()}")
+
+    minutes = settings.market_duration_minutes
+    windows = [
+        ("previous window", window_start - timedelta(minutes=minutes)),
+        ("current window", window_start),
+        ("next window", window_start + timedelta(minutes=minutes)),
+    ]
+
+    for label, start in windows:
+        try:
+            slug = us_client._expected_event_slug(start)
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n--- {label} ---\n  ERROR building slug: {_exception_detail(exc)}")
+            continue
+
+        print(f"\n--- {label}: {slug!r} ---")
+        for resource_name, method in (
+            ("events.retrieve_by_slug", sdk_client.events.retrieve_by_slug),
+            ("markets.retrieve_by_slug", sdk_client.markets.retrieve_by_slug),
+        ):
+            try:
+                response = method(slug)
+                print(f"  {resource_name}({slug!r}) SUCCEEDED:")
+                print(json.dumps(response, indent=2, default=str))
+            except Exception as exc:  # noqa: BLE001 - this is a diagnostic dump; one failing call must not abort the rest
+                print(f"  {resource_name}({slug!r}) FAILED: {_exception_detail(exc)}")
+
+    print("\n=== END DEBUG DUMP ===\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--debug-discovery", action="store_true",
         help="Dump raw, public search/events/series metadata from the live API before running the normal checks.",
+    )
+    parser.add_argument(
+        "--debug-exact-slug", action="store_true",
+        help="Diagnose the exact events.retrieve_by_slug()/markets.retrieve_by_slug() request find_active_btc_market() makes.",
     )
     args = parser.parse_args()
 
@@ -168,6 +243,8 @@ def main() -> int:
 
     if args.debug_discovery:
         _debug_discovery(settings)
+    if args.debug_exact_slug:
+        _debug_exact_slug(settings)
 
     # --- 1. SDK importable --------------------------------------------------
     try:
