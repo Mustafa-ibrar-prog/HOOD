@@ -14,11 +14,13 @@ from src.polymarket.state import DailyPnlStateStore
 class _FakeClient:
     def __init__(self):
         self._fills: dict[str, FillResult] = {}
+        self.get_fill_status_calls: list[str] = []
 
     def set_fill_result(self, exchange_order_id: str, fill: FillResult) -> None:
         self._fills[exchange_order_id] = fill
 
     def get_fill_status(self, exchange_order_id: str) -> FillResult:
+        self.get_fill_status_calls.append(exchange_order_id)
         return self._fills[exchange_order_id]
 
 
@@ -90,11 +92,15 @@ def test_reconcile_order_opens_no_position_on_a_rejection(tmp_path):
 
 def test_reconcile_order_treats_unknown_status_as_no_fill(tmp_path):
     """Fail-closed (Task 3): an ambiguous/unrecognized exchange response
-    must never be treated as a fill."""
+    must never be treated as a fill. Also NOT marked fill_reconciled --
+    unlike a genuine terminal outcome, "unknown" is not an authoritative
+    answer (see reconciliation.py's module docstring), so this pending
+    order must remain eligible for a later retry."""
     client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
     pending = _submitted_pending(pending_store, exchange_order_id="ex-3")
     client.set_fill_result("ex-3", FillResult(
         order_id="ex-3", status="unknown", requested_shares=10.0, filled_shares=0.0, avg_fill_price=None,
+        raw={"lookup_error": "APIConnectionError: timed out"},
     ))
 
     fill = reconciliation.reconcile_order(
@@ -103,6 +109,49 @@ def test_reconcile_order_treats_unknown_status_as_no_fill(tmp_path):
     )
     assert fill is not None and not fill.is_fill
     assert position_store.load() == []
+    assert pending_store.get(pending.id).fill_reconciled is False
+
+
+def test_reconcile_order_unknown_status_is_retried_on_a_later_call(tmp_path):
+    """Regression for the real post-submit "unknown" scenario: a first
+    lookup attempt fails/is unrecognized (status="unknown"); a LATER
+    call for the SAME pending order (e.g. a subsequent
+    reconcile_pending_orders() sweep, or a manual re-run after the
+    transient problem clears) must actually re-query get_fill_status()
+    -- not silently no-op -- and, once the exchange now reports a real
+    terminal state, reconcile correctly from there."""
+    client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
+    pending = _submitted_pending(pending_store, exchange_order_id="ex-unknown")
+    client.set_fill_result("ex-unknown", FillResult(
+        order_id="ex-unknown", status="unknown", requested_shares=10.0, filled_shares=0.0, avg_fill_price=None,
+        raw={"lookup_error": "APIConnectionError: timed out"},
+    ))
+
+    first = reconciliation.reconcile_order(
+        pending, client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger,
+    )
+    assert first.status == "unknown"
+    assert client.get_fill_status_calls == ["ex-unknown"]
+
+    # The transient problem has since cleared; the exchange now reports
+    # a real fill for the SAME order id.
+    client.set_fill_result("ex-unknown", FillResult(
+        order_id="ex-unknown", status="filled", requested_shares=10.0, filled_shares=10.0, avg_fill_price=0.55,
+    ))
+    still_pending = pending_store.get(pending.id)
+    assert still_pending.fill_reconciled is False  # confirms it was genuinely left re-checkable
+
+    second = reconciliation.reconcile_order(
+        still_pending, client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger,
+    )
+    assert client.get_fill_status_calls == ["ex-unknown", "ex-unknown"]  # genuinely re-queried, not a no-op
+    assert second.is_fill
+    positions = position_store.load()
+    assert len(positions) == 1
+    assert positions[0].filled_shares == 10.0
+    assert pending_store.get(pending.id).fill_reconciled is True  # now a real terminal answer -- safe to mark done
 
 
 def test_reconcile_order_handles_a_partial_fill(tmp_path):
@@ -229,6 +278,34 @@ def test_reconcile_pending_orders_sweeps_every_unreconciled_order(tmp_path):
     assert count == 2
     assert len(position_store.load()) == 1  # only the "filled" one opened a position
     assert all(p.fill_reconciled for p in pending_store.load())
+
+
+def test_reconcile_pending_orders_leaves_an_unknown_result_eligible_for_the_next_sweep(tmp_path):
+    """An "unknown" status is attempted (counted) in this sweep, but
+    must not be marked fill_reconciled, so the NEXT sweep picks it up
+    again automatically -- unlike a genuinely terminal sibling order in
+    the same sweep, which is correctly marked done and not retried."""
+    client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
+    _submitted_pending(pending_store, exchange_order_id="ex-unknown", order=_order(condition_id="c-unknown"))
+    _submitted_pending(pending_store, exchange_order_id="ex-filled", order=_order(condition_id="c-filled"))
+    client.set_fill_result("ex-unknown", FillResult(order_id="ex-unknown", status="unknown", requested_shares=10.0, filled_shares=0.0, avg_fill_price=None))
+    client.set_fill_result("ex-filled", FillResult(order_id="ex-filled", status="filled", requested_shares=10.0, filled_shares=10.0, avg_fill_price=0.5))
+
+    first_sweep = reconciliation.reconcile_pending_orders(
+        client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger,
+    )
+    assert first_sweep == 2  # both attempted
+    assert client.get_fill_status_calls == ["ex-unknown", "ex-filled"]
+    statuses = {p.order.condition_id: p.fill_reconciled for p in pending_store.load()}
+    assert statuses == {"c-unknown": False, "c-filled": True}
+
+    second_sweep = reconciliation.reconcile_pending_orders(
+        client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger,
+    )
+    assert second_sweep == 1  # only the still-unreconciled "unknown" one is attempted again
+    assert client.get_fill_status_calls == ["ex-unknown", "ex-filled", "ex-unknown"]
 
 
 def test_reconcile_pending_orders_skips_already_reconciled_and_never_submitted(tmp_path):

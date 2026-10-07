@@ -582,8 +582,13 @@ def test_live_unknown_fill_status_stops_and_does_not_assume_a_fill(tmp_path, cap
     out = capsys.readouterr().out
     assert "FILL STATUS: unknown" in out
     assert "do not assume a fill" in out
+    assert "check_order_status.py ord-live-unknown" in out
+    assert "RAW DETAIL: {'state': 'ORDER_STATE_SOMETHING_NEW_WE_DONT_KNOW'}" in out
     assert stores["position_store"].load() == []
     assert len(sdk.orders.create_calls) == 1  # exactly one submission attempt -- no automatic retry/second order
+    pending = stores["pending_store"].load()
+    assert len(pending) == 1
+    assert pending[0].fill_reconciled is False  # left re-checkable, not permanently given up on
 
 
 def test_live_mode_with_no_market_slug_uses_automatic_btc_discovery(tmp_path, capsys):

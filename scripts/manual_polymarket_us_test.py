@@ -342,10 +342,20 @@ def run_manual_test(
         print(f"FILLED SHARES: {fill.filled_shares}")
         print(f"AVG FILL PRICE: {fill.avg_fill_price}")
         print(f"POSITION CREATED: NO")
-        print(f"RECONCILIATION: done (status unknown — recorded, NOT treated as a fill)")
-        print("ERROR: fill status is unknown -- do not assume a fill. Investigate manually "
-              "(check the order on the Polymarket US app/orders.retrieve()) before taking any "
-              "further action. No second order was submitted.")
+        # NOT a terminal determination -- reconciliation.py deliberately does
+        # NOT mark this pending order fill_reconciled, so it can be re-checked
+        # later (a communication failure may be transient; an unrecognized
+        # state may become interpretable once the code is updated). RAW
+        # DETAIL below is whatever get_fill_status() preserved -- either
+        # {"lookup_error": ...} (the status call itself failed) or
+        # {"state": ...} (the exchange returned a state this system doesn't
+        # recognize) -- never discarded.
+        print(f"RAW DETAIL: {fill.raw}")
+        print(f"RECONCILIATION: NOT done -- this pending order remains re-checkable "
+              f"(pending_order_id={pending_id}, exchange_order_id={fill.order_id})")
+        print(f"ERROR: fill status is unknown -- do not assume a fill. Run "
+              f"'python3 scripts/check_order_status.py {fill.order_id}' to re-query the exchange "
+              "directly (prints the raw response). No second order was submitted.")
         return 1
 
     print(f"FILL STATUS: {fill.status}")

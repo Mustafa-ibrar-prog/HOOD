@@ -24,6 +24,16 @@ second position for the same client_order_id even if some caller
 managed to skip that check. Two independent guards, on purpose — the
 same "deliberately overlapping" philosophy gateway.py and
 execution/gateway.py already use for safety gates.
+
+One exception to "always marks fill_reconciled=True": a get_fill_status()
+result of status="unknown" is NOT an authoritative determination (it
+means either the status lookup itself failed, or the exchange returned
+a state this system doesn't recognize) — reconcile_order() deliberately
+leaves `fill_reconciled` False in that case, so the SAME pending order
+remains eligible for a later retry (a subsequent reconcile_pending_orders()
+sweep, or a manual re-run) instead of being permanently given up on
+without ever learning its real fate. No position is ever opened for an
+"unknown" result either way.
 """
 
 from __future__ import annotations
@@ -115,13 +125,32 @@ def reconcile_order(
             fill, pending.order, pending.id,
             position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
         )
+    elif fill.status == "unknown":
+        # NOT an authoritative determination -- either the status
+        # lookup call itself failed (fill.raw["lookup_error"], a
+        # transport/auth problem that says nothing about the order's
+        # real state) or the exchange returned a state this system
+        # doesn't recognize (fill.raw["state"]). Logged, but
+        # deliberately NOT marked fill_reconciled: a communication
+        # failure may be transient (a later sweep/manual re-run can
+        # succeed), and an unrecognized state may become interpretable
+        # once the code is updated -- permanently giving up on either
+        # without ever learning the truth is exactly the "unknown fill"
+        # risk this must never create. No position is opened here
+        # either way -- see FillResult.is_fill/models.py's module
+        # docstring on "unknown" always being treated like "not filled."
+        decision_logger.log_decision(
+            kind="order_status_unknown",
+            reason=f"Order {pending.exchange_order_id} on {pending.order.condition_id}: status unknown, "
+                   "no position opened, NOT marked reconciled -- re-checkable later",
+            evidence={"fill": _fill_to_dict(fill)},
+        )
+        return fill
     else:
-        # Not a fill (rejected/cancelled/expired/resting/unknown) — no
-        # position, but still mark reconciled so this pending order is
-        # never re-checked forever. "resting"/"unknown" are logged
-        # distinctly from genuine terminal non-fills, since they may
-        # warrant a human look (a FOK/FAK order should never actually
-        # end up "resting").
+        # A genuine terminal non-fill (rejected/cancelled/expired) or a
+        # resting state -- an authoritative answer, safe to mark done.
+        # "resting" is logged distinctly since a FOK/FAK order should
+        # never actually end up there; it may still warrant a human look.
         decision_logger.log_decision(
             kind="order_not_filled",
             reason=f"Order {pending.exchange_order_id} on {pending.order.condition_id}: {fill.status}, no position opened",
