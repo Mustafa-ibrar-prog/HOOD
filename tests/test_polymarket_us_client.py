@@ -25,7 +25,11 @@ from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import PolymarketPositionStore
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
-from src.polymarket.us_client import PolymarketUSClient, PolymarketUSClientError
+from src.polymarket.us_client import (
+    PolymarketUSClient,
+    PolymarketUSClientError,
+    _parse_btc_updown_window_from_slug,
+)
 
 _NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
 
@@ -67,8 +71,11 @@ class _FakeMarkets:
         self.settlements = settlements or {}
         self.details = details or {}
         self.book_exc = book_exc
+        self.book_calls: list = []
+        self.retrieve_by_slug_calls: list = []
 
     def book(self, slug):
+        self.book_calls.append(slug)
         if self.book_exc:
             raise self.book_exc
         return self.books[slug]
@@ -77,6 +84,7 @@ class _FakeMarkets:
         return self.settlements[slug]
 
     def retrieve_by_slug(self, slug):
+        self.retrieve_by_slug_calls.append(slug)
         if slug not in self.details:
             raise _NotFoundError(f"no such market {slug}")
         return self.details[slug]
@@ -272,6 +280,37 @@ def test_expected_slug_raises_for_an_unconfirmed_cadence():
         client._expected_event_slug(_NOW)
 
 
+# --- 1b. Inverse: deriving the window FROM an event slug (close_time source,
+# since the live API doesn't reliably send endTime for this product) -------
+
+def test_parse_btc_updown_window_from_slug_matches_the_confirmed_live_example():
+    start, end = _parse_btc_updown_window_from_slug(
+        "btc-updown-15m-2026-10-07-2015z", market_duration_minutes=15,
+    )
+    assert start == datetime(2026, 10, 7, 20, 15, tzinfo=timezone.utc)
+    assert end == datetime(2026, 10, 7, 20, 30, tzinfo=timezone.utc)
+
+
+def test_parse_btc_updown_window_from_slug_returns_none_for_a_non_matching_slug():
+    assert _parse_btc_updown_window_from_slug("some-unrelated-event-2026", market_duration_minutes=15) is None
+    assert _parse_btc_updown_window_from_slug(None, market_duration_minutes=15) is None
+
+
+def test_parse_btc_updown_window_from_slug_returns_none_for_an_unconfirmed_cadence():
+    """The slug matches the pattern but with a cadence token
+    (e.g. "1h") this system has no confirmed mapping for -- never
+    guess that it means 60 minutes."""
+    assert _parse_btc_updown_window_from_slug(
+        "btc-updown-1h-2026-10-07-2000z", market_duration_minutes=15,
+    ) is None
+
+
+def test_parse_btc_updown_window_from_slug_rejects_an_invalid_calendar_date():
+    assert _parse_btc_updown_window_from_slug(
+        "btc-updown-15m-2026-13-07-2015z", market_duration_minutes=15,
+    ) is None
+
+
 # --- 2. Discovery: exact-slug lookup, never a text search ---------------------
 
 def test_discovery_finds_the_exact_expected_event(tmp_path):
@@ -417,14 +456,6 @@ def test_discovery_rolls_over_to_the_next_window_automatically(tmp_path):
 
 # --- 2b. Manual market override (POLYMARKET_US_MARKET_SLUG) -----------------
 
-def _market_detail(*, slug, title="Some Market", outcome="YES", active=True, closed=False, event_slug=None) -> dict:
-    return {
-        "id": 1, "slug": slug, "title": title, "outcome": outcome, "description": "",
-        "active": active, "closed": closed, "liquidity": 100.0, "volume": 100.0,
-        "eventSlug": event_slug, "team": None,
-    }
-
-
 def test_manual_override_unset_leaves_btc_discovery_unaffected(tmp_path):
     """No POLYMARKET_US_MARKET_SLUG -> the existing deterministic BTC
     15m path runs exactly as before; the manual-override machinery is
@@ -440,121 +471,130 @@ def test_manual_override_unset_leaves_btc_discovery_unaffected(tmp_path):
     assert market.condition_id == slug
 
 
-def test_manual_override_exact_slug_found_as_a_market(tmp_path):
-    """The override slug resolves directly via markets.retrieve_by_slug
-    -- the common case, since that's the resource actually needed to trade."""
-    slug = "some-arbitrary-market-2026"
+def test_manual_override_treats_the_slug_as_an_event_slug(tmp_path):
+    """CONFIRMED LIVE: a slug copied from the Polymarket US app is an
+    EVENT slug, and its nested TRADEABLE market has its own, different
+    slug (a real event btc-updown-15m-2026-10-07-2015z's nested market
+    is cpc-btc-updown-15m-2026-10-07-2015z) -- never assumed equal.
+    Only events.retrieve_by_slug() is called; markets.retrieve_by_slug()
+    is never consulted for this path at all."""
     event_slug = "some-arbitrary-event-2026"
-    market_detail = _market_detail(slug=slug, title="Some Arbitrary Market", event_slug=event_slug)
+    market_slug = "cpc-some-arbitrary-event-2026"  # deliberately NOT equal to event_slug
     start = datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)
     end = datetime(2026, 10, 7, 9, 30, tzinfo=timezone.utc)
-    event = _event(slug=event_slug, title="Some Arbitrary Event", start=start, end=end, market_slug=slug)
-    sdk = _FakeSDKClient(
-        markets=_FakeMarkets(details={slug: {"market": market_detail}}),
-        events=_FakeEvents({event_slug: {"event": event}}),
-    )
-    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    event = _event(slug=event_slug, title="Some Arbitrary Event", start=start, end=end, market_slug=market_slug)
+    markets = _FakeMarkets()
+    sdk = _FakeSDKClient(markets=markets, events=_FakeEvents({event_slug: {"event": event}}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=event_slug), sdk_client=sdk)
+
     market = client.find_active_btc_market()
-    assert market.condition_id == slug
-    assert market.token_id_yes == market.token_id_no == slug
+
+    assert market.condition_id == event_slug  # the EVENT slug
+    assert market.token_id_yes == market.token_id_no == market_slug  # the NESTED market's own slug
     assert market.close_time == end
     assert market.question == "Some Arbitrary Event"
-
-
-def test_manual_override_exact_slug_found_as_an_event(tmp_path):
-    """The override slug 404s as a market but resolves as an event --
-    its first market is used, mirroring the BTC 15m discovery path."""
-    slug = "some-arbitrary-event-2026"
-    start = datetime(2026, 10, 7, 9, 0, tzinfo=timezone.utc)
-    end = datetime(2026, 10, 7, 9, 30, tzinfo=timezone.utc)
-    market_slug = "some-arbitrary-event-2026-market"
-    event = _event(slug=slug, start=start, end=end, market_slug=market_slug)
-    sdk = _FakeSDKClient(
-        markets=_FakeMarkets(details={}),  # 404s as a market
-        events=_FakeEvents({slug: {"event": event}}),
-    )
-    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
-    market = client.find_active_btc_market()
-    assert market.condition_id == market_slug
+    assert markets.retrieve_by_slug_calls == []  # markets.retrieve_by_slug never consulted
 
 
 def test_manual_override_never_searches(tmp_path):
     """No search.query() call of any kind for the manual-override path
-    -- an exact lookup only."""
-    slug = "some-arbitrary-market-2026"
-    market_detail = _market_detail(slug=slug, event_slug="evt")
-    event = _event(slug="evt", start=_NOW, end=_NOW + timedelta(minutes=30), market_slug=slug)
+    -- an exact events.retrieve_by_slug() lookup only."""
+    event_slug = "evt"
+    market_slug = "cpc-evt"
+    event = _event(slug=event_slug, start=_NOW, end=_NOW + timedelta(minutes=30), market_slug=market_slug)
     search = _FakeSearch({"events": [event]})
-    sdk = _FakeSDKClient(
-        search=search, markets=_FakeMarkets(details={slug: {"market": market_detail}}),
-        events=_FakeEvents({"evt": {"event": event}}),
-    )
-    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    sdk = _FakeSDKClient(search=search, events=_FakeEvents({event_slug: {"event": event}}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=event_slug), sdk_client=sdk)
     client.find_active_btc_market()
     assert search.calls == []
 
 
-def test_manual_override_rejects_missing_market(tmp_path):
-    sdk = _FakeSDKClient(markets=_FakeMarkets(details={}), events=_FakeEvents({}))
+def test_manual_override_rejects_a_missing_event(tmp_path):
+    sdk = _FakeSDKClient(events=_FakeEvents({}))
     client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG="does-not-exist"), sdk_client=sdk)
     with pytest.raises(NoActiveMarketError):
         client.find_active_btc_market()
 
 
-def test_manual_override_rejects_mismatched_slug(tmp_path):
-    """markets.retrieve_by_slug() returns a DIFFERENT slug than
-    requested -- never trusted; falls through to the event path, which
-    also fails here -- refuse rather than trade the wrong thing."""
+def test_manual_override_rejects_a_mismatched_event_slug(tmp_path):
+    """events.retrieve_by_slug() returns a DIFFERENT slug than
+    requested (a malformed/stale response) -- never trusted."""
     slug = "requested-slug"
-    wrong_market = _market_detail(slug="totally-different-slug")
-    sdk = _FakeSDKClient(markets=_FakeMarkets(details={slug: {"market": wrong_market}}), events=_FakeEvents({}))
+    wrong_event = _event(slug="totally-different-slug", start=_NOW, end=_NOW + timedelta(minutes=15))
+    sdk = _FakeSDKClient(events=_FakeEvents({slug: {"event": wrong_event}}))
     client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
     with pytest.raises(NoActiveMarketError):
         client.find_active_btc_market()
 
 
-def test_manual_override_rejects_inactive_market(tmp_path):
-    slug = "some-market"
-    market_detail = _market_detail(slug=slug, active=False, event_slug="evt")
-    sdk = _FakeSDKClient(markets=_FakeMarkets(details={slug: {"market": market_detail}}))
+def test_manual_override_rejects_an_inactive_or_closed_event(tmp_path):
+    slug = "some-event"
+    closed_event = _event(slug=slug, start=_NOW, end=_NOW + timedelta(minutes=15), active=False, closed=True)
+    sdk = _FakeSDKClient(events=_FakeEvents({slug: {"event": closed_event}}))
     client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
     with pytest.raises(NoActiveMarketError):
         client.find_active_btc_market()
 
 
-def test_manual_override_rejects_closed_market(tmp_path):
-    slug = "some-market"
-    market_detail = _market_detail(slug=slug, closed=True, event_slug="evt")
-    sdk = _FakeSDKClient(markets=_FakeMarkets(details={slug: {"market": market_detail}}))
+def test_manual_override_rejects_an_inactive_or_closed_nested_market(tmp_path):
+    """The event itself is open, but its one nested market is not --
+    refuse rather than trade a closed market."""
+    slug = "some-event"
+    event = _event(slug=slug, start=_NOW, end=_NOW + timedelta(minutes=15))
+    event["markets"][0]["active"] = False
+    event["markets"][0]["closed"] = True
+    sdk = _FakeSDKClient(events=_FakeEvents({slug: {"event": event}}))
     client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
     with pytest.raises(NoActiveMarketError):
         client.find_active_btc_market()
 
 
-def test_manual_override_rejects_when_parent_event_is_closed(tmp_path):
-    slug = "some-market"
-    event_slug = "evt"
-    market_detail = _market_detail(slug=slug, event_slug=event_slug)
-    closed_event = _event(slug=event_slug, start=_NOW, end=_NOW + timedelta(minutes=30),
-                           market_slug=slug, active=False, closed=True)
-    sdk = _FakeSDKClient(
-        markets=_FakeMarkets(details={slug: {"market": market_detail}}),
-        events=_FakeEvents({event_slug: {"event": closed_event}}),
-    )
+def test_manual_override_rejects_an_event_with_no_markets(tmp_path):
+    slug = "some-event"
+    event = _event(slug=slug, start=_NOW, end=_NOW + timedelta(minutes=15))
+    event["markets"] = []
+    sdk = _FakeSDKClient(events=_FakeEvents({slug: {"event": event}}))
     client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
     with pytest.raises(NoActiveMarketError):
         client.find_active_btc_market()
 
 
-def test_manual_override_rejects_when_schedule_data_unavailable(tmp_path):
-    """Found as a market, but its parent event can't be fetched at all
-    -- refuse rather than trade without a verified close time."""
-    slug = "some-market"
-    market_detail = _market_detail(slug=slug, event_slug="evt-does-not-exist")
-    sdk = _FakeSDKClient(markets=_FakeMarkets(details={slug: {"market": market_detail}}), events=_FakeEvents({}))
-    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
-    with pytest.raises(NoActiveMarketError):
-        client.find_active_btc_market()
+# --- 2c. Regression: the EXACT live response shape (no top-level endTime,
+# nested market slugged differently from its event) -------------------------
+
+def test_manual_override_matches_the_real_observed_response_shape(tmp_path):
+    """Sanitized regression fixture matching the LIVE response shape
+    observed for event btc-updown-15m-2026-10-07-2015z: no endTime key
+    AT ALL on the event (only startTime), and a nested market slugged
+    cpc-btc-updown-15m-2026-10-07-2015z (NOT the event's own slug).
+    Reproduces the exact live failure this fixes: close_time must be
+    derived from the event slug's own embedded YYYY-MM-DD-HHMM, never
+    from a missing endTime."""
+    event_slug = "btc-updown-15m-2026-10-07-2015z"
+    market_slug = "cpc-btc-updown-15m-2026-10-07-2015z"
+    event = {
+        "id": 1, "slug": event_slug, "title": "BTC Up or Down 15m", "description": "",
+        "startTime": "2026-10-07T20:15:00Z",  # no "endTime" key at all -- the real observed shape
+        "active": True, "closed": False, "archived": False, "featured": False,
+        "liquidity": 100.0, "volume": 100.0,
+        "markets": [{
+            "id": 1, "slug": market_slug, "title": "BTC Up or Down 15m", "outcome": "YES",
+            "active": True, "closed": False, "liquidity": 100.0, "volume": 100.0,
+        }],
+        "tags": [], "series": {"id": 1, "slug": "btc-up-or-down-15-minute", "title": "BTC Up or Down (15 Minute)"},
+    }
+    book = _book_response([_book_level("0.54", 100)], [_book_level("0.55", 100)])
+    markets = _FakeMarkets(books={market_slug: book})
+    sdk = _FakeSDKClient(markets=markets, events=_FakeEvents({event_slug: {"event": event}}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=event_slug), sdk_client=sdk)
+
+    market = client.find_active_btc_market()  # 1. event lookup succeeds; BinaryMarket is created (3/6)
+
+    assert "endTime" not in event  # the fixture genuinely omits it -- not a lenient parse of a present key
+    assert market.condition_id == event_slug  # 4. event slug is verified/used as condition_id
+    assert market.token_id_yes == market.token_id_no == market_slug  # 5. nested market slug extracted
+    assert market.close_time == datetime(2026, 10, 7, 20, 30, tzinfo=timezone.utc)  # derived from the slug, not endTime (2/6)
+    assert markets.book_calls == [market_slug]  # 7. order-book lookup used the nested market's slug, not the event slug
 
 
 # --- 3. Outcome identifiers ----------------------------------------------------
@@ -893,33 +933,43 @@ def test_fill_status_malformed_nonzero_cum_with_unexpected_state_is_unknown(tmp_
 # --- 9. Settlement / resolution -----------------------------------------------
 
 def test_resolution_yes_wins(tmp_path):
-    sdk = _FakeSDKClient(markets=_FakeMarkets(
-        details={"btc-updown-15m": {"market": {"id": 1, "slug": "btc-updown-15m", "closed": True}}},
-        settlements={"btc-updown-15m": {"slug": "btc-updown-15m", "settlement": 1.0}},
-    ))
+    """get_resolution() takes the EVENT slug (same as
+    BinaryMarket/OpenPosition.condition_id -- see _to_binary_market),
+    looks up the event, and checks its NESTED market's own
+    closed/settlement state -- the market slug (cpc-...) differs from
+    the event slug and is never passed in directly."""
+    event_slug = "btc-updown-15m-2026-10-07-2015z"
+    market_slug = "cpc-btc-updown-15m-2026-10-07-2015z"
+    event = _event(slug=event_slug, start=_NOW, end=_NOW, market_slug=market_slug, closed=True, active=False)
+    sdk = _FakeSDKClient(
+        events=_FakeEvents({event_slug: {"event": event}}),
+        markets=_FakeMarkets(settlements={market_slug: {"slug": market_slug, "settlement": 1.0}}),
+    )
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    assert client.get_resolution("btc-updown-15m") == "YES"
+    assert client.get_resolution(event_slug) == "YES"
 
 
 def test_resolution_no_wins(tmp_path):
-    sdk = _FakeSDKClient(markets=_FakeMarkets(
-        details={"btc-updown-15m": {"market": {"id": 1, "slug": "btc-updown-15m", "closed": True}}},
-        settlements={"btc-updown-15m": {"slug": "btc-updown-15m", "settlement": 0.0}},
-    ))
+    event_slug, market_slug = "evt-closed", "cpc-evt-closed"
+    event = _event(slug=event_slug, start=_NOW, end=_NOW, market_slug=market_slug, closed=True, active=False)
+    sdk = _FakeSDKClient(
+        events=_FakeEvents({event_slug: {"event": event}}),
+        markets=_FakeMarkets(settlements={market_slug: {"slug": market_slug, "settlement": 0.0}}),
+    )
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    assert client.get_resolution("btc-updown-15m") == "NO"
+    assert client.get_resolution(event_slug) == "NO"
 
 
 def test_resolution_none_while_still_open(tmp_path):
-    sdk = _FakeSDKClient(markets=_FakeMarkets(
-        details={"btc-updown-15m": {"market": {"id": 1, "slug": "btc-updown-15m", "closed": False}}},
-    ))
+    event_slug, market_slug = "evt-open", "cpc-evt-open"
+    event = _event(slug=event_slug, start=_NOW, end=_NOW, market_slug=market_slug, closed=False, active=True)
+    sdk = _FakeSDKClient(events=_FakeEvents({event_slug: {"event": event}}))
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    assert client.get_resolution("btc-updown-15m") is None
+    assert client.get_resolution(event_slug) is None
 
 
 def test_resolution_not_found_returns_none_not_a_crash(tmp_path):
-    sdk = _FakeSDKClient(markets=_FakeMarkets(details={}))
+    sdk = _FakeSDKClient(events=_FakeEvents({}))
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
     assert client.get_resolution("does-not-exist") is None
 

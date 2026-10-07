@@ -44,7 +44,19 @@ a blog post, not memory:
     — not as two separate ERC-1155 tokens with their own order books.
     Schedule/timing lives on the EVENT, not the market
     (`events.list()/retrieve() -> Event`: startTime, endTime, markets:
-    [Market...]). A recurring product is modeled as a `Series`
+    [Market...]) per the SDK's own type definitions — but CONFIRMED
+    LIVE, a real event response does not reliably include `endTime` at
+    all (one real btc-updown-15m-... event came back with no endTime
+    key whatsoever, only startTime); see find_active_btc_market()'s and
+    _to_binary_market()'s docstrings for how close_time is derived
+    instead for this product. ALSO CONFIRMED LIVE: an event's own slug
+    and its nested market's slug are NOT the same string — a real
+    event slugged `btc-updown-15m-2026-10-07-2015z` contains a nested
+    market slugged `cpc-btc-updown-15m-2026-10-07-2015z` — never
+    assume a manually-provided or deterministically-constructed BTC
+    slug is directly a market slug; it is the EVENT's slug, and the
+    tradeable market must be read from that event's own `markets[0]`.
+    A recurring product is modeled as a `Series`
     (`recurrence: str`) generating many Events — this is the SDK's own
     structural pattern for e.g. a daily/weekly game schedule, and is
     the most plausible home for a recurring 15-minute window product,
@@ -134,6 +146,7 @@ src/polymarket/__init__.py). Most importantly:
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -177,6 +190,15 @@ _BTC_UPDOWN_SLUG_PREFIX = "btc-updown"
 _SLUG_CADENCE_TOKENS: dict[int, str] = {
     15: "15m",
 }
+
+# Inverse of _expected_event_slug's f-string, for _parse_btc_updown_window_from_slug
+# below: btc-updown-<cadence>-YYYY-MM-DD-HHMMz. Confirmed LIVE (real example:
+# btc-updown-15m-2026-10-07-2015z) -- this is the SAME pattern _BTC_UPDOWN_SLUG_PREFIX/
+# _SLUG_CADENCE_TOKENS already encode, just parsed instead of built.
+_BTC_UPDOWN_SLUG_RE = re.compile(
+    rf"^{re.escape(_BTC_UPDOWN_SLUG_PREFIX)}-(?P<cadence>[a-z0-9]+)-"
+    rf"(?P<year>\d{{4}})-(?P<month>\d{{2}})-(?P<day>\d{{2}})-(?P<hhmm>\d{{4}})z$"
+)
 
 # Order.state -> this system's FillStatus vocabulary (models.py). Only
 # states with cumQuantity > 0 may map to "filled"/"partially_filled" —
@@ -231,6 +253,41 @@ def _parse_dt(value: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _parse_btc_updown_window_from_slug(
+    slug: str | None, *, market_duration_minutes: int,
+) -> tuple[datetime, datetime] | None:
+    """Confirmed LIVE: for this product, the event slug itself IS the
+    schedule (btc-updown-15m-YYYY-MM-DD-HHMMz, HHMM = UTC window
+    start) -- the inverse of _expected_event_slug's construction.
+    Used as the close-time source for this product's events because
+    the live API's own endTime field is confirmed ABSENT on at least
+    one real event response (see _to_binary_market's module docstring
+    note) -- deriving from the slug avoids requiring a field the API
+    doesn't reliably send, without guessing at a different field name
+    instead.
+
+    Returns None (never raises) for any slug that doesn't match the
+    pattern, or whose cadence token isn't the one currently configured
+    -- callers fall back to endTime for those, since this function has
+    no basis to assume non-BTC-15m products follow the same scheme."""
+    if not slug:
+        return None
+    match = _BTC_UPDOWN_SLUG_RE.match(slug)
+    if match is None:
+        return None
+    cadence_token = _SLUG_CADENCE_TOKENS.get(market_duration_minutes)
+    if cadence_token is None or match.group("cadence") != cadence_token:
+        return None
+    try:
+        start = datetime(
+            int(match.group("year")), int(match.group("month")), int(match.group("day")),
+            int(match.group("hhmm")[:2]), int(match.group("hhmm")[2:]), tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+    return start, start + timedelta(minutes=market_duration_minutes)
 
 
 def _parse_amount(amount: Any) -> float | None:
@@ -348,69 +405,44 @@ class PolymarketUSClient:
         this exact slug — no search, no "closest available," no
         fallback to BTC 15m discovery.
 
-        Tries `slug` as a MARKET slug first (that's what's actually
-        needed to trade — see place_order()/get_order_book()), falling
-        back to an EVENT-slug lookup (taking its first market) if that
-        doesn't resolve, since this codebase does not assume which
-        resource an arbitrary slug copied from the live app belongs to
-        — see this module's "NOT independently verified" item on the
-        BTC 15m slug's own resource, which applies equally here.
-        Either way, the result's own slug/active/closed fields are
-        verified before being trusted; anything that doesn't resolve
-        and verify cleanly raises NoActiveMarketError rather than
-        silently falling back to something else.
+        `slug` is treated as an EVENT slug — CONFIRMED LIVE: a slug
+        copied from the Polymarket US app's event URL (e.g.
+        btc-updown-15m-2026-10-07-2015z) is an event slug, and the
+        nested TRADEABLE market it contains has its OWN, different
+        slug (confirmed live: a "cpc-" prefixed internal slug, e.g.
+        cpc-btc-updown-15m-2026-10-07-2015z) — never assumed equal to
+        the event slug. events.retrieve_by_slug() is the one call made
+        here; the event's own slug/active/closed fields, and then the
+        nested market's own active/closed fields, are verified before
+        either is trusted — anything that doesn't resolve and verify
+        cleanly raises NoActiveMarketError rather than silently
+        falling back to something else.
         """
         client = self._client()
-
-        market: dict | None = None
-        event: dict | None = None
         try:
-            market_response = client.markets.retrieve_by_slug(slug)
-            candidate = market_response.get("market") or {}
-            if candidate.get("slug") == slug:
-                market = candidate
-        except Exception:  # noqa: BLE001 - not found as a market; try as an event next
-            pass
-
-        if market is not None:
-            event_slug = market.get("eventSlug")
-            if event_slug:
-                try:
-                    event_response = client.events.retrieve_by_slug(event_slug)
-                    event = event_response.get("event")
-                except Exception:  # noqa: BLE001 - schedule data unavailable; handled by the check below
-                    event = None
-        else:
-            try:
-                event_response = client.events.retrieve_by_slug(slug)
-            except Exception as exc:  # noqa: BLE001
-                raise NoActiveMarketError(
-                    f"POLYMARKET_US_MARKET_SLUG={slug!r} was not found as either a market "
-                    f"(markets.retrieve_by_slug) or an event (events.retrieve_by_slug): "
-                    f"{type(exc).__name__}: {exc}. Verify the exact slug from the Polymarket US app."
-                ) from exc
-            event = event_response.get("event")
-            if event is None or event.get("slug") != slug:
-                raise NoActiveMarketError(
-                    f"POLYMARKET_US_MARKET_SLUG={slug!r}: events.retrieve_by_slug() returned a "
-                    "mismatched or empty event — refusing to trade it."
-                )
-            markets = event.get("markets") or []
-            if not markets:
-                raise NoActiveMarketError(f"Event {slug!r} has no markets to trade.")
-            market = markets[0]
-
-        if market is None:
-            raise NoActiveMarketError(f"POLYMARKET_US_MARKET_SLUG={slug!r} could not be resolved to a market.")
-        if not market.get("active") or market.get("closed"):
-            raise NoActiveMarketError(f"Market {market.get('slug')!r} exists but is not active/open right now.")
-        if event is None:
+            event_response = client.events.retrieve_by_slug(slug)
+        except Exception as exc:  # noqa: BLE001
             raise NoActiveMarketError(
-                f"POLYMARKET_US_MARKET_SLUG={slug!r}: could not determine schedule (parent event) "
-                "data — refusing to trade without a verified close time."
+                f"POLYMARKET_US_MARKET_SLUG={slug!r} could not be retrieved as an event "
+                f"(events.retrieve_by_slug): {type(exc).__name__}: {exc}. Verify the exact "
+                "event slug from the Polymarket US app."
+            ) from exc
+
+        event = event_response.get("event")
+        if event is None or event.get("slug") != slug:
+            raise NoActiveMarketError(
+                f"POLYMARKET_US_MARKET_SLUG={slug!r}: events.retrieve_by_slug() returned a "
+                "mismatched or empty event — refusing to trade it."
             )
         if not event.get("active") or event.get("closed"):
-            raise NoActiveMarketError(f"Event {event.get('slug')!r} exists but is not active/open right now.")
+            raise NoActiveMarketError(f"Event {slug!r} exists but is not active/open right now.")
+
+        markets = event.get("markets") or []
+        if not markets:
+            raise NoActiveMarketError(f"Event {slug!r} has no markets to trade.")
+        market = markets[0]
+        if not market.get("active") or market.get("closed"):
+            raise NoActiveMarketError(f"Market {market.get('slug')!r} exists but is not active/open right now.")
 
         return self._to_binary_market(event, market, now=now)
 
@@ -440,12 +472,21 @@ class PolymarketUSClient:
     ) -> None:
         """Defense in depth: even though the slug was constructed
         deterministically, never trust the response blindly. Verifies
-        the returned event actually IS the one requested, is currently
-        open, and is on the exact expected schedule — raising
-        NoActiveMarketError (never silently substituting a different
-        market) on any mismatch. A few seconds of tolerance on the
-        start/end comparison absorbs harmless response-formatting
-        precision, not a genuine scheduling mismatch."""
+        the returned event actually IS the one requested and is
+        currently open — raising NoActiveMarketError (never silently
+        substituting a different market) on any mismatch.
+
+        startTime/endTime are cross-checked against the expected
+        window ONLY WHEN PRESENT: CONFIRMED LIVE, the real API's
+        response for this product does not reliably include endTime
+        at all (a real btc-updown-15m-... event was returned
+        successfully with no endTime key), so their absence is never
+        itself a rejection reason — the slug match above (which
+        deterministically encodes the same window — see
+        _parse_btc_updown_window_from_slug) is this check's primary
+        defense. A few seconds of tolerance on the start/end
+        comparison absorbs harmless response-formatting precision, not
+        a genuine scheduling mismatch."""
         actual_slug = event.get("slug")
         if actual_slug != expected_slug:
             raise NoActiveMarketError(
@@ -457,37 +498,73 @@ class PolymarketUSClient:
 
         start = _parse_dt(event.get("startTime"))
         end = _parse_dt(event.get("endTime"))
-        if start is None or end is None:
-            raise NoActiveMarketError(f"Event {expected_slug!r} is missing startTime/endTime.")
-        if abs((start - window_start).total_seconds()) > 5:
+        if start is not None and abs((start - window_start).total_seconds()) > 5:
             raise NoActiveMarketError(
                 f"Event {expected_slug!r} startTime={start.isoformat()} does not match the expected "
                 f"window start {window_start.isoformat()}."
             )
-        if abs((end - window_end).total_seconds()) > 5:
+        if end is not None and abs((end - window_end).total_seconds()) > 5:
             raise NoActiveMarketError(
                 f"Event {expected_slug!r} endTime={end.isoformat()} does not match the expected "
                 f"window end {window_end.isoformat()}."
             )
 
     def _to_binary_market(self, event: dict, market: dict, *, now: datetime) -> BinaryMarket:
-        slug = market.get("slug")
-        if not slug:
-            raise PolymarketUSClientError(f"Event {event.get('slug')!r}'s market has no slug")
-        close_time = _parse_dt(event.get("endTime"))
-        if close_time is None:
-            raise PolymarketUSClientError(f"Event {event.get('slug')!r} has no endTime")
+        """CONFIRMED LIVE: the event's own slug and its nested market's
+        slug are NOT the same string -- a real response for event
+        btc-updown-15m-2026-10-07-2015z contains a nested market
+        slugged cpc-btc-updown-15m-2026-10-07-2015z. condition_id uses
+        the EVENT's slug (the stable, human-meaningful identifier the
+        rest of this system and the trader both deal in); token_id_yes/
+        token_id_no use the nested MARKET's own slug (the id
+        markets.book()/orders.create() actually need -- see
+        get_order_book()/_build_create_order_params()). Never assume
+        these are equal.
+
+        close_time: ALSO confirmed live, the API does not reliably
+        include endTime on this product's event responses at all (a
+        real event came back with no endTime key whatsoever). For an
+        event slug matching the confirmed btc-updown-<cadence>-
+        YYYY-MM-DD-HHMMz pattern, the window end is derived directly
+        from the slug itself (_parse_btc_updown_window_from_slug) --
+        the slug IS the schedule for this product. Only for a
+        non-matching slug (a manually-overridden non-BTC market, where
+        no such pattern is confirmed) does this fall back to endTime;
+        if that is ALSO absent, this raises rather than guess at a
+        different field name (expirationTime/closeTime/endDate/etc)."""
+        event_slug = event.get("slug")
+        if not event_slug:
+            raise PolymarketUSClientError("Event has no slug")
+        market_slug = market.get("slug")
+        if not market_slug:
+            raise PolymarketUSClientError(f"Event {event_slug!r}'s market has no slug")
+
+        window = _parse_btc_updown_window_from_slug(
+            event_slug, market_duration_minutes=self._settings.market_duration_minutes,
+        )
+        if window is not None:
+            close_time = window[1]
+        else:
+            close_time = _parse_dt(event.get("endTime"))
+            if close_time is None:
+                raise PolymarketUSClientError(
+                    f"Event {event_slug!r} has no endTime, and its slug does not match the confirmed "
+                    f"{_BTC_UPDOWN_SLUG_PREFIX}-<cadence>-YYYY-MM-DD-HHMMz pattern to derive a close "
+                    "time from instead -- refusing to guess a different field name. Run "
+                    "scripts/verify_polymarket_setup.py --market-slug <slug> --debug-exact-slug to "
+                    "see the real response shape."
+                )
 
         yes_bid = yes_ask = None
         try:
-            book = self.get_order_book(slug)
+            book = self.get_order_book(market_slug)
             yes_bid, yes_ask = book.best_bid, book.best_ask
         except Exception:  # noqa: BLE001 - this summary price is a convenience for strategy.py's signal only
             pass
 
         return BinaryMarket(
-            condition_id=slug, question=event.get("title") or market.get("title") or "",
-            token_id_yes=slug, token_id_no=slug,
+            condition_id=event_slug, question=event.get("title") or market.get("title") or "",
+            token_id_yes=market_slug, token_id_no=market_slug,
             close_time=close_time, fetched_at=now, yes_bid=yes_bid, yes_ask=yes_ask,
         )
 
@@ -507,21 +584,37 @@ class PolymarketUSClient:
         return OrderBookSnapshot(token_id=token_id, bids=bids, asks=asks, fetched_at=datetime.now(timezone.utc))
 
     def get_resolution(self, condition_id: str) -> str | None:
-        """`condition_id` is the marketSlug. UNVERIFIED (see module
-        docstring): markets.settlement(slug)'s scalar `settlement`
-        value is assumed to mean 1.0="YES"(long) won, 0.0="NO" won —
-        the most natural reading for a single-contract binary market,
-        never confirmed against a real resolved market."""
+        """`condition_id` is this market's EVENT slug — the same
+        identifier BinaryMarket.condition_id/OpenPosition.condition_id
+        carry (see _to_binary_market) — NOT the nested market's own
+        slug, which is confirmed to differ (e.g. event
+        btc-updown-15m-2026-10-07-2015z's nested market is
+        cpc-btc-updown-15m-2026-10-07-2015z). Looks the EVENT up via
+        events.retrieve_by_slug() (the confirmed-working call — see
+        _get_manual_override_market), takes its nested market, and
+        checks THAT market's own closed/settlement state — never
+        assumes the event slug is itself a queryable market slug via
+        markets.retrieve_by_slug().
+
+        UNVERIFIED (see module docstring): markets.settlement(slug)'s
+        scalar `settlement` value is assumed to mean 1.0="YES"(long)
+        won, 0.0="NO" won — the most natural reading for a
+        single-contract binary market, never confirmed against a real
+        resolved market."""
         client = self._client()
         try:
-            detail = client.markets.retrieve_by_slug(condition_id)
+            event_response = client.events.retrieve_by_slug(condition_id)
         except Exception:  # noqa: BLE001 - not-found or a transport failure both mean "don't know yet"
             return None
-        market = detail.get("market") or {}
-        if not market.get("closed"):
+        event = event_response.get("event") or {}
+        markets = event.get("markets") or []
+        if not markets:
+            return None
+        market_slug = markets[0].get("slug")
+        if not market_slug or not markets[0].get("closed"):
             return None
         try:
-            settlement = client.markets.settlement(condition_id)
+            settlement = client.markets.settlement(market_slug)
         except Exception:  # noqa: BLE001 - same as above
             return None
         value = settlement.get("settlement")
