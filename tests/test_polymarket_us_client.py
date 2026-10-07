@@ -598,6 +598,34 @@ def test_manual_override_matches_the_real_observed_response_shape(tmp_path):
     assert markets.book_calls == [market_slug]  # 7. order-book lookup used the nested market's slug, not the event slug
 
 
+def test_automatic_discovery_extracts_the_nested_market_slug_never_synthesizes_it(tmp_path):
+    """Regression for the real NotFoundError observed live: automatic
+    BTC 15m discovery (no POLYMARKET_US_MARKET_SLUG override) for event
+    btc-updown-15m-2026-10-07-2145z. The nested market's slug here is
+    DELIBERATELY something that has nothing to do with "cpc-" + the
+    event slug -- if find_active_btc_market() ever started building
+    the market slug by string concatenation instead of reading
+    event["markets"][0]["slug"] verbatim, this test would fail by
+    asserting the wrong value. It passes precisely because
+    _to_binary_market() never does that -- see its own module
+    docstring note on this."""
+    event_slug = "btc-updown-15m-2026-10-07-2145z"
+    window_start = datetime(2026, 10, 7, 21, 45, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 22, 0, tzinfo=timezone.utc)
+    real_nested_market_slug = "totally-unrelated-internal-market-id-999"  # NOT "cpc-" + event_slug
+    event = _event(slug=event_slug, start=window_start, end=window_end, market_slug=real_nested_market_slug)
+    markets = _FakeMarkets(books={real_nested_market_slug: _book_response([_book_level("0.54", 100)], [_book_level("0.55", 100)])})
+    sdk = _FakeSDKClient(markets=markets, events=_FakeEvents({event_slug: {"event": event}}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)  # no override -- automatic discovery
+
+    market = client.find_active_btc_market(now=datetime(2026, 10, 7, 21, 47, tzinfo=timezone.utc))
+
+    assert market.condition_id == event_slug  # the EVENT's own slug
+    assert market.token_id_yes == market.token_id_no == real_nested_market_slug  # read verbatim, not synthesized
+    assert markets.book_calls == [real_nested_market_slug]  # markets.book() called with the REAL nested slug
+    assert markets.retrieve_by_slug_calls == []  # never even calls markets.retrieve_by_slug() in this path
+
+
 # --- 3. Outcome identifiers ----------------------------------------------------
 
 def test_outcome_identifiers_are_the_same_slug_for_both_sides(tmp_path):

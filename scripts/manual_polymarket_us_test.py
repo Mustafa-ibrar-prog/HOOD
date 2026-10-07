@@ -141,7 +141,21 @@ def run_manual_test(
     print(f"  closes in: {market.seconds_to_close:.0f}s ({market.close_time.isoformat()})")
 
     # --- current order book / current price / executable liquidity ----------
+    # EVENT SLUG and TRADEABLE MARKET SLUG are printed separately and
+    # explicitly here on purpose: market.condition_id is the EVENT's own
+    # slug (btc-updown-15m-...), while token_id is the NESTED market's own
+    # slug exactly as returned by event["markets"][0]["slug"] in
+    # _to_binary_market() -- NEVER synthesized by string concatenation
+    # anywhere in this codebase (see us_client.py's _to_binary_market/
+    # _get_manual_override_market). These two are genuinely different
+    # strings on the live API (confirmed: a "cpc-"-prefixed value has been
+    # observed as the real, API-returned nested market slug for at least
+    # one event) -- this print exists so that distinction, and the exact
+    # value about to be used for markets.book()/orders.create(), is never
+    # guessed at.
     token_id = market.token_id_for(outcome)
+    print(f"EVENT SLUG: {market.condition_id}")
+    print(f"TRADEABLE MARKET SLUG: {token_id}")
     try:
         order_book = client.get_order_book(token_id)
     except Exception as exc:  # noqa: BLE001 - this script's whole job is to surface exactly this kind of failure

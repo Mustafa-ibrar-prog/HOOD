@@ -414,6 +414,13 @@ def main() -> int:
 
     # --- 3. Order book + executable liquidity, for EACH outcome's own book ---
     if market is not None:
+        # market.condition_id is the EVENT's own slug; token_id below is the
+        # NESTED market's own slug, exactly as returned by
+        # event["markets"][0]["slug"] -- never synthesized by string
+        # concatenation. Printed explicitly since the two are genuinely
+        # different strings on the live API.
+        print(f"EVENT SLUG: {market.condition_id}")
+        print(f"TRADEABLE MARKET SLUG: {market.token_id_yes}")
         if args.debug_order_book:
             print("=== DEBUG: raw order-book response (public gateway data only — no credentials, no account data) ===")
         for outcome, token_id in (("YES", market.token_id_yes), ("NO", market.token_id_no)):
