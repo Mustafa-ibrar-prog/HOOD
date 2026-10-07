@@ -402,3 +402,20 @@ class PolymarketClient:
         client = self._secure_client()
         balance = client.get_balance_allowance(asset_type="COLLATERAL")
         return balance.balance / 1_000_000
+
+
+def get_polymarket_client(settings: PolymarketSettings) -> Any:
+    """Venue-selecting factory — see settings.py's module docstring on
+    POLYMARKET_VENUE. Returns whichever client implementation matches
+    settings.venue; both PolymarketClient (this module, international)
+    and PolymarketUSClient (us_client.py) expose the identical method
+    surface (find_active_btc_market, get_order_book, get_resolution,
+    place_order, get_fill_status, get_balance_usdc, refresh, close), so
+    every other module in this package — engine.py, gateway.py,
+    reconciliation.py — never needs to know or care which one it got.
+    Imports us_client lazily to avoid a module-level import cycle (that
+    module imports NoActiveMarketError/PolymarketClientError from here)."""
+    if settings.is_us_venue:
+        from src.polymarket.us_client import PolymarketUSClient
+        return PolymarketUSClient(settings)
+    return PolymarketClient(settings)

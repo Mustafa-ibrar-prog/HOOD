@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Run the Polymarket BTC 15-minute bot — an UNATTENDED loop, unlike
-scripts/run_paper_scheduler.py: client.py calls the real Polymarket API
-directly, so no agent needs to relay data each cycle. See
+scripts/run_paper_scheduler.py: client.py/us_client.py call the real
+Polymarket API directly, so no agent needs to relay data each cycle.
+POLYMARKET_VENUE selects which venue/client (see settings.py's module
+docstring) — get_polymarket_client() below returns whichever one
+matches, and nothing else in this script needs to know which. See
 src/polymarket/__init__.py before running this against real funds —
 none of the live-API code paths have been verified against the real
 API from the environment this was written in.
@@ -34,7 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.execution.emergency_stop import EmergencyStopStore  # noqa: E402
-from src.polymarket.client import PolymarketClient  # noqa: E402
+from src.polymarket.client import get_polymarket_client  # noqa: E402
 from src.polymarket.engine import MarketHistory, run_cycle  # noqa: E402
 from src.polymarket.gateway import get_execution_gateway  # noqa: E402
 from src.polymarket.logger import PolymarketDecisionLogger  # noqa: E402
@@ -53,7 +56,7 @@ def main() -> int:
     args = parser.parse_args()
 
     settings = PolymarketSettings.from_env()
-    client = PolymarketClient(settings)
+    client = get_polymarket_client(settings)
     strategy = BtcMomentumStrategy()
     risk_manager = PolymarketRiskManager(settings)
     decision_logger = PolymarketDecisionLogger(Path(settings.decision_log_file))
@@ -73,6 +76,7 @@ def main() -> int:
         order_placer=order_placer, emergency_stop_store=emergency_stop_store,
     )
 
+    print(f"POLYMARKET_VENUE={settings.venue} ({type(client).__name__})")
     print(f"POLYMARKET_TRADING_MODE={settings.trading_mode}" + (" (REAL MONEY)" if settings.is_live else " (paper — no real funds at risk)"))
     print(f"asset={settings.asset} market_duration_minutes={settings.market_duration_minutes}")
     print(f"max_bet_usd={settings.max_bet_usd} max_daily_loss_usd={settings.max_daily_loss_usd}")

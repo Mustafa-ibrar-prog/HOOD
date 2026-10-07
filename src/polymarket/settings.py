@@ -34,6 +34,32 @@ is currently used — see client.py); letting them be set independently
 risked a real, dangerous mismatch (e.g. a overridden host paired with
 the wrong chain_id). There is currently no supported way to point this
 system at anything other than real, production Polymarket.
+
+VENUE (verified by installing polymarket-us==2.3.0 from PyPI and
+inspecting its real source/types directly — see us_client.py's module
+docstring for the full trail): Polymarket US (traded via QCX LLC, a
+CFTC-regulated Designated Contract Market) is a GENUINELY DIFFERENT
+venue from international polymarket.com — different base URLs, a
+different official SDK (`polymarket-us`, not `polymarket-client`), and
+a completely different credential model (an Ed25519 API key_id +
+secret_key pair, NOT an EVM private key — there is no wallet/funder
+concept on this venue at all). POLYMARKET_VENUE selects between them:
+
+  - "international" (THE DEFAULT, for backward compatibility with any
+    existing deployment/test that predates the US venue work and never
+    sets this variable): uses client.PolymarketClient and the
+    PRIVATE_KEY/API_KEY/API_SECRET/API_PASSPHRASE/FUNDER_ADDRESS fields
+    below exactly as documented.
+  - "us": uses us_client.PolymarketUSClient and the
+    POLYMARKET_US_KEY_ID/POLYMARKET_US_SECRET_KEY fields instead. A
+    US-based trader should set POLYMARKET_VENUE=us explicitly in their
+    own .env — see .env.polymarket.example.
+
+Never log POLYMARKET_PRIVATE_KEY, POLYMARKET_API_SECRET,
+POLYMARKET_US_SECRET_KEY, or any other credential value — this module
+only ever reads them into memory for client construction; nothing in
+this package writes a credential value to a log, and that must stay
+true for anything added here.
 """
 
 from __future__ import annotations
@@ -47,6 +73,12 @@ TRADING_MODE_PAPER = "paper"
 TRADING_MODE_LIVE = "live"
 VALID_TRADING_MODES = frozenset({TRADING_MODE_PAPER, TRADING_MODE_LIVE})
 VALID_ORDER_TYPES = frozenset({"FOK", "FAK"})
+
+VENUE_INTERNATIONAL = "international"
+VENUE_US = "us"
+VALID_VENUES = frozenset({VENUE_INTERNATIONAL, VENUE_US})
+DEFAULT_US_API_BASE_URL = "https://api.polymarket.us"
+DEFAULT_US_GATEWAY_BASE_URL = "https://gateway.polymarket.us"
 
 
 class PolymarketConfigError(ValueError):
@@ -121,12 +153,21 @@ class PolymarketSettings:
     # this, not callers.
     live_auto_execute: bool
 
-    # --- Credentials (see module docstring) ------------------------------
+    # --- Venue selection (see module docstring) ---------------------------
+    venue: str
+
+    # --- Credentials, international venue (see module docstring) --------
     private_key: str | None
     api_key: str | None
     api_secret: str | None
     api_passphrase: str | None
     funder_address: str | None
+
+    # --- Credentials, US venue (see module docstring) ---------------------
+    us_key_id: str | None
+    us_secret_key: str | None
+    us_api_base_url: str
+    us_gateway_base_url: str
 
     # --- Risk controls — deliberately tiny defaults. Read every one of
     # these yourself in .env.polymarket.example before going live; they
@@ -212,13 +253,20 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE must be >= 0")
         if self.poll_interval_seconds <= 0:
             raise PolymarketConfigError("POLYMARKET_POLL_INTERVAL_SECONDS must be > 0")
+        if self.venue not in VALID_VENUES:
+            raise PolymarketConfigError(
+                f"POLYMARKET_VENUE={self.venue!r} is invalid; must be one of {sorted(VALID_VENUES)}"
+            )
 
         # --- Fail-closed credential checks (Task 7) --------------------------
         # The API-key triple is all-or-nothing, in EITHER mode: a partial
         # triple is always a configuration mistake (e.g. a typo'd env var
         # name), never a valid "use 2 of 3" state, so it's rejected
-        # regardless of paper/live — catching it here is strictly earlier
-        # and clearer than letting client.py discover it mid-request.
+        # regardless of paper/live, and regardless of venue (a stale
+        # partial triple left in a .env is still worth catching even if
+        # the active venue happens to be "us") — catching it here is
+        # strictly earlier and clearer than letting client.py discover it
+        # mid-request.
         api_parts = (self.api_key, self.api_secret, self.api_passphrase)
         if any(api_parts) and not all(api_parts):
             raise PolymarketConfigError(
@@ -226,27 +274,52 @@ class PolymarketSettings:
                 "all set or all unset -- a partial set is never valid (verified against "
                 "polymarket-client's ApiKeyCreds, which requires all three)."
             )
-        # private_key is required for ANY live trading — verified against
-        # SecureClient.create()'s real signature: private_key is a
-        # required keyword argument there even when pre-derived
-        # `credentials` are also supplied, because signing an order
-        # always needs the private key regardless of how L2 REST auth is
-        # established. This is checked here, at config-construction
-        # time, specifically so a misconfigured deployment fails before
-        # ever reaching the network, not with an opaque error from
-        # inside client.py.
-        if self.is_live and not self.private_key:
-            raise PolymarketConfigError(
-                "POLYMARKET_TRADING_MODE=live requires POLYMARKET_PRIVATE_KEY to be set — "
-                "every order is signed by this wallet; the API key triple alone cannot "
-                "substitute for it. See .env.polymarket.example."
-            )
-        if self.private_key is not None and not self.private_key.startswith("0x"):
-            raise PolymarketConfigError(
-                "POLYMARKET_PRIVATE_KEY must be a 0x-prefixed hex string — refusing to proceed "
-                "with a value that cannot be a valid EVM private key, rather than let it fail "
-                "unpredictably later inside the SDK's signer."
-            )
+
+        if self.venue == VENUE_INTERNATIONAL:
+            # private_key is required for ANY live trading on the
+            # international venue — verified against SecureClient.create()'s
+            # real signature: private_key is a required keyword argument
+            # there even when pre-derived `credentials` are also supplied,
+            # because signing an order always needs the private key
+            # regardless of how L2 REST auth is established. This is
+            # checked here, at config-construction time, specifically so a
+            # misconfigured deployment fails before ever reaching the
+            # network, not with an opaque error from inside client.py.
+            if self.is_live and not self.private_key:
+                raise PolymarketConfigError(
+                    "POLYMARKET_TRADING_MODE=live with POLYMARKET_VENUE=international "
+                    "requires POLYMARKET_PRIVATE_KEY to be set — every order is signed by "
+                    "this wallet; the API key triple alone cannot substitute for it. "
+                    "See .env.polymarket.example."
+                )
+            if self.private_key is not None and not self.private_key.startswith("0x"):
+                raise PolymarketConfigError(
+                    "POLYMARKET_PRIVATE_KEY must be a 0x-prefixed hex string — refusing to "
+                    "proceed with a value that cannot be a valid EVM private key, rather than "
+                    "let it fail unpredictably later inside the SDK's signer."
+                )
+        elif self.venue == VENUE_US:
+            # Polymarket US has NO private-key/wallet concept at all —
+            # verified by inspecting the installed polymarket-us SDK's
+            # real PolymarketUS.__init__ and auth.create_auth_headers():
+            # authentication is a UUID key_id plus a base64-encoded
+            # Ed25519 secret_key, signed per-request over
+            # f"{timestamp}{method}{path}". The two must be all-or-nothing
+            # (a lone key_id or secret_key is always a mistake), and BOTH
+            # are required before live trading — there is no partial
+            # credential state that can validly sign a real order here.
+            us_parts = (self.us_key_id, self.us_secret_key)
+            if any(us_parts) and not all(us_parts):
+                raise PolymarketConfigError(
+                    "POLYMARKET_US_KEY_ID and POLYMARKET_US_SECRET_KEY must be all set or "
+                    "all unset -- a partial pair can never authenticate."
+                )
+            if self.is_live and not all(us_parts):
+                raise PolymarketConfigError(
+                    "POLYMARKET_TRADING_MODE=live with POLYMARKET_VENUE=us requires both "
+                    "POLYMARKET_US_KEY_ID and POLYMARKET_US_SECRET_KEY to be set. "
+                    "See .env.polymarket.example."
+                )
 
     @property
     def is_paper(self) -> bool:
@@ -255,6 +328,10 @@ class PolymarketSettings:
     @property
     def is_live(self) -> bool:
         return not self.is_paper
+
+    @property
+    def is_us_venue(self) -> bool:
+        return self.venue == VENUE_US
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None, dotenv_path: Path | None = None) -> "PolymarketSettings":
@@ -266,11 +343,20 @@ class PolymarketSettings:
             trading_mode=_get_str(env, "POLYMARKET_TRADING_MODE", TRADING_MODE_PAPER).lower(),
             live_trading_confirmed=_get_bool(env, "POLYMARKET_LIVE_TRADING_CONFIRMED", False),
             live_auto_execute=_get_bool(env, "POLYMARKET_LIVE_AUTO_EXECUTE", False),
+            # Defaults to "international" for backward compatibility with
+            # any existing deployment/test that predates the US venue and
+            # never sets this — see module docstring. A US-based trader
+            # must set POLYMARKET_VENUE=us explicitly.
+            venue=_get_str(env, "POLYMARKET_VENUE", VENUE_INTERNATIONAL).lower(),
             private_key=_get_optional_str(env, "POLYMARKET_PRIVATE_KEY"),
             api_key=_get_optional_str(env, "POLYMARKET_API_KEY"),
             api_secret=_get_optional_str(env, "POLYMARKET_API_SECRET"),
             api_passphrase=_get_optional_str(env, "POLYMARKET_API_PASSPHRASE"),
             funder_address=_get_optional_str(env, "POLYMARKET_FUNDER_ADDRESS"),
+            us_key_id=_get_optional_str(env, "POLYMARKET_US_KEY_ID"),
+            us_secret_key=_get_optional_str(env, "POLYMARKET_US_SECRET_KEY"),
+            us_api_base_url=_get_str(env, "POLYMARKET_US_API_BASE_URL", DEFAULT_US_API_BASE_URL),
+            us_gateway_base_url=_get_str(env, "POLYMARKET_US_GATEWAY_BASE_URL", DEFAULT_US_GATEWAY_BASE_URL),
             max_bet_usd=_get_float(env, "POLYMARKET_MAX_BET_USD", 5.0),
             max_daily_loss_usd=_get_float(env, "POLYMARKET_MAX_DAILY_LOSS_USD", 20.0),
             max_open_positions=_get_int(env, "POLYMARKET_MAX_OPEN_POSITIONS", 1),

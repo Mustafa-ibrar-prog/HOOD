@@ -586,18 +586,49 @@ for why that constraint exists there but not here). This is a
 real-money system: correctness, fail-closed behavior, and verified API
 behavior are prioritized over speed throughout `src/polymarket/`.
 
-**SDK: `polymarket-client` (import name `polymarket`), not
-`py-clob-client`.** `py-clob-client` is ARCHIVED (its own GitHub README
-carries an explicit "no longer maintained, no longer functional"
-notice) — `polymarket-client`, published by Polymarket Engineering, is
-its real successor and requires Python >=3.11. It's declared as an
-optional `polymarket` extra in `pyproject.toml`
-(`pip install -e ".[polymarket]"`), not a hard dependency, because
-`src/polymarket/client.py` is the ONLY module that imports it, and does
-so lazily (`_sdk()`) — every other module (`models`, `risk`, `strategy`,
+**Two venues, two SDKs, selected by `POLYMARKET_VENUE`.** Polymarket US
+(traded via QCX LLC, a CFTC-regulated Designated Contract Market) and
+international polymarket.com are **genuinely different systems**, not
+regional variants of the same CLOB — verified by installing both
+official SDKs directly and inspecting their real source/types (not
+docs, not a blog post, not memory):
+
+| | `POLYMARKET_VENUE=international` (default) | `POLYMARKET_VENUE=us` |
+|---|---|---|
+| Client module | `src/polymarket/client.py` | `src/polymarket/us_client.py` |
+| SDK (PyPI / import) | `polymarket-client` / `polymarket` | `polymarket-us` / `polymarket_us` |
+| Supersedes | `py-clob-client` (ARCHIVED — its own GitHub README says so) | — |
+| Auth | EVM private key, EIP-712 order signing | Ed25519 `key_id`+`secret_key` API pair — **no wallet/private key at all** |
+| Market model | ERC-1155 YES/NO token pair, own order book each | ONE contract per `marketSlug`; YES/NO = BUY_LONG/BUY_SHORT on the same contract |
+| Settled in | USDC on Polygon | USD cash balance (brokerage-style account) |
+| Python | `>=3.11` | `>=3.10` |
+
+Both are declared as the optional `polymarket` extra in `pyproject.toml`
+(`pip install -e ".[polymarket]"`), not a hard dependency — only
+`client.py`/`us_client.py` import their respective SDK, and both do so
+lazily (`_sdk()`), so every other module (`models`, `risk`, `strategy`,
 `gateway`, `positions`, `reconciliation`, `settings`, and their tests)
-runs without it installed. See `client.py`'s module docstring for the
-full primary-source verification trail.
+runs without either installed. `src/polymarket/client.py`'s
+`get_polymarket_client(settings)` is the one factory every script uses
+— it returns whichever client matches `POLYMARKET_VENUE`, and
+`engine.py`/`gateway.py`/`reconciliation.py` never need to know or care
+which one they got, since both implement the identical method surface.
+See `client.py`'s and `us_client.py`'s module docstrings for the full
+primary-source verification trail on each venue.
+
+**A US-based trader must set `POLYMARKET_VENUE=us` explicitly** — it
+defaults to `international` for backward compatibility with any
+existing config that predates the US venue work. Two things are NOT
+yet confirmed for the US venue and must be checked against the live
+API before trusting it with real funds (see `us_client.py`'s module
+docstring for the full list): whether a Bitcoin **15-minute recurring**
+up/down market actually exists in the real catalog (Bitcoin markets as
+a category are confirmed — Polymarket US's own bundled SDK README uses
+`"btc-100k"` as its canonical order example — but not specifically this
+short-duration recurring product), and the exact pricing mechanics of
+a "bet NO" (`BUY_SHORT`) order, which this codebase maps onto the same
+ceiling-price logic as "bet YES" (`BUY_LONG`) as the most defensible
+reading of the SDK's types, not a confirmed one.
 
 **"Placed" is never treated as "filled" (the single most important
 correctness property here).** A submitted order becoming a position
@@ -680,29 +711,61 @@ is imported as-is):
   configuration mistake, not guessed at.
 
 **Not independently verified against the real API.** This was built in
-an environment whose network egress policy blocks `polymarket.com`
-outright (confirmed on both `gamma-api.polymarket.com` and
-`clob.polymarket.com`), so none of the live-network code paths in
-`src/polymarket/client.py` have actually been run against Polymarket —
-everything is instead verified against the SDK's real, current source
-code. Before trusting this with real funds:
+an environment whose network egress policy blocks both
+`*.polymarket.com` and `*.polymarket.us` outright (confirmed directly —
+`curl`'s own CONNECT-tunnel attempt is refused with a 403 from the
+sandbox's own proxy, not a response from Polymarket), so none of the
+live-network code paths in `client.py`/`us_client.py` have actually run
+against either venue — everything is instead verified against each
+SDK's real, current, installed source code and type definitions.
+Before trusting this with real funds, from a network-enabled machine:
 
-1. `pip install -e ".[polymarket]"` (the `polymarket-client` SDK is an
-   optional extra — see above; not installed in the environment this
-   was written in, and requires Python >=3.11).
-2. Copy `.env.polymarket.example` values into your real `.env` and fill
-   in credentials and risk limits — the defaults are deliberately tiny
-   placeholders, not a recommendation.
-3. Run `python3 scripts/verify_polymarket_setup.py` — a read-only check
-   (never places an order) that confirms market discovery, the order
-   book, per-outcome executable liquidity, and credentials actually
-   work against the live API before you run the bot for real.
-4. Only then: `python3 scripts/run_polymarket_bot.py` (add `--once` to
-   run a single cycle first and inspect `logs/polymarket/decisions.jsonl`
-   before leaving it running unattended). With auto-execute off (the
-   default), approve or reject a pending order with
-   `scripts/confirm_polymarket_order.py` /
-   `scripts/reject_polymarket_order.py`.
+**Windows (PowerShell), the expected live environment:**
+
+```powershell
+git clone https://github.com/Mustafa-ibrar-prog/HOOD.git
+cd HOOD
+git checkout claude/tender-cerf-e1t6ie   # or main, once this is merged
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install -e ".[polymarket]"
+copy .env.polymarket.example .env
+notepad .env   # fill in POLYMARKET_VENUE=us, POLYMARKET_US_KEY_ID, POLYMARKET_US_SECRET_KEY
+py scripts\verify_polymarket_setup.py
+```
+
+**macOS/Linux, equivalently:**
+
+```bash
+git clone https://github.com/Mustafa-ibrar-prog/HOOD.git
+cd HOOD
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[polymarket]"
+cp .env.polymarket.example .env
+$EDITOR .env
+python3 scripts/verify_polymarket_setup.py
+```
+
+Then:
+
+1. Read `scripts/verify_polymarket_setup.py`'s output carefully — it
+   prints an explicit `PASS`/`FAIL`/`SKIPPED` line per check (API
+   connectivity, BTC market discovery, each outcome's own order book
+   and executable liquidity, resolution metadata, authentication,
+   balance) and exits non-zero if anything required failed. Do not
+   proceed past a `FAIL`.
+2. Only once every required check is a real, live `PASS`: run
+   `python3 scripts/run_polymarket_bot.py --once`, inspect
+   `logs/polymarket/decisions.jsonl`, then a short multi-cycle run
+   (`--max-cycles 20`) before leaving it running unattended — still in
+   `POLYMARKET_TRADING_MODE=paper`.
+3. Only after that: consider `POLYMARKET_TRADING_MODE=live` with
+   `POLYMARKET_LIVE_AUTO_EXECUTE=false` (keep it false for the first
+   real trade) and the emergency stop still active. Approve or reject
+   the one resulting pending order by hand with
+   `scripts/confirm_polymarket_order.py` / `scripts/reject_polymarket_order.py`
+   — never auto-execute a venue's first-ever real order.
 
 The momentum-continuation strategy in `src/polymarket/strategy.py` is a
 v1 starting point (reads the market's own implied-probability trend

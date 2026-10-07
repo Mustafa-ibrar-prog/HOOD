@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.execution.emergency_stop import EmergencyStopStore  # noqa: E402
 from src.polymarket import reconciliation  # noqa: E402
-from src.polymarket.client import PolymarketClient  # noqa: E402
+from src.polymarket.client import get_polymarket_client  # noqa: E402
 from src.polymarket.gateway import LivePolymarketGateway  # noqa: E402
 from src.polymarket.logger import PolymarketDecisionLogger  # noqa: E402
 from src.polymarket.pending import PolymarketPendingOrderStore  # noqa: E402
@@ -52,7 +52,7 @@ def main() -> int:
     args = parser.parse_args()
 
     settings = PolymarketSettings.from_env()
-    client = PolymarketClient(settings)
+    client = get_polymarket_client(settings)
     decision_logger = PolymarketDecisionLogger(Path(settings.decision_log_file))
     pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file))
     position_store = PolymarketPositionStore(Path(settings.positions_file))
