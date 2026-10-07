@@ -4,62 +4,69 @@ integration test of the complete trading pipeline (discovery → order
 book → risk → preview → submission → authoritative fill → reconciliation
 → position ledger), NOT an autonomous "trade anything you find" mode.
 
-You give this script a market slug you picked yourself from the
+--market-slug is OPTIONAL. Give it a slug you picked yourself from the
 Polymarket US app (the SAME mechanism as
 scripts/verify_polymarket_setup.py --market-slug — see
 settings.py's/us_client.py's module docstrings on
 POLYMARKET_US_MARKET_SLUG: no search, no "closest available," the
-exact slug only), an outcome, a USD amount, and a max price. This
-script NEVER bypasses the gateway: it calls the exact same
+exact slug only) to test one specific market. OMIT it to use the
+normal, automatic BTC 15m discovery (find_active_btc_market() with no
+override) — this is the mode for a real production live test, since
+the current BTC 15m market changes every 15 minutes and nothing here
+should require pasting a fresh slug each cycle.
+
+This script NEVER bypasses the gateway: it calls the exact same
 gateway.py/reconciliation.py code paths scripts/confirm_polymarket_order.py
 already uses, and the exact same risk.py PolymarketRiskManager
 engine.py uses — nothing here is a shortcut around risk or reconciliation.
 
-Flow, every single time, regardless of paper or live:
-    exact market (manual override)
-    -> current order book
-    -> current price
-    -> executable liquidity
-    -> risk checks (max bet, daily loss, open positions, cooldown,
-       stale data, spread, liquidity, entry cutoff — PolymarketRiskManager,
-       the SAME class engine.py uses)
-    -> order preview (orders.preview() — never places anything)
-    -> emergency-stop check
-    -> explicit live confirmation gates
-    -> FOK/appropriate bounded order via gateway.submit_order()/confirm_and_place()
-    -> submission
-    -> authoritative fill lookup (reconciliation.reconcile_order())
-    -> position ledger
+Two distinct modes, selected ENTIRELY by POLYMARKET_TRADING_MODE (never
+by a flag on this script):
+
+PAPER (POLYMARKET_TRADING_MODE=paper, the default) — a dry run of the
+full pipeline, ending in a simulated fill. Safe to run any time, any
+number of times:
+    python3 scripts/manual_polymarket_us_test.py --outcome YES --amount 5 --max-price 0.60
+
+LIVE (POLYMARKET_TRADING_MODE=live) — prints a consolidated LIVE
+PREFLIGHT block covering every gate below, then READY FOR FIRST $<amount>
+LIVE TEST: YES/NO, and STOPS there — no order, paper or real, is placed
+by a preflight-only run. Only a SECOND, explicit invocation with
+--confirm-live goes on to actually submit, and only if the preflight
+was READY:
+    python3 scripts/manual_polymarket_us_test.py --outcome YES --amount 5 --max-price 0.60                 (preflight only)
+    python3 scripts/manual_polymarket_us_test.py --outcome YES --amount 5 --max-price 0.60 --confirm-live   (the real attempt)
 
 SAFETY — multiple independent, all-required gates before a REAL order
-can ever be placed (any one missing falls through to a PAPER dry run
-of the exact same pipeline instead):
+can ever be placed (any one missing keeps this at the preflight stage):
   1. POLYMARKET_TRADING_MODE=live
   2. POLYMARKET_LIVE_TRADING_CONFIRMED=true
-  3. --confirm-live (this script's own explicit flag)
-  4. Emergency stop not active (src/execution/emergency_stop.py)
+  3. --confirm-live (this script's own explicit flag, on its own
+     separate invocation from the preflight-only check)
+  4. Emergency stop not active (src/execution/emergency_stop.py —
+     cleared ONLY by a human, via scripts/emergency_stop_control.py;
+     this script never clears it)
   5. --amount <= POLYMARKET_MAX_BET_USD
   6. orders.preview() succeeded
-  7. PolymarketRiskManager.evaluate_new_trade().allowed
-
-Usage (read-only verification FIRST):
-    python3 scripts/verify_polymarket_setup.py --market-slug <SLUG>
-
-Then, a safe PAPER dry run of the full pipeline (no env changes needed
-— POLYMARKET_TRADING_MODE stays "paper", the default):
-    python3 scripts/manual_polymarket_us_test.py \\
-        --market-slug <SLUG> --outcome YES --amount 5 --max-price 0.60
-
-Only once that looks right, and POLYMARKET_TRADING_MODE=live /
-POLYMARKET_LIVE_TRADING_CONFIRMED=true are set and the emergency stop
-is cleared, add --confirm-live to actually attempt a real order:
-    python3 scripts/manual_polymarket_us_test.py \\
-        --market-slug <SLUG> --outcome YES --amount 5 --max-price 0.60 --confirm-live
+  7. PolymarketRiskManager.evaluate_new_trade().allowed (max bet,
+     daily loss, open positions, cooldown, stale data, spread,
+     liquidity, entry cutoff)
+  8. No existing open position (positions.py) — this is a ONE-position
+     integration test, not an averaging-down tool.
+  9. No existing pending order awaiting approval — refuses to risk a
+     duplicate/conflicting submission.
 
 --outcome accepts YES/NO (this codebase's own vocabulary) or LONG/SHORT
 (the US venue's own CreateOrderParams.intent vocabulary) — LONG/SHORT
 are normalized to YES/NO respectively; see us_client.py's
 _INTENT_FOR_OUTCOME for the reverse mapping at order-construction time.
+The outcome is ALWAYS explicit on the command line — this script never
+lets a strategy choose it.
+
+If a fill's status comes back "unknown" (get_fill_status() couldn't
+confidently interpret the exchange's response), this STOPS and reports
+it rather than assuming a fill either way, and never submits a second
+order to compensate — see run_manual_test()'s reconciliation step.
 """
 
 from __future__ import annotations
@@ -84,12 +91,16 @@ from src.polymarket.logger import PolymarketDecisionLogger  # noqa: E402
 from src.polymarket.models import OrderRequest  # noqa: E402
 from src.polymarket.pending import PolymarketPendingOrderStore  # noqa: E402
 from src.polymarket.positions import PolymarketPositionStore  # noqa: E402
-from src.polymarket.risk import PolymarketRiskManager  # noqa: E402
+from src.polymarket.risk import PolymarketRiskManager, RiskDecision  # noqa: E402
 from src.polymarket.settings import PolymarketSettings  # noqa: E402
 from src.polymarket.state import DailyPnlStateStore  # noqa: E402
 from src.polymarket.us_client import PolymarketUSClient  # noqa: E402
 
 _OUTCOME_ALIASES = {"YES": "YES", "LONG": "YES", "NO": "NO", "SHORT": "NO"}
+
+
+def _risk_result(decision: RiskDecision, name: str):
+    return next(r for r in decision.results if r.name == name)
 
 
 def run_manual_test(
@@ -109,9 +120,9 @@ def run_manual_test(
 ) -> int:
     """The testable core (argparse-free) — see module docstring for the
     full flow and safety-gate list. Returns a process exit code (0 on
-    a clean paper/live outcome including a risk/preview/live-gate
-    refusal that was handled cleanly; 1 on anything that should be
-    treated as a hard failure by a calling script)."""
+    a clean paper/live outcome including a preflight-not-ready or
+    live-gate refusal that was handled cleanly; 1 on anything that
+    should be treated as a hard failure by a calling script)."""
     now = now or datetime.now(timezone.utc)
 
     # --- Gate 5: amount <= POLYMARKET_MAX_BET_USD -----------------------------
@@ -119,9 +130,7 @@ def run_manual_test(
         print(f"REFUSING: --amount ${amount:.2f} exceeds the configured POLYMARKET_MAX_BET_USD=${settings.max_bet_usd:.2f}.")
         return 1
 
-    print(f"Emergency stop active: {emergency_stop_store.is_stopped()}")
-
-    # --- exact market (manual override) ---------------------------------------
+    # --- exact market (automatic BTC 15m discovery, or the manual override) ---
     try:
         market = client.find_active_btc_market(now=now)
     except (NoActiveMarketError, PolymarketClientError) as exc:
@@ -174,34 +183,15 @@ def run_manual_test(
     else:
         print("Preview: not available for this venue's client — treated as not confirmed for the live-gate check below.")
 
-    # --- submission, via the gateway (never bypassed) -------------------------
-    # IMPORTANT: order_placer is deliberately omitted here (always None), even
-    # in live mode. If POLYMARKET_LIVE_AUTO_EXECUTE=true happens to be set in
-    # the environment (a legitimate setting for the automated bot's own
-    # loop — see run_polymarket_bot.py), passing a real order_placer here
-    # would let gateway.submit_order() auto-submit the live order on the
-    # spot, bypassing this script's own --confirm-live / preview-success
-    # gates below entirely. This script supplies the order_placer only to
-    # the explicit confirm_and_place() call further down, once every gate
-    # has independently passed.
-    try:
-        gateway = get_execution_gateway(
-            settings, decision_logger, pending_store=pending_store if settings.is_live else None,
-            order_placer=None, emergency_stop_store=emergency_stop_store,
-        )
-        result = gateway.submit_order(order)
-    except LiveTradingDisabledError as exc:
-        # e.g. POLYMARKET_TRADING_MODE=live but POLYMARKET_LIVE_TRADING_CONFIRMED
-        # is not true -- LivePolymarketGateway.__init__ itself refuses to
-        # construct in that state. Fail closed with a clear message instead
-        # of an unhandled traceback.
-        print(f"REFUSING: {exc}")
-        return 1
-
-    if result.status == "simulated_fill":
-        if confirm_live:
-            print("NOTE: --confirm-live was passed, but POLYMARKET_TRADING_MODE is not \"live\" — "
-                  "this was a PAPER-only dry run of the full pipeline; no real order was ever possible.")
+    # --- PAPER MODE: unchanged dry run of the full pipeline -------------------
+    if not settings.is_live:
+        try:
+            gateway = get_execution_gateway(settings, decision_logger, order_placer=None, emergency_stop_store=emergency_stop_store)
+            result = gateway.submit_order(order)
+        except LiveTradingDisabledError as exc:
+            print(f"REFUSING: {exc}")
+            return 1
+        assert result.status == "simulated_fill"
         assert result.fill_result is not None
         position = reconciliation.record_fill(
             result.fill_result, order, result.fill_result.order_id,
@@ -211,66 +201,160 @@ def run_manual_test(
         print("Position created." if position is not None else "No new position (already reconciled — idempotent).")
         return 0
 
-    if result.status == "awaiting_approval":
-        pending_id = result.extra["pending_order_id"]
-        print(f"Order is PENDING APPROVAL (pending_order_id={pending_id}) — nothing has reached the exchange yet.")
+    # --- LIVE MODE: consolidated preflight, then an explicit second step ------
+    stopped = emergency_stop_store.is_stopped()
+    open_positions = position_store.load()
+    conflicting_pending = [p for p in pending_store.load() if p.status == "awaiting_approval"]
+    live_confirmed = settings.live_trading_confirmed  # settings.is_live is already true here
 
-        # --- Gates 1-4, 6: ALL required before a real order is attempted -----
-        if not confirm_live:
-            print("--confirm-live was not passed — stopping here. No real order placed.")
-            return 0
-        if not (settings.is_live and settings.live_trading_confirmed):
-            print("REFUSING: --confirm-live was passed, but POLYMARKET_TRADING_MODE=live and "
-                  "POLYMARKET_LIVE_TRADING_CONFIRMED=true are not BOTH set. No order placed.")
-            return 1
-        if emergency_stop_store.is_stopped():
-            print("REFUSING: the emergency stop is ACTIVE. No order placed.")
-            return 1
+    entry_cutoff_ok = _risk_result(decision, "ENTRY_CUTOFF").passed
+    ready = (
+        decision.allowed and preview_ok and not stopped and live_confirmed
+        and not open_positions and not conflicting_pending
+    )
+
+    auth_ok = True
+    auth_error = ""
+    print("")
+    print("LIVE PREFLIGHT")
+    print(f"API: reached (market + order book retrieved from the live venue)")
+    try:
+        balance = client.get_balance_usdc()
+        print(f"AUTH: OK")
+        print(f"BALANCE: ${balance:.2f}")
+    except Exception as exc:  # noqa: BLE001 - authentication/balance failing is a real, reportable gate, not a crash
+        auth_ok = False
+        auth_error = f"{type(exc).__name__}: {exc}"
+        print(f"AUTH: FAILED ({auth_error})")
+        print(f"BALANCE: unknown")
+    ready = ready and auth_ok
+    print(f"CURRENT BTC 15M: {market.question!r} (condition_id={market.condition_id})")
+    print(f"NESTED MARKET: {token_id}")
+    print(f"BEST BID: {order_book.best_bid}")
+    print(f"BEST ASK: {order_book.best_ask}")
+    print(f"SPREAD: {order_book.spread_pct}")
+    print(f"LIQUIDITY: ${liquidity:.2f}")
+    print(f"ENTRY CUTOFF: {'PASS' if entry_cutoff_ok else 'FAIL'} ({market.seconds_to_close:.0f}s remaining)")
+    print(f"RISK: {'PASS' if decision.allowed else 'FAIL'}")
+    print(f"PREVIEW: {'PASS' if preview_ok else 'FAIL'}")
+    print(f"EMERGENCY STOP: {'ACTIVE' if stopped else 'CLEARED'}")
+    print(f"OPEN POSITIONS: {len(open_positions)}")
+    print(f"PENDING ORDERS: {len(conflicting_pending)}")
+    print("")
+    print(f"READY FOR FIRST ${amount:.0f} LIVE TEST: {'YES' if ready else 'NO'}")
+
+    if not ready:
+        print("")
+        print("STOP. The following gate(s) are not satisfied:")
+        if not auth_ok:
+            print(f"  - AUTH: {auth_error}")
+        if not decision.allowed:
+            print("  - RISK: one or more risk checks failed (see Risk checks above).")
         if not preview_ok:
-            print("REFUSING: orders.preview() did not succeed. An order is never placed live without "
-                  "a successful preview first.")
-            return 1
+            print("  - PREVIEW: orders.preview() did not succeed.")
+        if stopped:
+            print("  - EMERGENCY STOP: active. Clear it yourself (a human, not this script) via "
+                  "scripts/emergency_stop_control.py clear --authorized-by <you> --reason <...> "
+                  "only once every other gate above is already satisfied.")
+        if not live_confirmed:
+            print("  - POLYMARKET_LIVE_TRADING_CONFIRMED is not true.")
+        if open_positions:
+            print(f"  - OPEN POSITIONS: {len(open_positions)} existing open position(s) — this is a "
+                  "one-position integration test, not an averaging-down tool.")
+        if conflicting_pending:
+            print(f"  - PENDING ORDERS: {len(conflicting_pending)} pending order(s) already awaiting "
+                  "approval — resolve or let those expire before attempting a new one.")
+        print("No order (paper or live) was attempted.")
+        return 1
 
-        try:
-            confirmed = gateway.confirm_and_place(pending_id, client, approved_by="user:manual-test")
-        except (LiveTradingDisabledError, PendingOrderNotActionableError) as exc:
-            print(f"REFUSING: {exc}")
-            return 1
-        print(f"Submission result: {confirmed.status}")
-        if confirmed.status != "submitted":
-            print(f"  error: {confirmed.error}")
-            return 1
-
-        pending = pending_store.get(pending_id)
-        fill = reconciliation.reconcile_order(
-            pending, client=client, pending_store=pending_store, position_store=position_store,
-            state_store=state_store, decision_logger=decision_logger, now=now,
-        )
-        if fill is None:
-            print("Reconciliation: nothing to reconcile (unexpected for a freshly-submitted order).")
-            return 1
-        print(f"Fill status: {fill.status} filled_shares={fill.filled_shares} avg_fill_price={fill.avg_fill_price}")
-        print("POSITION OPENED" if fill.is_fill else "No position opened (order did not fill).")
+    if not confirm_live:
+        print("")
+        print("Preflight PASSED. Nothing has been submitted. Re-run this EXACT command with "
+              "--confirm-live to actually attempt the live order.")
         return 0
 
-    print(f"Submission result: {result.status} (error={result.error})")
-    return 1
+    # --- Only now: READY=YES and --confirm-live both hold. Submit for real. --
+    try:
+        gateway = get_execution_gateway(
+            settings, decision_logger, pending_store=pending_store, order_placer=None,
+            emergency_stop_store=emergency_stop_store,
+        )
+        result = gateway.submit_order(order)
+    except LiveTradingDisabledError as exc:
+        print(f"REFUSING: {exc}")
+        return 1
+    assert result.status == "awaiting_approval"
+    pending_id = result.extra["pending_order_id"]
+
+    try:
+        confirmed = gateway.confirm_and_place(pending_id, client, approved_by="user:manual-test")
+    except (LiveTradingDisabledError, PendingOrderNotActionableError) as exc:
+        print("")
+        print("LIVE ORDER:")
+        print(f"ORDER ID: {pending_id}")
+        print(f"SUBMISSION: refused")
+        print(f"ERROR: {exc}")
+        return 1
+
+    print("")
+    print("LIVE ORDER:")
+    print(f"ORDER ID: {pending_id}")
+    print(f"SUBMISSION: {confirmed.status}")
+    if confirmed.status != "submitted":
+        print(f"FILL STATUS: n/a (never reached the exchange)")
+        print(f"ERROR: {confirmed.error}")
+        return 1
+
+    pending = pending_store.get(pending_id)
+    fill = reconciliation.reconcile_order(
+        pending, client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger, now=now,
+    )
+    if fill is None:
+        print("FILL STATUS: n/a (nothing to reconcile -- unexpected for a freshly-submitted order)")
+        print("ERROR: reconciliation returned nothing to reconcile")
+        return 1
+    if fill.status == "unknown":
+        print(f"FILL STATUS: unknown")
+        print(f"FILLED SHARES: {fill.filled_shares}")
+        print(f"AVG FILL PRICE: {fill.avg_fill_price}")
+        print(f"POSITION CREATED: NO")
+        print(f"RECONCILIATION: done (status unknown — recorded, NOT treated as a fill)")
+        print("ERROR: fill status is unknown -- do not assume a fill. Investigate manually "
+              "(check the order on the Polymarket US app/orders.retrieve()) before taking any "
+              "further action. No second order was submitted.")
+        return 1
+
+    print(f"FILL STATUS: {fill.status}")
+    print(f"FILLED SHARES: {fill.filled_shares}")
+    print(f"AVG FILL PRICE: {fill.avg_fill_price}")
+    print(f"POSITION CREATED: {'YES' if fill.is_fill else 'NO'}")
+    print(f"RECONCILIATION: done")
+    print(f"OPEN POSITIONS NOW: {len(position_store.load())}")
+    print(f"ERROR: none")
+    return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--market-slug", required=True, metavar="SLUG")
+    parser.add_argument(
+        "--market-slug", default=None, metavar="SLUG",
+        help="OPTIONAL. A specific market/event slug to test instead of automatic BTC 15m discovery. "
+             "Omit this for a real production live test -- the current BTC market is found automatically.",
+    )
     parser.add_argument("--outcome", required=True, choices=sorted(_OUTCOME_ALIASES))
     parser.add_argument("--amount", required=True, type=float, help="USD size — capped at POLYMARKET_MAX_BET_USD")
     parser.add_argument("--max-price", required=True, type=float, dest="max_price")
     parser.add_argument(
         "--confirm-live", action="store_true",
-        help="Required (along with POLYMARKET_TRADING_MODE=live and POLYMARKET_LIVE_TRADING_CONFIRMED=true "
-             "and a cleared emergency stop) to attempt a REAL order. Without it, this is always a paper dry run.",
+        help="Required (along with POLYMARKET_TRADING_MODE=live, POLYMARKET_LIVE_TRADING_CONFIRMED=true, "
+             "a cleared emergency stop, and a READY preflight) to attempt a REAL order. Without it, in live "
+             "mode this only prints the preflight and stops; in paper mode it is ignored.",
     )
     args = parser.parse_args()
 
-    os.environ["POLYMARKET_US_MARKET_SLUG"] = args.market_slug
+    if args.market_slug:
+        os.environ["POLYMARKET_US_MARKET_SLUG"] = args.market_slug
     settings = PolymarketSettings.from_env()
     if not settings.is_us_venue:
         print("REFUSING: this script is Polymarket US only — set POLYMARKET_VENUE=us.")

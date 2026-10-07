@@ -34,12 +34,14 @@ from scripts.manual_polymarket_us_test import main, run_manual_test  # noqa: E40
 from src.execution.emergency_stop import EmergencyStopStore  # noqa: E402
 from src.polymarket import reconciliation  # noqa: E402
 from src.polymarket.logger import PolymarketDecisionLogger  # noqa: E402
+from src.polymarket.models import OrderRequest, PendingLiveOrder  # noqa: E402
 from src.polymarket.pending import PolymarketPendingOrderStore  # noqa: E402
-from src.polymarket.positions import PolymarketPositionStore  # noqa: E402
+from src.polymarket.positions import OpenPosition, PolymarketPositionStore  # noqa: E402
 from src.polymarket.settings import PolymarketSettings  # noqa: E402
 from src.polymarket.state import DailyPnlStateStore  # noqa: E402
 from src.polymarket.us_client import PolymarketUSClient  # noqa: E402
 from tests.test_polymarket_us_client import (  # noqa: E402
+    _FakeAccount,
     _FakeEvents,
     _FakeMarkets,
     _FakeOrders,
@@ -80,7 +82,8 @@ def _happy_sdk(slug: str, *, orders: _FakeOrders | None = None) -> _FakeSDKClien
     return _FakeSDKClient(
         events=_FakeEvents({slug: {"event": _happy_event(slug)}}),
         markets=_FakeMarkets(books={slug: _good_book()}),
-        orders=orders or _FakeOrders(),
+        orders=orders or _FakeOrders(preview_response={"order": {"id": "preview-ok"}}),
+        account=_FakeAccount(response={"balances": [{"currency": "USD", "currentBalance": 51.58}]}),
     )
 
 
@@ -129,9 +132,10 @@ def test_paper_mode_default_opens_a_position_from_a_simulated_fill(tmp_path, cap
 
 
 def test_confirm_live_in_paper_mode_is_still_only_a_paper_dry_run(tmp_path, capsys):
-    """--confirm-live alone, without POLYMARKET_TRADING_MODE=live, must
-    never place a real order -- it silently falls through to the exact
-    same paper pipeline, with a note explaining why."""
+    """--confirm-live is a LIVE-mode-only concept: in paper mode
+    (POLYMARKET_TRADING_MODE=paper) it is simply ignored, and the exact
+    same paper pipeline runs regardless, ending in a simulated fill --
+    never a real order."""
     slug = "manual-test-market-2"
     sdk = _happy_sdk(slug)
     client = PolymarketUSClient(_settings(slug), sdk_client=sdk)
@@ -141,7 +145,7 @@ def test_confirm_live_in_paper_mode_is_still_only_a_paper_dry_run(tmp_path, caps
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "PAPER-only dry run" in out
+    assert "PAPER FILL" in out
     assert sdk.orders.create_calls == []  # never actually submitted anywhere
 
 
@@ -252,25 +256,28 @@ def test_no_slug_set_falls_through_to_btc_15m_discovery(tmp_path, capsys):
 
 # --- Live mode: every gate is independently required ------------------------
 
-def test_live_without_confirm_live_flag_stops_at_awaiting_approval(tmp_path, capsys):
-    """Gate 3 missing: POLYMARKET_TRADING_MODE=live and
-    LIVE_TRADING_CONFIRMED=true are set, but --confirm-live was not
-    passed -- must stop cleanly with no submission, return 0 (this is
-    an expected, clean stop, not a failure)."""
+def test_live_without_confirm_live_flag_stops_after_a_ready_preflight(tmp_path, capsys):
+    """Gate 3 missing: every other gate is satisfied (a READY
+    preflight), but --confirm-live was not passed -- must stop cleanly
+    with no submission at all (not even a pending order created),
+    return 0 (this is an expected, clean stop, not a failure)."""
     slug = "manual-test-live-1"
     sdk = _happy_sdk(slug)
     settings = _settings(
         slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
     )
     client = PolymarketUSClient(settings, sdk_client=sdk)
-    stores = _stores(tmp_path)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
 
     rc = _run(settings, client, stores, confirm_live=False)
 
     assert rc == 0
-    assert "No real order placed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "READY FOR FIRST $5 LIVE TEST: YES" in out
+    assert "Preflight PASSED" in out
     assert sdk.orders.create_calls == []
     assert stores["position_store"].load() == []
+    assert stores["pending_store"].load() == []  # preflight-only must never create a pending order
 
 
 def test_live_trading_not_confirmed_is_refused_even_with_confirm_live(tmp_path, capsys):
@@ -289,7 +296,9 @@ def test_live_trading_not_confirmed_is_refused_even_with_confirm_live(tmp_path, 
     rc = _run(settings, client, stores, confirm_live=True)
 
     assert rc == 1
-    assert "REFUSING" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "READY FOR FIRST $5 LIVE TEST: NO" in out
+    assert "POLYMARKET_LIVE_TRADING_CONFIRMED is not true" in out
     assert sdk.orders.create_calls == []
 
 
@@ -306,7 +315,9 @@ def test_emergency_stop_active_refuses_a_live_attempt(tmp_path, capsys):
     rc = _run(settings, client, stores, confirm_live=True)
 
     assert rc == 1
-    assert "emergency stop is ACTIVE" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "READY FOR FIRST $5 LIVE TEST: NO" in out
+    assert "EMERGENCY STOP: active" in out
     assert sdk.orders.create_calls == []
 
 
@@ -352,8 +363,8 @@ def test_live_submission_that_fills_opens_a_position(tmp_path, capsys):
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Submission result: submitted" in out
-    assert "POSITION OPENED" in out
+    assert "SUBMISSION: submitted" in out
+    assert "POSITION CREATED: YES" in out
     positions = stores["position_store"].load()
     assert len(positions) == 1
     assert positions[0].condition_id == slug
@@ -376,7 +387,7 @@ def test_live_submission_that_does_not_fill_opens_no_position(tmp_path, capsys):
     rc = _run(settings, client, stores, confirm_live=True)
 
     assert rc == 0
-    assert "No position opened" in capsys.readouterr().out
+    assert "POSITION CREATED: NO" in capsys.readouterr().out
     assert stores["position_store"].load() == []
 
 
@@ -421,6 +432,113 @@ def test_bad_outcome_is_rejected_by_argparse(monkeypatch):
     ])
     with pytest.raises(SystemExit):
         main()
+
+
+def test_live_existing_open_position_blocks_the_preflight(tmp_path, capsys):
+    """Gate 8: an existing open position must block a new live attempt
+    -- this is a one-position integration test, never an
+    averaging-down tool."""
+    slug = "manual-test-live-positions"
+    sdk = _happy_sdk(slug)
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+    stores["position_store"].add_if_absent(OpenPosition(
+        condition_id="some-other-market", token_id="some-other-market", outcome="YES",
+        requested_size_usd=5.0, filled_shares=8.0, avg_fill_price=0.55, order_id="ord-prior",
+        client_order_id="prior-1", status="filled", opened_at=_real_now(), close_time=_real_now(),
+    ))
+
+    rc = _run(settings, client, stores, confirm_live=True)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "READY FOR FIRST $5 LIVE TEST: NO" in out
+    assert "OPEN POSITIONS: 1 existing open position" in out
+    assert sdk.orders.create_calls == []
+
+
+def test_live_existing_pending_order_blocks_the_preflight(tmp_path, capsys):
+    """Gate 9: a pending order already awaiting approval must block a
+    new live attempt -- refuses to risk a duplicate/conflicting
+    submission."""
+    slug = "manual-test-live-pending"
+    sdk = _happy_sdk(slug)
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+    prior_order = OrderRequest(
+        condition_id="some-other-market", token_id="some-other-market", outcome="YES", side="BUY",
+        size_usd=5.0, max_price=0.55, close_time=_real_now() + timedelta(minutes=5), reason="prior test",
+    )
+    stores["pending_store"].add(PendingLiveOrder.new(order=prior_order, expiry_seconds=600))
+
+    rc = _run(settings, client, stores, confirm_live=True)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "READY FOR FIRST $5 LIVE TEST: NO" in out
+    assert "PENDING ORDERS: 1 pending order" in out
+    assert sdk.orders.create_calls == []
+
+
+def test_live_unknown_fill_status_stops_and_does_not_assume_a_fill(tmp_path, capsys):
+    """If get_fill_status() can't confidently interpret the exchange's
+    response, this must STOP and report it, never assume a fill either
+    way, and never submit a second order automatically."""
+    slug = "manual-test-live-unknown-fill"
+    orders = _FakeOrders(
+        preview_response={"order": {"id": "preview-ok"}},
+        create_response={"id": "ord-live-unknown", "executions": []},
+        retrieve_responses={"ord-live-unknown": _order_response("ORDER_STATE_SOMETHING_NEW_WE_DONT_KNOW", quantity=8, cum=0)},
+    )
+    sdk = _happy_sdk(slug, orders=orders)
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+
+    rc = _run(settings, client, stores, confirm_live=True)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "FILL STATUS: unknown" in out
+    assert "do not assume a fill" in out
+    assert stores["position_store"].load() == []
+    assert len(sdk.orders.create_calls) == 1  # exactly one submission attempt -- no automatic retry/second order
+
+
+def test_live_mode_with_no_market_slug_uses_automatic_btc_discovery(tmp_path, capsys):
+    """--market-slug is optional: with POLYMARKET_US_MARKET_SLUG unset,
+    even in live mode, the preflight resolves the market via the real
+    automatic BTC 15m discovery path -- a production live test must
+    never require pasting a fresh slug every 15 minutes."""
+    now = _real_now()
+    settings_no_slug = PolymarketSettings.from_env(env={
+        "POLYMARKET_VENUE": "us", **_LIVE_CREDS,
+        "POLYMARKET_TRADING_MODE": "live", "POLYMARKET_LIVE_TRADING_CONFIRMED": "true",
+    })
+    client = PolymarketUSClient(settings_no_slug)
+    window_start, window_end = client._current_window(now)
+    btc_slug = client._expected_event_slug(window_start)
+    event = _event(slug=btc_slug, start=window_start, end=window_end, market_slug=btc_slug, title="BTC Up or Down 15m")
+    sdk = _FakeSDKClient(
+        events=_FakeEvents({btc_slug: {"event": event}}), markets=_FakeMarkets(books={btc_slug: _good_book()}),
+        orders=_FakeOrders(preview_response={"order": {"id": "preview-ok"}}),
+        account=_FakeAccount(response={"balances": [{"currency": "USD", "currentBalance": 51.58}]}),
+    )
+    client = PolymarketUSClient(settings_no_slug, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+
+    _run(settings_no_slug, client, stores, confirm_live=False)
+
+    out = capsys.readouterr().out
+    assert f"CURRENT BTC 15M: 'BTC Up or Down 15m' (condition_id={btc_slug})" in out
 
 
 def test_non_us_venue_is_refused(monkeypatch, tmp_path, capsys):

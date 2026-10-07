@@ -767,64 +767,89 @@ Then:
    `scripts/confirm_polymarket_order.py` / `scripts/reject_polymarket_order.py`
    — never auto-execute a venue's first-ever real order.
 
-**Manual market test mode — testing the real order/fill pipeline
-against one market you choose, independent of BTC discovery.**
-`POLYMARKET_US_MARKET_SLUG` (POLYMARKET_VENUE=us only; see
-`.env.polymarket.example`) makes `find_active_btc_market()` retrieve
-ONLY that exact market/event slug instead of running BTC 15m
-discovery — no search, no "closest available," no fallback; the
-returned market's own slug/active/closed fields are verified before
-being trusted. This is for testing the complete pipeline (discovery →
-order book → risk checks → preview → submission → authoritative fill →
-reconciliation → position ledger) against a market you picked yourself
-in the Polymarket US app, and does not require it to be a BTC market at
-all. Every existing safety control (bet-size/daily-loss/open-position/
+**Manual market test mode / the first live test.**
+`scripts/manual_polymarket_us_test.py`'s behavior is selected ENTIRELY
+by `POLYMARKET_TRADING_MODE` — never by a flag:
+
+- **`POLYMARKET_TRADING_MODE=paper`** (the default): a dry run of the
+  full pipeline (discovery → order book → risk → preview → simulated
+  fill → reconciliation → position ledger), safe to run any time, any
+  number of times.
+- **`POLYMARKET_TRADING_MODE=live`**: prints a consolidated **LIVE
+  PREFLIGHT** block (API/auth/balance, the current market, best
+  bid/ask, spread, liquidity, entry cutoff, risk, preview, emergency
+  stop, open positions, pending orders) and a **READY FOR FIRST $&lt;N&gt;
+  LIVE TEST: YES/NO** verdict, then STOPS — no order, paper or real, is
+  placed by this preflight-only run. Only a SECOND, separate invocation
+  with `--confirm-live` goes on to actually submit, and only if that
+  preflight said YES.
+
+`--market-slug` is OPTIONAL. Omit it to use the normal, automatic BTC
+15m discovery (the mode for a real production live test — the current
+BTC market changes every 15 minutes and nothing here should require
+pasting a fresh slug each cycle). Give it an exact market/event slug
+copied from the Polymarket US app (e.g. `btc-updown-15m-2026-10-06-1745z`)
+to test one specific market instead — no search, no "closest
+available," no fallback; see `POLYMARKET_US_MARKET_SLUG` in
+`.env.polymarket.example`.
+
+Every existing safety control (bet-size/daily-loss/open-position/
 cooldown/stale-data/spread/liquidity/entry-cutoff risk checks, the
 emergency stop, the live-trading-confirmation switches, actual-fill
-reconciliation) still applies — nothing here bypasses `risk.py` or
-`gateway.py`.
+reconciliation) applies in both modes, plus two LIVE-only gates: no
+existing open position, and no pending order already awaiting
+approval — this is a ONE-position integration test, never an
+averaging-down tool. Nothing here bypasses `risk.py` or `gateway.py`.
+If a fill ever comes back `status="unknown"`, the script stops and
+reports it rather than assuming a fill either way, and never submits a
+second order to compensate.
 
-1. Pick an exact market or event slug from the Polymarket US app (the
-   part of the URL after the market/event name — e.g.
-   `btc-updown-15m-2026-10-06-1745z`). Put it where `<SLUG>` appears
-   below.
-2. Read-only verification FIRST — never places an order:
+**The emergency stop is never cleared by any script.**
+`scripts/emergency_stop_control.py` is the one, human-operated way to
+check/trip/clear it:
+```powershell
+py scripts\emergency_stop_control.py status
+py scripts\emergency_stop_control.py clear --authorized-by "YourName" --reason "cleared for the first $5 live test"
+py scripts\emergency_stop_control.py activate --reason "done testing"
+```
+`clear` requires a real identity (it rejects anything starting with
+`system:`) — there is no code path anywhere in this codebase that
+clears a stop on its own.
+
+**The first $5 live test, step by step:**
+
+1. Read-only verification first — never places an order (works with or
+   without `--market-slug`):
    ```powershell
-   py scripts\verify_polymarket_setup.py --market-slug <SLUG>
+   py scripts\verify_polymarket_setup.py
    ```
-   (macOS/Linux: `python3 scripts/verify_polymarket_setup.py --market-slug <SLUG>`.)
-   This prints the exact title, slug, end time, order book, best
-   bid/ask, and executable liquidity for that one market. Do not
+   (macOS/Linux: `python3 scripts/verify_polymarket_setup.py`.) Do not
    proceed past a `FAIL`.
-3. A safe PAPER dry run of the full pipeline — no env changes needed,
-   `POLYMARKET_TRADING_MODE` stays `paper` (the default):
+2. In `.env`, set `POLYMARKET_TRADING_MODE=live`,
+   `POLYMARKET_LIVE_TRADING_CONFIRMED=true`, and keep
+   `POLYMARKET_LIVE_AUTO_EXECUTE=false` — leave the emergency stop
+   ACTIVE for now.
+3. Run the preflight (no `--confirm-live`, so nothing is submitted):
    ```powershell
-   py scripts\manual_polymarket_us_test.py --market-slug <SLUG> --outcome YES --amount 5 --max-price 0.60
+   py scripts\manual_polymarket_us_test.py --outcome YES --amount 5 --max-price 0.60
    ```
-   (macOS/Linux: `python3 scripts/manual_polymarket_us_test.py --market-slug <SLUG> --outcome YES --amount 5 --max-price 0.60`.)
-   `--outcome` accepts `YES`/`NO` or the US venue's own `LONG`/`SHORT`.
-   This always previews the order (`orders.preview()`) and runs every
-   risk check, but — in paper mode — only ever simulates the fill; no
-   real order is possible here regardless of any flag.
-4. Only once that output looks right, set
-   `POLYMARKET_TRADING_MODE=live` and `POLYMARKET_LIVE_TRADING_CONFIRMED=true`
-   in `.env`, clear the emergency stop, and add `--confirm-live` to
-   actually attempt ONE real order (start at `--amount 5` or less —
-   never above your configured `POLYMARKET_MAX_BET_USD`):
+   Review the **LIVE PREFLIGHT** block. It will say `READY: NO` as
+   long as the emergency stop is active — that's expected.
+4. Only once every other line is clean, clear the emergency stop
+   yourself (step above), then re-run the SAME preflight command and
+   confirm it now says `READY FOR FIRST $5 LIVE TEST: YES`.
+5. Only now, re-run the EXACT same command with `--confirm-live`
+   added. This is the one real order:
    ```powershell
-   py scripts\manual_polymarket_us_test.py --market-slug <SLUG> --outcome YES --amount 5 --max-price 0.60 --confirm-live
+   py scripts\manual_polymarket_us_test.py --outcome YES --amount 5 --max-price 0.60 --confirm-live
    ```
-   Without `--confirm-live`, this is always a paper dry run — the real
-   order is attempted only when `--confirm-live`,
-   `POLYMARKET_TRADING_MODE=live`, `POLYMARKET_LIVE_TRADING_CONFIRMED=true`,
-   a cleared emergency stop, AND a successful preview are ALL true at
-   once; any one missing falls through to the same paper dry run as
-   step 3, or refuses outright with a printed reason.
-
-Once the plumbing is proven against a market you chose, go back to
-`POLYMARKET_US_MARKET_SLUG` unset (the default) for the normal
-automatic BTC 15m strategy — this override is test-only and never
-alters BTC discovery or the strategy itself.
+6. Read the **LIVE ORDER** block (order id, submission result, fill
+   status, filled shares, avg fill price, whether a position was
+   created, reconciliation, error). Re-activate the emergency stop
+   afterward (`scripts/emergency_stop_control.py activate ...`) and do
+   NOT set `POLYMARKET_LIVE_AUTO_EXECUTE=true` until you've separately
+   watched this one position through resolution → settlement →
+   realized P&L → removal → cooldown.
 
 The momentum-continuation strategy in `src/polymarket/strategy.py` is a
 v1 starting point (reads the market's own implied-probability trend
