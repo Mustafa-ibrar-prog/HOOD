@@ -155,6 +155,25 @@ _INTENT_FOR_OUTCOME = {"YES": "ORDER_INTENT_BUY_LONG", "NO": "ORDER_INTENT_BUY_S
 # polymarket_us.types.orders.CreateOrderParams's own Literal.
 _TIF_FOR_ORDER_TYPE = {"FOK": "TIME_IN_FORCE_FILL_OR_KILL", "FAK": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"}
 
+# Market discovery (see find_active_btc_market's docstring): synonyms
+# for settings.asset, since a real Polymarket US event titled "BTC Up
+# or Down 15m" never contains the literal word "bitcoin" — confirmed
+# against the live API (POLYMARKET_ASSET=bitcoin, real title uses
+# "BTC"). Extend this map if another asset needs the same treatment;
+# an asset with no entry here falls back to matching its own literal
+# name only.
+_ASSET_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "bitcoin": ("bitcoin", "btc"),
+}
+
+# The structural signal that distinguishes the recurring "<asset> Up or
+# Down <N>m" product from any OTHER market that happens to mention the
+# asset (a price-target market like "Bitcoin price at the end of
+# 2026", or "How high will Bitcoin get this year?") — those are real,
+# legitimate Bitcoin markets on this venue, just not THIS recurring
+# up/down product, so matching the asset name alone is not enough.
+_UP_DOWN_PATTERNS = ("up or down", "up/down", "up-or-down", "updown")
+
 # Order.state -> this system's FillStatus vocabulary (models.py). Only
 # states with cumQuantity > 0 may map to "filled"/"partially_filled" —
 # get_fill_status() enforces that itself rather than trusting this map
@@ -255,14 +274,46 @@ class PolymarketUSClient:
 
     # --- Market discovery (public data, no credentials needed) ---------------
     def find_active_btc_market(self, *, now: datetime | None = None) -> BinaryMarket:
-        """UNVERIFIED (see module docstring item 1): search.query() is
-        the SDK's own documented topic-search method, but whether any
-        matching event is actually a 15-minute recurring BTC up/down
-        market — as opposed to some other Bitcoin-related market
-        entirely — has never been confirmed against a live catalog."""
+        """Finds the open event for settings.asset's recurring "Up or
+        Down" product whose duration is closest to
+        settings.market_duration_minutes.
+
+        LIVE-VERIFIED FIX: the first version of this method required
+        the literal word "bitcoin" in the event title, which never
+        matched the real event ("BTC Up or Down 15m" — confirmed live
+        against the real catalog with POLYMARKET_ASSET=bitcoin: the
+        actual title uses "BTC", not "Bitcoin"). Fixed with two
+        independent, deliberately narrow signals — see
+        _event_matches_configured_product():
+          1. An asset-name match broadened with real synonyms
+             (_ASSET_SYNONYMS), not the literal settings.asset string.
+          2. A required "up or down" structural pattern
+             (_UP_DOWN_PATTERNS), so a genuinely different Bitcoin
+             market that merely mentions "bitcoin"/"btc" — a
+             price-target market like "Bitcoin price at the end of
+             2026", or "How high will Bitcoin get this year?" — is
+             never selected just because it matches the asset name.
+          3. search.query() can also return events whose title+pattern
+             match the right PRODUCT but the wrong CADENCE (e.g. an
+             hourly "BTC Up or Down 1h" instead of the 15-minute one) —
+             a hard duration tolerance (not just "closest available")
+             rejects those outright rather than silently settling for
+             the nearest wrong-duration market when nothing closer
+             exists.
+        A caller that has learned the product's actual, stable Series
+        slug from the live catalog should set
+        POLYMARKET_US_BTC_SERIES_SLUG — see settings.py — which pins
+        discovery to that exact series instead of the text heuristic.
+        """
         now = now or datetime.now(timezone.utc)
         client = self._client()
         target_seconds = self._settings.market_duration_minutes * 60
+        # At least 5 minutes, or 50% of the target duration, whichever
+        # is larger -- wide enough to tolerate a real event's start/end
+        # not landing on an exact multiple of market_duration_minutes,
+        # narrow enough to still reject a wrong-cadence variant of the
+        # same product (e.g. 1h when the target is 15m) outright.
+        tolerance_seconds = max(300.0, target_seconds * 0.5)
 
         response = client.search.query({"query": self._settings.asset, "status": "active"})
         events = response.get("events") or []
@@ -270,8 +321,7 @@ class PolymarketUSClient:
         best = None
         best_diff: float | None = None
         for event in events:
-            title = (event.get("title") or "").lower()
-            if self._settings.asset not in title:
+            if not self._event_matches_configured_product(event):
                 continue
             start = _parse_dt(event.get("startTime"))
             end = _parse_dt(event.get("endTime"))
@@ -279,18 +329,51 @@ class PolymarketUSClient:
                 continue
             duration = (end - start).total_seconds()
             diff = abs(duration - target_seconds)
+            if diff > tolerance_seconds:
+                continue
             if best_diff is None or diff < best_diff:
                 best, best_diff = event, diff
 
         if best is None:
             raise NoActiveMarketError(
-                f"No open {self._settings.asset} event found near "
-                f"{self._settings.market_duration_minutes} minutes in duration right now "
-                "(Polymarket US). This may mean no matching event is currently live, or that "
-                "this product does not exist on this venue yet — verify the catalog by hand "
-                "with search.query()/events.list() before assuming this filter is wrong."
+                f"No open {self._settings.asset} 'Up or Down' event found within "
+                f"{tolerance_seconds:.0f}s of {self._settings.market_duration_minutes} minutes in "
+                "duration right now (Polymarket US). This may mean no matching event is currently "
+                "live, or that this product does not exist on this venue yet — verify the catalog "
+                "by hand with search.query()/events.list() before assuming this filter is wrong."
             )
         return self._to_binary_market(best, now=now)
+
+    def _event_matches_configured_product(self, event: dict) -> bool:
+        """Identifies the recurring "<asset> Up or Down <N>m" product —
+        see find_active_btc_market()'s docstring for why this needs to
+        be more than just "the asset's name appears somewhere."
+
+        Prefers a stable identifier over display text when one is
+        configured: POLYMARKET_US_BTC_SERIES_SLUG pins this to an exact
+        Series.slug, verified independently of whatever the event
+        happens to be titled today. Falls back to a structural text
+        match (asset synonym AND an "up or down" pattern) scanned across
+        the event's own title, its series' slug/title, and its
+        market(s)' slug/title — not display-title text alone, per the
+        multiple independent places this product's identity could show
+        up in a real response.
+        """
+        series = event.get("series") or {}
+        pinned_slug = self._settings.us_btc_series_slug
+        if pinned_slug:
+            return series.get("slug") == pinned_slug
+
+        markets = event.get("markets") or []
+        haystack = " ".join([
+            event.get("title") or "", series.get("slug") or "", series.get("title") or "",
+            *(m.get("slug") or "" for m in markets), *(m.get("title") or "" for m in markets),
+        ]).lower()
+
+        synonyms = _ASSET_SYNONYMS.get(self._settings.asset, (self._settings.asset,))
+        if not any(s in haystack for s in synonyms):
+            return False
+        return any(p in haystack for p in _UP_DOWN_PATTERNS)
 
     def _to_binary_market(self, event: dict, *, now: datetime) -> BinaryMarket:
         markets = event.get("markets") or []

@@ -234,6 +234,107 @@ def test_discovery_ignores_events_already_closed(tmp_path):
         client.find_active_btc_market(now=_NOW)
 
 
+# --- 2b. Regression: the real Polymarket US title is "BTC", not "Bitcoin" ----
+# (the exact failure a live run of verify_polymarket_setup.py surfaced).
+
+def test_discovery_finds_the_real_btc_up_or_down_15m_title(tmp_path):
+    """The actual live event title never contains the literal word
+    "bitcoin" -- POLYMARKET_ASSET=bitcoin must still match it via the
+    _ASSET_SYNONYMS broadening."""
+    real_event = _event(slug="btc-up-or-down-15m-oct7-1200", title="BTC Up or Down 15m",
+                         minutes=15, market_slug="btc-up-or-down-15m-oct7-1200")
+    sdk = _FakeSDKClient(search=_FakeSearch({"events": [real_event]}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    market = client.find_active_btc_market(now=_NOW)
+    assert market.condition_id == "btc-up-or-down-15m-oct7-1200"
+    assert market.question == "BTC Up or Down 15m"
+
+
+@pytest.mark.parametrize("title", [
+    "Bitcoin price at the end of 2026",
+    "How high will Bitcoin get this year?",
+])
+def test_discovery_excludes_unrelated_bitcoin_markets_that_are_not_the_updown_product(tmp_path, title):
+    """These mention "bitcoin" but are NOT the recurring 15-minute
+    up/down product -- the "up or down" structural pattern requirement
+    must reject them even though the asset-name check alone would pass."""
+    unrelated = _event(slug="btc-price-target", title=title, minutes=15, market_slug="btc-price-target")
+    sdk = _FakeSDKClient(search=_FakeSearch({"events": [unrelated]}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market(now=_NOW)
+
+
+def test_discovery_excludes_btc_1h_title_with_no_updown_pattern(tmp_path):
+    """"BTC 1h" has neither the "up or down" pattern nor a matching
+    duration -- must never be selected, including when it's the only
+    candidate returned by search.query()."""
+    hourly = _event(slug="btc-1h", title="BTC 1h", minutes=60, market_slug="btc-1h")
+    sdk = _FakeSDKClient(search=_FakeSearch({"events": [hourly]}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market(now=_NOW)
+
+
+def test_discovery_excludes_an_updown_product_at_the_wrong_cadence(tmp_path):
+    """Defense in depth, independent of title wording: even a real "Up
+    or Down" BTC product that passes the TEXT match must still be
+    rejected outright if its duration is nowhere near the configured
+    target (15 minutes), rather than being accepted as "the closest
+    available" when nothing better exists."""
+    wrong_cadence = _event(slug="btc-up-or-down-1h", title="BTC Up or Down 1h", minutes=60,
+                            market_slug="btc-up-or-down-1h")
+    sdk = _FakeSDKClient(search=_FakeSearch({"events": [wrong_cadence]}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market(now=_NOW)
+
+
+def test_discovery_picks_the_right_cadence_among_multiple_updown_products(tmp_path):
+    """All candidates pass the text match; only the 15-minute one must
+    be selected even though nearer/farther wrong-cadence siblings exist."""
+    events = [
+        _event(slug="btc-up-or-down-1h", title="BTC Up or Down 1h", minutes=60, market_slug="btc-up-or-down-1h"),
+        _event(slug="btc-up-or-down-15m", title="BTC Up or Down 15m", minutes=15, market_slug="btc-up-or-down-15m"),
+        _event(slug="btc-up-or-down-5m", title="BTC Up or Down 5m", minutes=5, market_slug="btc-up-or-down-5m"),
+    ]
+    sdk = _FakeSDKClient(search=_FakeSearch({"events": events}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    market = client.find_active_btc_market(now=_NOW)
+    assert market.condition_id == "btc-up-or-down-15m"
+
+
+def test_discovery_matches_via_series_slug_or_title_not_just_event_title(tmp_path):
+    """The structural match scans the series' own slug/title too, not
+    just the event's display title -- covers a real response where the
+    "up or down" signal lives on the series rather than the event."""
+    event = _event(slug="btc-15m-oct7-1200", title="BTC 15m", minutes=15, market_slug="btc-15m-oct7-1200")
+    event["series"] = {"id": 1, "slug": "btc-up-or-down-15m", "title": "BTC Up or Down (15 Minute)"}
+    sdk = _FakeSDKClient(search=_FakeSearch({"events": [event]}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    market = client.find_active_btc_market(now=_NOW)
+    assert market.condition_id == "btc-15m-oct7-1200"
+
+
+def test_discovery_pinned_series_slug_overrides_the_text_heuristic(tmp_path):
+    """POLYMARKET_US_BTC_SERIES_SLUG, once known, is a stable identifier
+    that should be preferred over -- and is strict enough to reject
+    even a title that would otherwise pass -- the text heuristic."""
+    matching_slug_wrong_title = _event(
+        slug="e1", title="Totally unrelated title", minutes=15, market_slug="e1",
+    )
+    matching_slug_wrong_title["series"] = {"id": 1, "slug": "the-pinned-series", "title": "Something"}
+    wrong_slug_matching_title = _event(
+        slug="e2", title="BTC Up or Down 15m", minutes=15, market_slug="e2",
+    )
+    wrong_slug_matching_title["series"] = {"id": 2, "slug": "some-other-series", "title": "Something else"}
+
+    sdk = _FakeSDKClient(search=_FakeSearch({"events": [wrong_slug_matching_title, matching_slug_wrong_title]}))
+    client = PolymarketUSClient(_settings(POLYMARKET_US_BTC_SERIES_SLUG="the-pinned-series"), sdk_client=sdk)
+    market = client.find_active_btc_market(now=_NOW)
+    assert market.condition_id == "e1"
+
+
 # --- 3. Outcome identifiers ----------------------------------------------------
 
 def test_outcome_identifiers_are_the_same_slug_for_both_sides(tmp_path):
