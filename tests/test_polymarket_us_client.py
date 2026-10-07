@@ -23,6 +23,7 @@ from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import OrderRequest, PendingLiveOrder
 from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import PolymarketPositionStore
+from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.us_client import (
@@ -650,6 +651,92 @@ def test_order_book_malformed_missing_keys_defaults_to_empty_not_a_crash(tmp_pat
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
     book = client.get_order_book("x")
     assert book.bids == () and book.asks == ()
+
+
+# --- 4b. Order book -> risk integration (spread / liquidity through the real
+# parsing path, end to end via find_active_btc_market) -----------------------
+# Verifies, against the SAME get_order_book()/_to_binary_market() parsing
+# used live: (1) best bid, (2) best ask, (3) spread, (4) executable liquidity,
+# (5) an empty book fails closed, (6) a one-sided book fails MAX_SPREAD, and
+# (7) a two-sided book within the configured limit passes MAX_SPREAD.
+
+def _discover_with_book(bids, offers, *, slug="btc-updown-15m-2026-10-07-2015z") -> tuple:
+    """Builds a manual-override market through the real client, with its
+    nested market's order book set to exactly `bids`/`offers` -- returns
+    (market, order_book), both fetched through the production parsing path
+    (get_order_book()/_to_binary_market()), never constructed by hand."""
+    market_slug = f"cpc-{slug}"
+    now = datetime(2026, 10, 7, 20, 15, 30, tzinfo=timezone.utc)
+    event = _event(slug=slug, start=now, end=now + timedelta(minutes=15), market_slug=market_slug)
+    sdk = _FakeSDKClient(
+        events=_FakeEvents({slug: {"event": event}}),
+        markets=_FakeMarkets(books={market_slug: _book_response(bids, offers)}),
+    )
+    client = PolymarketUSClient(_settings(POLYMARKET_US_MARKET_SLUG=slug), sdk_client=sdk)
+    market = client.find_active_btc_market(now=now)
+    order_book = client.get_order_book(market.token_id_yes)
+    return market, order_book
+
+
+def test_integration_best_bid_best_ask_and_spread_are_parsed_correctly(tmp_path):
+    """(1) best bid, (2) best ask, (3) spread -- through the real parser."""
+    market, order_book = _discover_with_book([_book_level("0.54", 100)], [_book_level("0.55", 100)])
+    assert order_book.best_bid == 0.54
+    assert order_book.best_ask == 0.55
+    assert order_book.spread_pct == pytest.approx((0.55 - 0.54) / 0.545, abs=1e-4)
+    assert market.yes_bid == 0.54  # BinaryMarket's own summary, populated the same way
+    assert market.yes_ask == 0.55
+
+
+def test_integration_executable_liquidity_matches_the_parsed_asks(tmp_path):
+    """(4) executable liquidity -- must never be nonzero when best_ask is
+    None (there is no level for it to have summed), and must exactly equal
+    price*size for levels at/below max_price otherwise."""
+    market, order_book = _discover_with_book([_book_level("0.54", 100)], [_book_level("0.55", 100)])
+    liquidity = order_book.executable_liquidity_usd(side="BUY", max_price=0.99)
+    assert liquidity == pytest.approx(0.55 * 100)
+    if order_book.best_ask is None:
+        assert liquidity == 0.0  # the invariant this task is guarding: never nonzero with no ask
+
+
+def test_integration_empty_book_fails_closed_on_spread_and_liquidity(tmp_path):
+    """(5) an empty book -- no bids, no asks -- must fail BOTH MAX_SPREAD
+    (no two-sided quote) and ORDER_BOOK_LIQUIDITY (zero liquidity), never
+    silently pass either."""
+    market, order_book = _discover_with_book([], [])
+    assert order_book.best_bid is None and order_book.best_ask is None
+    risk = PolymarketRiskManager(_settings())
+    spread_result = risk.check_spread(market)
+    liquidity_result = risk.check_order_book_liquidity(order_book, side="BUY", max_price=0.60)
+    assert not spread_result.passed
+    assert not liquidity_result.passed
+    assert liquidity_result.detail.startswith("Only $0.00")
+
+
+def test_integration_one_sided_book_fails_max_spread(tmp_path):
+    """(6) a one-sided book (asks only, no bids) -- a real, nonzero
+    executable liquidity must NOT be mistaken for a two-sided quote;
+    MAX_SPREAD must still fail."""
+    market, order_book = _discover_with_book([], [_book_level("0.55", 100)])
+    assert order_book.best_bid is None
+    assert order_book.best_ask == 0.55
+    liquidity = order_book.executable_liquidity_usd(side="BUY", max_price=0.99)
+    assert liquidity == pytest.approx(55.0)  # real, nonzero liquidity...
+    risk = PolymarketRiskManager(_settings())
+    spread_result = risk.check_spread(market)
+    assert not spread_result.passed  # ...but still correctly fails MAX_SPREAD (one-sided)
+    assert "No two-sided quote" in spread_result.detail
+
+
+def test_integration_two_sided_book_within_limit_passes_max_spread(tmp_path):
+    """(7) a two-sided book within the configured POLYMARKET_MAX_SPREAD_PCT
+    passes MAX_SPREAD (default limit is 5%; this book's spread is ~1.8%)."""
+    market, order_book = _discover_with_book([_book_level("0.54", 100)], [_book_level("0.55", 100)])
+    risk = PolymarketRiskManager(_settings())
+    spread_result = risk.check_spread(market)
+    assert spread_result.passed
+    liquidity_result = risk.check_order_book_liquidity(order_book, side="BUY", max_price=0.60)
+    assert liquidity_result.passed
 
 
 # --- 5. FOK order construction + max price -----------------------------------

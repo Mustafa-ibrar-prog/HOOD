@@ -21,6 +21,7 @@ Usage:
     python3 scripts/verify_polymarket_setup.py --debug-exact-slug
     python3 scripts/verify_polymarket_setup.py --market-slug <SLUG>
     python3 scripts/verify_polymarket_setup.py --market-slug <SLUG> --debug-exact-slug
+    python3 scripts/verify_polymarket_setup.py --market-slug <SLUG> --debug-order-book
 
 --market-slug SLUG (POLYMARKET_VENUE=us only) verifies ONE exact
 market/event you choose yourself — e.g. a slug copied from the
@@ -60,6 +61,17 @@ Combined with --market-slug <SLUG>, dumps that EXACT slug's raw
 response instead of the three deterministic BTC windows — use this to
 inspect one specific market/event you already know exists (e.g. one
 --market-slug has reported as found but failed to parse).
+
+--debug-order-book (POLYMARKET_VENUE=us only) dumps the RAW
+markets.book() response (bids/offers/price/quantity, exactly as the
+live API returns it) alongside the PARSED OrderBookSnapshot
+(best_bid/best_ask/mid/spread_pct/every level/executable_liquidity_usd)
+for the resolved market's YES/NO token, right where the normal "Order
+book" check runs — so a mismatch like "best_bid/best_ask are None but
+executable liquidity is nonzero" is visible against the real response
+shape, instead of guessed at. markets.book() is a public-gateway
+endpoint; nothing printed includes POLYMARKET_US_KEY_ID/SECRET_KEY, any
+header, or account/balance data — only public order-book fields.
 """
 
 from __future__ import annotations
@@ -70,6 +82,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -255,6 +268,51 @@ def _debug_exact_slug(settings: PolymarketSettings) -> None:
           "are public-gateway endpoints; their response bodies contain only market/event metadata.\n")
 
 
+def _debug_raw_order_book(client: Any, outcome: str, token_id: str) -> None:
+    """Diagnoses the order-book parsing path specifically: prints the
+    RAW markets.book() response exactly as the live API returns it
+    (bids/offers/price/quantity), then the PARSED OrderBookSnapshot
+    (best_bid/best_ask/mid/spread_pct, every bid/ask level, and
+    executable_liquidity_usd) for the SAME fetch -- so a mismatch
+    between "best_bid/best_ask are None" and "executable liquidity is
+    nonzero" is visible directly against the real response shape,
+    instead of guessed at. markets.book() is a public-gateway
+    endpoint; nothing printed here is a credential, header, or account
+    field -- only public order-book data.
+
+    POLYMARKET_VENUE=us only (markets.book() is a us_client.py-specific
+    call -- client.py's international order book uses a different SDK
+    method entirely)."""
+    if not isinstance(client, PolymarketUSClient):
+        print(f"  (--debug-order-book currently only covers POLYMARKET_VENUE=us; skipping {outcome})")
+        return
+    sdk_client = client._client()
+    print(f"\n--- {outcome} token_id={token_id!r} ---")
+    try:
+        raw = sdk_client.markets.book(token_id)
+    except Exception as exc:  # noqa: BLE001 - diagnostic dump; surface the failure, don't abort the script
+        print(f"  raw markets.book({token_id!r}) FAILED: {_exception_detail(exc)}")
+        return
+    print(f"  raw markets.book({token_id!r}):")
+    print(json.dumps(raw, indent=2, default=str))
+
+    try:
+        book = client.get_order_book(token_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  parsed get_order_book({token_id!r}) FAILED: {_exception_detail(exc)}")
+        return
+    print(f"  parsed bids (best first): {[(lvl.price, lvl.size) for lvl in book.bids]}")
+    print(f"  parsed asks (best first): {[(lvl.price, lvl.size) for lvl in book.asks]}")
+    print(f"  parsed best_bid={book.best_bid} best_ask={book.best_ask} mid={book.mid} spread_pct={book.spread_pct}")
+    liquidity_99 = book.executable_liquidity_usd(side="BUY", max_price=0.99)
+    print(f"  parsed executable_liquidity_usd(side='BUY', max_price=0.99) = ${liquidity_99:.2f}")
+    if book.best_ask is None and liquidity_99 > 0:
+        print("  *** INCONSISTENCY: best_ask is None but executable liquidity is nonzero -- "
+              "this should never happen (liquidity is summed from the SAME asks list best_ask "
+              "reads from); compare the raw response above against _level()/get_order_book() "
+              "in us_client.py to see exactly which levels are being counted. ***")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
@@ -271,6 +329,15 @@ def main() -> int:
             "Manually verify ONE exact market/event by slug (POLYMARKET_VENUE=us only) instead of "
             "BTC 15m discovery -- e.g. a slug you copied from the Polymarket US app. Read-only; never "
             "places an order. Equivalent to setting POLYMARKET_US_MARKET_SLUG for this run only."
+        ),
+    )
+    parser.add_argument(
+        "--debug-order-book", action="store_true",
+        help=(
+            "Dump the RAW markets.book() response (POLYMARKET_VENUE=us only) alongside the PARSED "
+            "OrderBookSnapshot (best_bid/best_ask/spread_pct/executable_liquidity_usd) for the "
+            "resolved market's YES/NO token -- diagnoses a best_bid/best_ask vs. executable-liquidity "
+            "mismatch against the real response shape instead of guessing at it."
         ),
     )
     args = parser.parse_args()
@@ -347,7 +414,11 @@ def main() -> int:
 
     # --- 3. Order book + executable liquidity, for EACH outcome's own book ---
     if market is not None:
+        if args.debug_order_book:
+            print("=== DEBUG: raw order-book response (public gateway data only — no credentials, no account data) ===")
         for outcome, token_id in (("YES", market.token_id_yes), ("NO", market.token_id_no)):
+            if args.debug_order_book:
+                _debug_raw_order_book(client, outcome, token_id)
             try:
                 book = client.get_order_book(token_id)
             except Exception as exc:  # noqa: BLE001
@@ -370,6 +441,8 @@ def main() -> int:
                     f"${liquidity:.2f} at/below ${max_price:.4f} "
                     f"({'meets' if meets else 'BELOW'} the configured ${settings.min_order_book_liquidity_usd:.2f} minimum)",
                 )
+        if args.debug_order_book:
+            print("\n=== END DEBUG DUMP ===\n")
     else:
         _report("Order book", "SKIPPED", "no market discovered")
         _report("Executable liquidity", "SKIPPED", "no market discovered")
