@@ -20,6 +20,7 @@ Usage:
     python3 scripts/verify_polymarket_setup.py --debug-discovery
     python3 scripts/verify_polymarket_setup.py --debug-exact-slug
     python3 scripts/verify_polymarket_setup.py --market-slug <SLUG>
+    python3 scripts/verify_polymarket_setup.py --market-slug <SLUG> --debug-exact-slug
 
 --market-slug SLUG (POLYMARKET_VENUE=us only) verifies ONE exact
 market/event you choose yourself — e.g. a slug copied from the
@@ -48,11 +49,17 @@ guaranteed identical to what a real cycle would compute — never a
 second, possibly-different implementation. For the previous, current,
 and next 15-minute window, it tries the computed slug against BOTH
 events.retrieve_by_slug() AND markets.retrieve_by_slug(), printing the
-full raw response or the exact exception (type, message, and
-status_code/request_id if the SDK's error carries them) for each —
-so a wrong-resource guess (event vs. market) or an off-by-one window
-is visible directly, instead of guessed at. Also public-gateway calls;
+full raw response (including its top-level keys) or the exact
+exception (type, message, and status_code/request_id if the SDK's
+error carries them) for each — so a wrong-resource guess (event vs.
+market), an off-by-one window, or an unexpected response field name is
+visible directly, instead of guessed at. Also public-gateway calls;
 same no-credentials-printed guarantee as --debug-discovery.
+
+Combined with --market-slug <SLUG>, dumps that EXACT slug's raw
+response instead of the three deterministic BTC windows — use this to
+inspect one specific market/event you already know exists (e.g. one
+--market-slug has reported as found but failed to parse).
 """
 
 from __future__ import annotations
@@ -202,25 +209,33 @@ def _debug_exact_slug(settings: PolymarketSettings) -> None:
     us_client = PolymarketUSClient(settings)
     sdk_client = us_client._client()  # the real polymarket_us.PolymarketUS -- diagnostic use only
 
-    now = datetime.now(timezone.utc)
-    window_start, window_end = us_client._current_window(now)
-    print(f"  now (UTC):       {now.isoformat()}")
-    print(f"  current window:  {window_start.isoformat()} -> {window_end.isoformat()}")
+    if settings.us_market_slug:
+        # --market-slug / POLYMARKET_US_MARKET_SLUG is set -- dump exactly
+        # that one slug's raw response (both as a market and as an event,
+        # matching what _get_manual_override_market() itself tries) rather
+        # than the deterministic BTC windows below, since that's the exact
+        # slug under investigation.
+        slugs = [("manual override slug", settings.us_market_slug)]
+    else:
+        now = datetime.now(timezone.utc)
+        window_start, window_end = us_client._current_window(now)
+        print(f"  now (UTC):       {now.isoformat()}")
+        print(f"  current window:  {window_start.isoformat()} -> {window_end.isoformat()}")
 
-    minutes = settings.market_duration_minutes
-    windows = [
-        ("previous window", window_start - timedelta(minutes=minutes)),
-        ("current window", window_start),
-        ("next window", window_start + timedelta(minutes=minutes)),
-    ]
+        minutes = settings.market_duration_minutes
+        windows = [
+            ("previous window", window_start - timedelta(minutes=minutes)),
+            ("current window", window_start),
+            ("next window", window_start + timedelta(minutes=minutes)),
+        ]
+        slugs = []
+        for label, start in windows:
+            try:
+                slugs.append((label, us_client._expected_event_slug(start)))
+            except Exception as exc:  # noqa: BLE001
+                print(f"\n--- {label} ---\n  ERROR building slug: {_exception_detail(exc)}")
 
-    for label, start in windows:
-        try:
-            slug = us_client._expected_event_slug(start)
-        except Exception as exc:  # noqa: BLE001
-            print(f"\n--- {label} ---\n  ERROR building slug: {_exception_detail(exc)}")
-            continue
-
+    for label, slug in slugs:
         print(f"\n--- {label}: {slug!r} ---")
         for resource_name, method in (
             ("events.retrieve_by_slug", sdk_client.events.retrieve_by_slug),
@@ -229,11 +244,15 @@ def _debug_exact_slug(settings: PolymarketSettings) -> None:
             try:
                 response = method(slug)
                 print(f"  {resource_name}({slug!r}) SUCCEEDED:")
+                print(f"  top-level keys: {sorted(response.keys()) if isinstance(response, dict) else type(response).__name__}")
                 print(json.dumps(response, indent=2, default=str))
             except Exception as exc:  # noqa: BLE001 - this is a diagnostic dump; one failing call must not abort the rest
                 print(f"  {resource_name}({slug!r}) FAILED: {_exception_detail(exc)}")
 
     print("\n=== END DEBUG DUMP ===\n")
+    print("Nothing above includes POLYMARKET_US_KEY_ID/SECRET_KEY, any auth header, "
+          "balance, or account data -- events.retrieve_by_slug()/markets.retrieve_by_slug() "
+          "are public-gateway endpoints; their response bodies contain only market/event metadata.\n")
 
 
 def main() -> int:
