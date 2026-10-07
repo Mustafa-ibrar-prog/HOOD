@@ -45,6 +45,22 @@ class _FakeSearch:
         return self.response
 
 
+class _FakeEvents:
+    """Keyed by slug, mirroring events.retrieve_by_slug()'s real
+    lookup-by-exact-identifier semantics (not a text search)."""
+
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+
+    def retrieve_by_slug(self, slug):
+        resp = self.responses.get(slug)
+        if resp is None:
+            raise _NotFoundError(f"no such event {slug}")
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
+
+
 class _FakeMarkets:
     def __init__(self, *, books=None, settlements=None, details=None, book_exc=None):
         self.books = books or {}
@@ -100,8 +116,9 @@ class _FakeAccount:
 
 
 class _FakeSDKClient:
-    def __init__(self, *, search=None, markets=None, orders=None, account=None):
+    def __init__(self, *, search=None, events=None, markets=None, orders=None, account=None):
         self.search = search or _FakeSearch()
+        self.events = events or _FakeEvents()
         self.markets = markets or _FakeMarkets()
         self.orders = orders or _FakeOrders()
         self.account = account or _FakeAccount()
@@ -144,19 +161,25 @@ def _book_response(bids, offers, state="MARKET_STATE_OPEN") -> dict:
     }}
 
 
-def _event(*, slug="btc-updown-15m", title="Bitcoin Up or Down (15 min)", minutes=15, market_slug=None, now=_NOW) -> dict:
-    start = now
-    end = now + timedelta(minutes=minutes)
+def _btc_15m_slug(window_start: datetime) -> str:
+    """The deterministic slug pattern confirmed LIVE by the user
+    against the real Polymarket US site (real example:
+    btc-updown-15m-2026-10-06-1745z)."""
+    return f"btc-updown-15m-{window_start:%Y-%m-%d-%H%M}z"
+
+
+def _event(*, slug, start: datetime, end: datetime, title="BTC Up or Down 15m",
+           market_slug=None, active=True, closed=False) -> dict:
     return {
         "id": 1, "slug": slug, "title": title, "description": "",
         "startTime": start.isoformat(), "endTime": end.isoformat(),
-        "active": True, "closed": False, "archived": False, "featured": False,
+        "active": active, "closed": closed, "archived": False, "featured": False,
         "liquidity": 100.0, "volume": 100.0,
         "markets": [{
             "id": 1, "slug": market_slug or slug, "title": title, "outcome": "YES",
-            "active": True, "closed": False, "liquidity": 100.0, "volume": 100.0,
+            "active": active, "closed": closed, "liquidity": 100.0, "volume": 100.0,
         }],
-        "tags": [], "series": {"id": 1, "slug": "btc-15min", "title": "BTC 15min"},
+        "tags": [], "series": {"id": 1, "slug": "btc-up-or-down-15-minute", "title": "BTC Up or Down (15 Minute)"},
     }
 
 
@@ -186,153 +209,200 @@ def _order_request(**overrides) -> OrderRequest:
     return OrderRequest(**defaults)
 
 
-# --- 1. Market discovery ------------------------------------------------------
+# --- 1. Deterministic slug generation (pure functions, no SDK needed) -------
 
-def test_market_discovery_finds_an_active_event(tmp_path):
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [_event()]}))
+@pytest.mark.parametrize("hour,minute,expected_hhmm", [
+    (0, 0, "0000"), (0, 15, "0015"), (0, 30, "0030"), (0, 45, "0045"),
+    (0, 7, "0000"),    # mid-window still floors to the window's own start
+    (23, 59, "2345"),  # last window of the day
+])
+def test_current_window_floors_to_the_15_minute_boundary(hour, minute, expected_hhmm):
+    client = PolymarketUSClient(_settings())
+    now = datetime(2026, 10, 7, hour, minute, 30, tzinfo=timezone.utc)
+    window_start, window_end = client._current_window(now)
+    assert window_start.strftime("%H%M") == expected_hhmm
+    assert window_start.second == 0 and window_start.microsecond == 0
+    assert window_end == window_start + timedelta(minutes=15)
+
+
+def test_expected_slug_matches_the_confirmed_live_example():
+    """btc-updown-15m-2026-10-06-1745z -- confirmed by the user directly
+    against the real Polymarket US site, not derived or guessed here."""
+    client = PolymarketUSClient(_settings())
+    now = datetime(2026, 10, 6, 17, 50, tzinfo=timezone.utc)  # inside the 17:45-18:00 window
+    window_start, window_end = client._current_window(now)
+    assert client._expected_event_slug(window_start) == "btc-updown-15m-2026-10-06-1745z"
+    assert window_end == datetime(2026, 10, 6, 18, 0, tzinfo=timezone.utc)
+
+
+def test_expected_slug_day_rollover():
+    """`now` at exactly midnight must produce the NEW day's date."""
+    client = PolymarketUSClient(_settings())
+    window_start, _ = client._current_window(datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc))
+    assert client._expected_event_slug(window_start) == "btc-updown-15m-2026-10-08-0000z"
+
+
+def test_expected_slug_month_rollover():
+    client = PolymarketUSClient(_settings())
+    window_start, _ = client._current_window(datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc))
+    assert client._expected_event_slug(window_start) == "btc-updown-15m-2026-11-01-0000z"
+
+
+def test_expected_slug_year_rollover():
+    client = PolymarketUSClient(_settings())
+    window_start, _ = client._current_window(datetime(2027, 1, 1, 0, 0, tzinfo=timezone.utc))
+    assert client._expected_event_slug(window_start) == "btc-updown-15m-2027-01-01-0000z"
+
+
+def test_expected_slug_raises_for_an_unconfirmed_cadence():
+    """Only 15-minute has a confirmed live slug token -- any other
+    configured duration must fail closed, never guess a pattern."""
+    client = PolymarketUSClient(_settings(POLYMARKET_MARKET_DURATION_MINUTES="60"))
+    with pytest.raises(PolymarketUSClientError):
+        client._expected_event_slug(_NOW)
+
+
+# --- 2. Discovery: exact-slug lookup, never a text search ---------------------
+
+def test_discovery_finds_the_exact_expected_event(tmp_path):
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)  # inside the 12:00-12:15 window
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    slug = _btc_15m_slug(window_start)
+    event = _event(slug=slug, start=window_start, end=window_end, market_slug=slug)
+    sdk = _FakeSDKClient(events=_FakeEvents({slug: {"event": event}}))
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    market = client.find_active_btc_market(now=_NOW)
-    assert market.condition_id == "btc-updown-15m"
-    assert market.question == "Bitcoin Up or Down (15 min)"
-    assert sdk.search.calls[0]["query"] == "bitcoin"
 
-
-def test_market_discovery_raises_when_nothing_matches(tmp_path):
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": []}))
-    client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    with pytest.raises(NoActiveMarketError):
-        client.find_active_btc_market(now=_NOW)
-
-
-# --- 2. BTC 15-minute discovery: closest-duration selection ------------------
-
-def test_discovery_picks_the_event_closest_to_the_target_duration(tmp_path):
-    events = [
-        _event(slug="btc-updown-60m", minutes=60, market_slug="btc-updown-60m"),
-        _event(slug="btc-updown-15m", minutes=15, market_slug="btc-updown-15m"),
-        _event(slug="btc-updown-5m", minutes=5, market_slug="btc-updown-5m"),
-    ]
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": events}))
-    client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    market = client.find_active_btc_market(now=_NOW)
-    assert market.condition_id == "btc-updown-15m"
-
-
-def test_discovery_ignores_events_whose_title_does_not_match_asset(tmp_path):
-    events = [_event(slug="super-bowl", title="Who wins the Super Bowl?", market_slug="super-bowl")]
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": events}))
-    client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    with pytest.raises(NoActiveMarketError):
-        client.find_active_btc_market(now=_NOW)
-
-
-def test_discovery_ignores_events_already_closed(tmp_path):
-    past_event = _event(now=_NOW - timedelta(minutes=30), minutes=15)  # ended 15 min ago
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [past_event]}))
-    client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    with pytest.raises(NoActiveMarketError):
-        client.find_active_btc_market(now=_NOW)
-
-
-# --- 2b. Regression: the real Polymarket US title is "BTC", not "Bitcoin" ----
-# (the exact failure a live run of verify_polymarket_setup.py surfaced).
-
-def test_discovery_finds_the_real_btc_up_or_down_15m_title(tmp_path):
-    """The actual live event title never contains the literal word
-    "bitcoin" -- POLYMARKET_ASSET=bitcoin must still match it via the
-    _ASSET_SYNONYMS broadening."""
-    real_event = _event(slug="btc-up-or-down-15m-oct7-1200", title="BTC Up or Down 15m",
-                         minutes=15, market_slug="btc-up-or-down-15m-oct7-1200")
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [real_event]}))
-    client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    market = client.find_active_btc_market(now=_NOW)
-    assert market.condition_id == "btc-up-or-down-15m-oct7-1200"
+    market = client.find_active_btc_market(now=now)
+    assert market.condition_id == slug
+    assert market.token_id_yes == market.token_id_no == slug
+    assert market.close_time == window_end
     assert market.question == "BTC Up or Down 15m"
 
 
-@pytest.mark.parametrize("title", [
-    "Bitcoin price at the end of 2026",
-    "How high will Bitcoin get this year?",
-])
-def test_discovery_excludes_unrelated_bitcoin_markets_that_are_not_the_updown_product(tmp_path, title):
-    """These mention "bitcoin" but are NOT the recurring 15-minute
-    up/down product -- the "up or down" structural pattern requirement
-    must reject them even though the asset-name check alone would pass."""
-    unrelated = _event(slug="btc-price-target", title=title, minutes=15, market_slug="btc-price-target")
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [unrelated]}))
+def test_discovery_raises_when_the_exact_event_does_not_exist(tmp_path):
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    sdk = _FakeSDKClient(events=_FakeEvents({}))  # nothing registered -> 404 on lookup
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
     with pytest.raises(NoActiveMarketError):
-        client.find_active_btc_market(now=_NOW)
+        client.find_active_btc_market(now=now)
 
 
-def test_discovery_excludes_btc_1h_title_with_no_updown_pattern(tmp_path):
-    """"BTC 1h" has neither the "up or down" pattern nor a matching
-    duration -- must never be selected, including when it's the only
-    candidate returned by search.query()."""
-    hourly = _event(slug="btc-1h", title="BTC 1h", minutes=60, market_slug="btc-1h")
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [hourly]}))
+def test_discovery_never_falls_back_to_search_even_if_it_would_find_something(tmp_path):
+    """search.query() is debug-only now -- even if it WOULD return the
+    right event, discovery must never consult it."""
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    slug = _btc_15m_slug(window_start)
+    event = _event(slug=slug, start=window_start, end=window_end, market_slug=slug)
+    search = _FakeSearch({"events": [event]})  # would "find" it via text search...
+    sdk = _FakeSDKClient(search=search, events=_FakeEvents({}))  # ...but the exact lookup 404s
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
     with pytest.raises(NoActiveMarketError):
-        client.find_active_btc_market(now=_NOW)
+        client.find_active_btc_market(now=now)
+    assert search.calls == []  # never even consulted
 
 
-def test_discovery_excludes_an_updown_product_at_the_wrong_cadence(tmp_path):
-    """Defense in depth, independent of title wording: even a real "Up
-    or Down" BTC product that passes the TEXT match must still be
-    rejected outright if its duration is nowhere near the configured
-    target (15 minutes), rather than being accepted as "the closest
-    available" when nothing better exists."""
-    wrong_cadence = _event(slug="btc-up-or-down-1h", title="BTC Up or Down 1h", minutes=60,
-                            market_slug="btc-up-or-down-1h")
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [wrong_cadence]}))
+def test_discovery_rejects_a_response_with_a_mismatched_slug(tmp_path):
+    """Defense in depth: even if the API returns something other than
+    the exact event requested, never trade it."""
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    expected_slug = _btc_15m_slug(window_start)
+    wrong_event = _event(slug="some-other-event-entirely", start=window_start, end=window_end)
+    sdk = _FakeSDKClient(events=_FakeEvents({expected_slug: {"event": wrong_event}}))
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
     with pytest.raises(NoActiveMarketError):
-        client.find_active_btc_market(now=_NOW)
+        client.find_active_btc_market(now=now)
 
 
-def test_discovery_picks_the_right_cadence_among_multiple_updown_products(tmp_path):
-    """All candidates pass the text match; only the 15-minute one must
-    be selected even though nearer/farther wrong-cadence siblings exist."""
-    events = [
-        _event(slug="btc-up-or-down-1h", title="BTC Up or Down 1h", minutes=60, market_slug="btc-up-or-down-1h"),
-        _event(slug="btc-up-or-down-15m", title="BTC Up or Down 15m", minutes=15, market_slug="btc-up-or-down-15m"),
-        _event(slug="btc-up-or-down-5m", title="BTC Up or Down 5m", minutes=5, market_slug="btc-up-or-down-5m"),
-    ]
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": events}))
+def test_discovery_rejects_an_inactive_or_closed_event(tmp_path):
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    slug = _btc_15m_slug(window_start)
+    closed_event = _event(slug=slug, start=window_start, end=window_end, market_slug=slug, active=False, closed=True)
+    sdk = _FakeSDKClient(events=_FakeEvents({slug: {"event": closed_event}}))
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    market = client.find_active_btc_market(now=_NOW)
-    assert market.condition_id == "btc-up-or-down-15m"
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market(now=now)
 
 
-def test_discovery_matches_via_series_slug_or_title_not_just_event_title(tmp_path):
-    """The structural match scans the series' own slug/title too, not
-    just the event's display title -- covers a real response where the
-    "up or down" signal lives on the series rather than the event."""
-    event = _event(slug="btc-15m-oct7-1200", title="BTC 15m", minutes=15, market_slug="btc-15m-oct7-1200")
-    event["series"] = {"id": 1, "slug": "btc-up-or-down-15m", "title": "BTC Up or Down (15 Minute)"}
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [event]}))
-    client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    market = client.find_active_btc_market(now=_NOW)
-    assert market.condition_id == "btc-15m-oct7-1200"
-
-
-def test_discovery_pinned_series_slug_overrides_the_text_heuristic(tmp_path):
-    """POLYMARKET_US_BTC_SERIES_SLUG, once known, is a stable identifier
-    that should be preferred over -- and is strict enough to reject
-    even a title that would otherwise pass -- the text heuristic."""
-    matching_slug_wrong_title = _event(
-        slug="e1", title="Totally unrelated title", minutes=15, market_slug="e1",
+def test_discovery_rejects_an_event_on_the_wrong_schedule(tmp_path):
+    """Right slug, but its own startTime/endTime don't match the
+    window we computed -- never trust the response blindly."""
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    expected_slug = _btc_15m_slug(window_start)
+    off_schedule = _event(
+        slug=expected_slug, start=datetime(2026, 10, 7, 12, 5, tzinfo=timezone.utc),
+        end=datetime(2026, 10, 7, 12, 20, tzinfo=timezone.utc), market_slug=expected_slug,
     )
-    matching_slug_wrong_title["series"] = {"id": 1, "slug": "the-pinned-series", "title": "Something"}
-    wrong_slug_matching_title = _event(
-        slug="e2", title="BTC Up or Down 15m", minutes=15, market_slug="e2",
-    )
-    wrong_slug_matching_title["series"] = {"id": 2, "slug": "some-other-series", "title": "Something else"}
+    sdk = _FakeSDKClient(events=_FakeEvents({expected_slug: {"event": off_schedule}}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    with pytest.raises(NoActiveMarketError):
+        client.find_active_btc_market(now=now)
 
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [wrong_slug_matching_title, matching_slug_wrong_title]}))
-    client = PolymarketUSClient(_settings(POLYMARKET_US_BTC_SERIES_SLUG="the-pinned-series"), sdk_client=sdk)
-    market = client.find_active_btc_market(now=_NOW)
-    assert market.condition_id == "e1"
+
+def test_discovery_unrelated_bitcoin_market_never_interferes(tmp_path):
+    """A generic Bitcoin price-target market registered under some
+    other slug must have zero effect -- discovery only ever looks up
+    the one exact slug it computed."""
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    expected_slug = _btc_15m_slug(window_start)
+    real_event = _event(slug=expected_slug, start=window_start, end=window_end, market_slug=expected_slug)
+    unrelated = _event(
+        slug="bitcoin-price-eoy-2026", title="Bitcoin price at the end of 2026",
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc), end=datetime(2026, 12, 31, tzinfo=timezone.utc),
+    )
+    sdk = _FakeSDKClient(events=_FakeEvents({expected_slug: {"event": real_event}, "bitcoin-price-eoy-2026": {"event": unrelated}}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    market = client.find_active_btc_market(now=now)
+    assert market.condition_id == expected_slug
+
+
+def test_discovery_multiple_simultaneous_updown_events_still_picks_the_exact_slug(tmp_path):
+    """A simultaneously-open "BTC Up or Down 1h" sibling (confirmed to
+    exist on the real homepage too) must have zero effect: there is no
+    "closest candidate" selection anymore, only the one exact slug."""
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    fifteen_min_slug = _btc_15m_slug(window_start)
+    fifteen_min = _event(slug=fifteen_min_slug, start=window_start, end=window_end, market_slug=fifteen_min_slug)
+    one_hour_slug = "btc-updown-1h-2026-10-07-1200z"
+    one_hour = _event(
+        slug=one_hour_slug, title="BTC Up or Down 1h", start=window_start,
+        end=datetime(2026, 10, 7, 13, 0, tzinfo=timezone.utc), market_slug=one_hour_slug,
+    )
+    sdk = _FakeSDKClient(events=_FakeEvents({fifteen_min_slug: {"event": fifteen_min}, one_hour_slug: {"event": one_hour}}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    market = client.find_active_btc_market(now=now)
+    assert market.condition_id == fifteen_min_slug
+
+
+def test_discovery_rolls_over_to_the_next_window_automatically(tmp_path):
+    """The next cycle's `now` lands in the NEXT 15-minute window and
+    must look up a DIFFERENT, independently-registered exact slug --
+    no caching or stickiness to the previous window's event."""
+    window_1200 = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_1215 = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    window_1230 = datetime(2026, 10, 7, 12, 30, tzinfo=timezone.utc)
+    slug_1200 = _btc_15m_slug(window_1200)
+    slug_1215 = _btc_15m_slug(window_1215)
+    event_1200 = _event(slug=slug_1200, start=window_1200, end=window_1215, market_slug=slug_1200)
+    event_1215 = _event(slug=slug_1215, start=window_1215, end=window_1230, market_slug=slug_1215)
+    sdk = _FakeSDKClient(events=_FakeEvents({slug_1200: {"event": event_1200}, slug_1215: {"event": event_1215}}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+
+    first = client.find_active_btc_market(now=datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc))
+    assert first.condition_id == slug_1200
+    second = client.find_active_btc_market(now=datetime(2026, 10, 7, 12, 17, tzinfo=timezone.utc))
+    assert second.condition_id == slug_1215
 
 
 # --- 3. Outcome identifiers ----------------------------------------------------
@@ -340,10 +410,15 @@ def test_discovery_pinned_series_slug_overrides_the_text_heuristic(tmp_path):
 def test_outcome_identifiers_are_the_same_slug_for_both_sides(tmp_path):
     """Polymarket US has ONE contract per market -- YES/NO is expressed
     via order intent (BUY_LONG/BUY_SHORT), not via two separate tokens."""
-    sdk = _FakeSDKClient(search=_FakeSearch({"events": [_event()]}))
+    now = datetime(2026, 10, 7, 12, 3, tzinfo=timezone.utc)
+    window_start = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 7, 12, 15, tzinfo=timezone.utc)
+    slug = _btc_15m_slug(window_start)
+    event = _event(slug=slug, start=window_start, end=window_end, market_slug=slug)
+    sdk = _FakeSDKClient(events=_FakeEvents({slug: {"event": event}}))
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    market = client.find_active_btc_market(now=_NOW)
-    assert market.token_id_yes == market.token_id_no == "btc-updown-15m"
+    market = client.find_active_btc_market(now=now)
+    assert market.token_id_yes == market.token_id_no == slug
     assert market.token_id_for("YES") == market.token_id_for("NO")
 
 

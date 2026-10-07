@@ -168,12 +168,6 @@ class PolymarketSettings:
     us_secret_key: str | None
     us_api_base_url: str
     us_gateway_base_url: str
-    # Optional, stable-identifier override for the recurring BTC Up/Down
-    # product on the US venue (see us_client.py's find_active_btc_market()
-    # docstring) — a Series.slug, once known, pins discovery exactly
-    # rather than relying on the event's display title. Leave blank to
-    # use the (still asset+pattern-validated) title-based fallback.
-    us_btc_series_slug: str | None
 
     # --- Risk controls — deliberately tiny defaults. Read every one of
     # these yourself in .env.polymarket.example before going live; they
@@ -363,7 +357,6 @@ class PolymarketSettings:
             us_secret_key=_get_optional_str(env, "POLYMARKET_US_SECRET_KEY"),
             us_api_base_url=_get_str(env, "POLYMARKET_US_API_BASE_URL", DEFAULT_US_API_BASE_URL),
             us_gateway_base_url=_get_str(env, "POLYMARKET_US_GATEWAY_BASE_URL", DEFAULT_US_GATEWAY_BASE_URL),
-            us_btc_series_slug=_get_optional_str(env, "POLYMARKET_US_BTC_SERIES_SLUG"),
             max_bet_usd=_get_float(env, "POLYMARKET_MAX_BET_USD", 5.0),
             max_daily_loss_usd=_get_float(env, "POLYMARKET_MAX_DAILY_LOSS_USD", 20.0),
             max_open_positions=_get_int(env, "POLYMARKET_MAX_OPEN_POSITIONS", 1),

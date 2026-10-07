@@ -49,13 +49,19 @@ a blog post, not memory:
     structural pattern for e.g. a daily/weekly game schedule, and is
     the most plausible home for a recurring 15-minute window product,
     but this has NOT been confirmed live (see NOT VERIFIED below).
-  - Discovery: `search.query({"query": ..., "status": "active"})` is
-    the SDK's own documented way to find markets by topic — its
-    bundled README uses exactly `client.search.query({"query": "bitcoin"})`
-    as ITS OWN canonical example, and that same README's order-creation
-    example market is literally "btc-100k" — real, if indirect,
-    confirmation that Bitcoin markets exist as a category on this
-    venue. This does NOT confirm a 15-MINUTE recurring product exists.
+  - Discovery: CONFIRMED LIVE (by the user, directly against the real
+    Polymarket US site, not guessed) — the recurring 15-minute BTC
+    Up/Down product's event slugs follow a fixed, predictable pattern:
+    `btc-updown-15m-YYYY-MM-DD-HHMMz`, where HHMM is the UTC start of
+    the 15-minute window (confirmed real example:
+    `btc-updown-15m-2026-10-06-1745z`). find_active_btc_market() below
+    computes the current window from `now` and looks up that EXACT
+    event via `events.retrieve_by_slug(slug)` — never a text search,
+    never "closest available." `search.query({"query": ...})` (the
+    SDK's own documented topic-search method, used by an earlier
+    version of this method) remains available as a read-only debug tool
+    (scripts/verify_polymarket_setup.py --debug-discovery) but is no
+    longer part of the trading discovery path at all.
   - Order book: `markets.book(slug) -> MarketBook(bids, offers:
     [OrderBookLevel(px: Amount, qty: str)], state: Literal[...])`. This
     module does NOT trust the API's own bid/offer array ordering (not
@@ -93,13 +99,13 @@ a blog post, not memory:
 NOT independently verified against a live server (this sandbox cannot
 reach polymarket.us at all — see module docstring above and
 src/polymarket/__init__.py). Most importantly:
-  1. Whether ANY Bitcoin 15-MINUTE recurring up/down market currently
-     exists in the real catalog at all. The evidence above confirms
-     Bitcoin markets exist as a category; it does NOT confirm this
-     specific short-duration recurring product exists on this venue.
-     find_active_btc_market() below will raise NoActiveMarketError if
-     none is found — treat that as "verify the catalog by hand," not
-     as a confirmed absence.
+  1. Whether the deterministic slug pattern above holds for EVERY
+     window, indefinitely (confirmed for one real, specific window by
+     the user; not re-derived or guessed by this codebase). If
+     Polymarket US ever changes this pattern, find_active_btc_market()
+     will raise NoActiveMarketError (events.retrieve_by_slug() 404s) —
+     treat that as "re-confirm the live pattern," never as a reason to
+     fall back to a text search for trading.
   2. The exact book-side/pricing mechanics of a BUY_SHORT ("betting
      NO") order. This module maps "NO" to ORDER_INTENT_BUY_SHORT with
      the SAME price/quantity/tif construction as "YES" (ORDER_INTENT_
@@ -129,7 +135,7 @@ src/polymarket/__init__.py). Most importantly:
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from src.polymarket.client import NoActiveMarketError, PolymarketClientError
@@ -155,24 +161,22 @@ _INTENT_FOR_OUTCOME = {"YES": "ORDER_INTENT_BUY_LONG", "NO": "ORDER_INTENT_BUY_S
 # polymarket_us.types.orders.CreateOrderParams's own Literal.
 _TIF_FOR_ORDER_TYPE = {"FOK": "TIME_IN_FORCE_FILL_OR_KILL", "FAK": "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"}
 
-# Market discovery (see find_active_btc_market's docstring): synonyms
-# for settings.asset, since a real Polymarket US event titled "BTC Up
-# or Down 15m" never contains the literal word "bitcoin" — confirmed
-# against the live API (POLYMARKET_ASSET=bitcoin, real title uses
-# "BTC"). Extend this map if another asset needs the same treatment;
-# an asset with no entry here falls back to matching its own literal
-# name only.
-_ASSET_SYNONYMS: dict[str, tuple[str, ...]] = {
-    "bitcoin": ("bitcoin", "btc"),
-}
+# Market discovery (see find_active_btc_market's docstring): the
+# recurring BTC Up/Down product's fixed slug prefix, confirmed LIVE by
+# the user against the real Polymarket US site (real example:
+# btc-updown-15m-2026-10-06-1745z) — not derived from settings.asset
+# ("bitcoin"), which is a different string.
+_BTC_UPDOWN_SLUG_PREFIX = "btc-updown"
 
-# The structural signal that distinguishes the recurring "<asset> Up or
-# Down <N>m" product from any OTHER market that happens to mention the
-# asset (a price-target market like "Bitcoin price at the end of
-# 2026", or "How high will Bitcoin get this year?") — those are real,
-# legitimate Bitcoin markets on this venue, just not THIS recurring
-# up/down product, so matching the asset name alone is not enough.
-_UP_DOWN_PATTERNS = ("up or down", "up/down", "up-or-down", "updown")
+# settings.market_duration_minutes -> the slug's cadence token. ONLY
+# 15 ("15m") has been confirmed live. Do not add another entry (e.g.
+# 60 -> "1h") by guessing/analogy -- confirm the real slug for that
+# cadence the same way first (events.retrieve_by_slug on a hand-built
+# guess will 404 harmlessly if wrong, which is how 15m's pattern
+# should be re-confirmed too if Polymarket US ever changes it).
+_SLUG_CADENCE_TOKENS: dict[int, str] = {
+    15: "15m",
+}
 
 # Order.state -> this system's FillStatus vocabulary (models.py). Only
 # states with cumQuantity > 0 may map to "filled"/"partially_filled" —
@@ -274,106 +278,103 @@ class PolymarketUSClient:
 
     # --- Market discovery (public data, no credentials needed) ---------------
     def find_active_btc_market(self, *, now: datetime | None = None) -> BinaryMarket:
-        """Finds the open event for settings.asset's recurring "Up or
-        Down" product whose duration is closest to
-        settings.market_duration_minutes.
+        """Deterministic discovery — CONFIRMED LIVE by the user against
+        the real Polymarket US site (not guessed, not inferred): the
+        recurring BTC Up/Down product's event slugs follow a fixed
+        pattern, `btc-updown-15m-YYYY-MM-DD-HHMMz` (real example:
+        btc-updown-15m-2026-10-06-1745z), where HHMM is the UTC start
+        of the current 15-minute window.
 
-        LIVE-VERIFIED FIX: the first version of this method required
-        the literal word "bitcoin" in the event title, which never
-        matched the real event ("BTC Up or Down 15m" — confirmed live
-        against the real catalog with POLYMARKET_ASSET=bitcoin: the
-        actual title uses "BTC", not "Bitcoin"). Fixed with two
-        independent, deliberately narrow signals — see
-        _event_matches_configured_product():
-          1. An asset-name match broadened with real synonyms
-             (_ASSET_SYNONYMS), not the literal settings.asset string.
-          2. A required "up or down" structural pattern
-             (_UP_DOWN_PATTERNS), so a genuinely different Bitcoin
-             market that merely mentions "bitcoin"/"btc" — a
-             price-target market like "Bitcoin price at the end of
-             2026", or "How high will Bitcoin get this year?" — is
-             never selected just because it matches the asset name.
-          3. search.query() can also return events whose title+pattern
-             match the right PRODUCT but the wrong CADENCE (e.g. an
-             hourly "BTC Up or Down 1h" instead of the 15-minute one) —
-             a hard duration tolerance (not just "closest available")
-             rejects those outright rather than silently settling for
-             the nearest wrong-duration market when nothing closer
-             exists.
-        A caller that has learned the product's actual, stable Series
-        slug from the live catalog should set
-        POLYMARKET_US_BTC_SERIES_SLUG — see settings.py — which pins
-        discovery to that exact series instead of the text heuristic.
+        Computes that exact slug for the CURRENT window from `now` and
+        looks it up directly via events.retrieve_by_slug() — never a
+        text search, never "closest available," never a fallback to a
+        different market. An earlier version of this method used
+        search.query() with title/pattern heuristics; that approach is
+        retired from the trading path entirely (search.query() remains
+        available only as a read-only debug tool — see
+        scripts/verify_polymarket_setup.py --debug-discovery).
+
+        If the exact expected event doesn't exist, isn't open, or
+        doesn't verify as being on the expected schedule (see
+        _verify_expected_event), this sits the cycle out
+        (NoActiveMarketError) rather than trading anything else —
+        "no trade" is always a safe outcome; a wrong market never is.
         """
         now = now or datetime.now(timezone.utc)
+        window_start, window_end = self._current_window(now)
+        expected_slug = self._expected_event_slug(window_start)
+
         client = self._client()
-        target_seconds = self._settings.market_duration_minutes * 60
-        # At least 5 minutes, or 50% of the target duration, whichever
-        # is larger -- wide enough to tolerate a real event's start/end
-        # not landing on an exact multiple of market_duration_minutes,
-        # narrow enough to still reject a wrong-cadence variant of the
-        # same product (e.g. 1h when the target is 15m) outright.
-        tolerance_seconds = max(300.0, target_seconds * 0.5)
-
-        response = client.search.query({"query": self._settings.asset, "status": "active"})
-        events = response.get("events") or []
-
-        best = None
-        best_diff: float | None = None
-        for event in events:
-            if not self._event_matches_configured_product(event):
-                continue
-            start = _parse_dt(event.get("startTime"))
-            end = _parse_dt(event.get("endTime"))
-            if start is None or end is None or end <= now:
-                continue
-            duration = (end - start).total_seconds()
-            diff = abs(duration - target_seconds)
-            if diff > tolerance_seconds:
-                continue
-            if best_diff is None or diff < best_diff:
-                best, best_diff = event, diff
-
-        if best is None:
+        try:
+            response = client.events.retrieve_by_slug(expected_slug)
+        except Exception as exc:  # noqa: BLE001 - not-found or a transport failure both mean "nothing to trade this cycle"
             raise NoActiveMarketError(
-                f"No open {self._settings.asset} 'Up or Down' event found within "
-                f"{tolerance_seconds:.0f}s of {self._settings.market_duration_minutes} minutes in "
-                "duration right now (Polymarket US). This may mean no matching event is currently "
-                "live, or that this product does not exist on this venue yet — verify the catalog "
-                "by hand with search.query()/events.list() before assuming this filter is wrong."
+                f"Expected Polymarket US event {expected_slug!r} for the current "
+                f"{self._settings.market_duration_minutes}-minute window "
+                f"({window_start.isoformat()}–{window_end.isoformat()}) was not found or could not "
+                f"be fetched ({type(exc).__name__}: {exc}) — sitting this cycle out rather than "
+                "trading a fallback market."
+            ) from exc
+
+        event = response.get("event") or {}
+        self._verify_expected_event(event, expected_slug=expected_slug, window_start=window_start, window_end=window_end)
+        return self._to_binary_market(event, now=now)
+
+    def _current_window(self, now: datetime) -> tuple[datetime, datetime]:
+        """Floors `now` to the start of the current
+        market_duration_minutes-wide UTC window."""
+        minutes = self._settings.market_duration_minutes
+        floored_minute = (now.minute // minutes) * minutes
+        window_start = now.replace(minute=floored_minute, second=0, microsecond=0)
+        window_end = window_start + timedelta(minutes=minutes)
+        return window_start, window_end
+
+    def _expected_event_slug(self, window_start: datetime) -> str:
+        cadence_token = _SLUG_CADENCE_TOKENS.get(self._settings.market_duration_minutes)
+        if cadence_token is None:
+            raise PolymarketUSClientError(
+                f"No confirmed Polymarket US slug cadence token for "
+                f"POLYMARKET_MARKET_DURATION_MINUTES={self._settings.market_duration_minutes} — only "
+                f"15 ('15m', confirmed live: {_BTC_UPDOWN_SLUG_PREFIX}-15m-2026-10-06-1745z) is "
+                "currently supported. Add a new entry to _SLUG_CADENCE_TOKENS only after confirming "
+                "the real slug pattern for that cadence live — never by guessing/analogy."
             )
-        return self._to_binary_market(best, now=now)
+        return f"{_BTC_UPDOWN_SLUG_PREFIX}-{cadence_token}-{window_start:%Y-%m-%d-%H%M}z"
 
-    def _event_matches_configured_product(self, event: dict) -> bool:
-        """Identifies the recurring "<asset> Up or Down <N>m" product —
-        see find_active_btc_market()'s docstring for why this needs to
-        be more than just "the asset's name appears somewhere."
+    def _verify_expected_event(
+        self, event: dict, *, expected_slug: str, window_start: datetime, window_end: datetime,
+    ) -> None:
+        """Defense in depth: even though the slug was constructed
+        deterministically, never trust the response blindly. Verifies
+        the returned event actually IS the one requested, is currently
+        open, and is on the exact expected schedule — raising
+        NoActiveMarketError (never silently substituting a different
+        market) on any mismatch. A few seconds of tolerance on the
+        start/end comparison absorbs harmless response-formatting
+        precision, not a genuine scheduling mismatch."""
+        actual_slug = event.get("slug")
+        if actual_slug != expected_slug:
+            raise NoActiveMarketError(
+                f"Expected event slug {expected_slug!r} but the API returned {actual_slug!r} — "
+                "refusing to trade a mismatched event."
+            )
+        if not event.get("active") or event.get("closed"):
+            raise NoActiveMarketError(f"Event {expected_slug!r} exists but is not active/open right now.")
 
-        Prefers a stable identifier over display text when one is
-        configured: POLYMARKET_US_BTC_SERIES_SLUG pins this to an exact
-        Series.slug, verified independently of whatever the event
-        happens to be titled today. Falls back to a structural text
-        match (asset synonym AND an "up or down" pattern) scanned across
-        the event's own title, its series' slug/title, and its
-        market(s)' slug/title — not display-title text alone, per the
-        multiple independent places this product's identity could show
-        up in a real response.
-        """
-        series = event.get("series") or {}
-        pinned_slug = self._settings.us_btc_series_slug
-        if pinned_slug:
-            return series.get("slug") == pinned_slug
-
-        markets = event.get("markets") or []
-        haystack = " ".join([
-            event.get("title") or "", series.get("slug") or "", series.get("title") or "",
-            *(m.get("slug") or "" for m in markets), *(m.get("title") or "" for m in markets),
-        ]).lower()
-
-        synonyms = _ASSET_SYNONYMS.get(self._settings.asset, (self._settings.asset,))
-        if not any(s in haystack for s in synonyms):
-            return False
-        return any(p in haystack for p in _UP_DOWN_PATTERNS)
+        start = _parse_dt(event.get("startTime"))
+        end = _parse_dt(event.get("endTime"))
+        if start is None or end is None:
+            raise NoActiveMarketError(f"Event {expected_slug!r} is missing startTime/endTime.")
+        if abs((start - window_start).total_seconds()) > 5:
+            raise NoActiveMarketError(
+                f"Event {expected_slug!r} startTime={start.isoformat()} does not match the expected "
+                f"window start {window_start.isoformat()}."
+            )
+        if abs((end - window_end).total_seconds()) > 5:
+            raise NoActiveMarketError(
+                f"Event {expected_slug!r} endTime={end.isoformat()} does not match the expected "
+                f"window end {window_end.isoformat()}."
+            )
 
     def _to_binary_market(self, event: dict, *, now: datetime) -> BinaryMarket:
         markets = event.get("markets") or []
