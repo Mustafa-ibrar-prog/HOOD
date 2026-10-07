@@ -64,9 +64,14 @@ The outcome is ALWAYS explicit on the command line — this script never
 lets a strategy choose it.
 
 If a fill's status comes back "unknown" (get_fill_status() couldn't
-confidently interpret the exchange's response), this STOPS and reports
-it rather than assuming a fill either way, and never submits a second
-order to compensate — see run_manual_test()'s reconciliation step.
+confidently interpret the exchange's response — this includes
+orders.retrieve() 404ing on an order that was JUST submitted, a real,
+observed, transient delay before the exchange makes a new order
+visible), this retries the SAME reconciliation check a few times with a
+short delay (never a second submission — only re-querying the status of
+the one order already placed) before giving up and reporting "unknown"
+to stop and let a human investigate with scripts/check_order_status.py.
+See run_manual_test()'s reconciliation step.
 """
 
 from __future__ import annotations
@@ -74,6 +79,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,6 +123,8 @@ def run_manual_test(
     pending_store: PolymarketPendingOrderStore,
     emergency_stop_store: EmergencyStopStore,
     now: datetime | None = None,
+    unknown_status_retries: int = 3,
+    unknown_status_retry_delay_seconds: float = 2.0,
 ) -> int:
     """The testable core (argparse-free) — see module docstring for the
     full flow and safety-gate list. Returns a process exit code (0 on
@@ -337,17 +345,36 @@ def run_manual_test(
     print(f"EXCHANGE ORDER ID: {confirmed.submission.exchange_order_id}")
     print(f"RAW SUBMISSION RESPONSE: {confirmed.submission.raw}")
 
-    pending = pending_store.get(pending_id)
-    fill = reconciliation.reconcile_order(
-        pending, client=client, pending_store=pending_store, position_store=position_store,
-        state_store=state_store, decision_logger=decision_logger, now=now,
-    )
+    # A 404 from orders.retrieve() immediately after submission can be a
+    # real, transient visibility delay (confirmed live: an order that
+    # 404'd moments after submission was definitively FILLED on a later
+    # check) -- retry the SAME status check a bounded number of times
+    # before giving up. This NEVER resubmits the order: reconcile_order()
+    # only re-queries get_fill_status() for the SAME exchange_order_id;
+    # reconciliation.py's own fill_reconciled=False-on-"unknown" guard
+    # (see its module docstring) is what makes each retry here safe and
+    # idempotent -- a later FILLED result still opens exactly one
+    # position, never a duplicate.
+    attempt = 1
+    while True:
+        pending = pending_store.get(pending_id)
+        fill = reconciliation.reconcile_order(
+            pending, client=client, pending_store=pending_store, position_store=position_store,
+            state_store=state_store, decision_logger=decision_logger, now=now,
+        )
+        if fill is None or fill.status != "unknown" or attempt >= unknown_status_retries:
+            break
+        print(f"FILL STATUS: unknown (attempt {attempt}/{unknown_status_retries}; {fill.raw}) -- "
+              f"retrying in {unknown_status_retry_delay_seconds:.0f}s...")
+        time.sleep(unknown_status_retry_delay_seconds)
+        attempt += 1
+
     if fill is None:
         print("FILL STATUS: n/a (nothing to reconcile -- unexpected for a freshly-submitted order)")
         print("ERROR: reconciliation returned nothing to reconcile")
         return 1
     if fill.status == "unknown":
-        print(f"FILL STATUS: unknown")
+        print(f"FILL STATUS: unknown (after {attempt}/{unknown_status_retries} attempts)")
         print(f"FILLED SHARES: {fill.filled_shares}")
         print(f"AVG FILL PRICE: {fill.avg_fill_price}")
         print(f"POSITION CREATED: NO")

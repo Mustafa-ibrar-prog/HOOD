@@ -46,6 +46,7 @@ from tests.test_polymarket_us_client import (  # noqa: E402
     _FakeMarkets,
     _FakeOrders,
     _FakeSDKClient,
+    _NotFoundError,
     _book_level,
     _book_response,
     _event,
@@ -109,10 +110,12 @@ def _stores_with_emergency_stop_cleared(tmp_path) -> dict:
     return stores
 
 
-def _run(settings, client, stores, *, outcome="YES", amount=5.0, max_price=0.60, confirm_live=False, now=None):
+def _run(settings, client, stores, *, outcome="YES", amount=5.0, max_price=0.60, confirm_live=False, now=None,
+         unknown_status_retries=3, unknown_status_retry_delay_seconds=0.0):
     return run_manual_test(
         settings=settings, client=client, outcome=outcome, amount=amount, max_price=max_price,
-        confirm_live=confirm_live, now=now, **stores,
+        confirm_live=confirm_live, now=now, unknown_status_retries=unknown_status_retries,
+        unknown_status_retry_delay_seconds=unknown_status_retry_delay_seconds, **stores,
     )
 
 
@@ -582,15 +585,58 @@ def test_live_unknown_fill_status_stops_and_does_not_assume_a_fill(tmp_path, cap
 
     assert rc == 1
     out = capsys.readouterr().out
-    assert "FILL STATUS: unknown" in out
+    assert "FILL STATUS: unknown (after 3/3 attempts)" in out
     assert "do not assume a fill" in out
     assert "check_order_status.py ord-live-unknown" in out
     assert "RAW DETAIL: {'state': 'ORDER_STATE_SOMETHING_NEW_WE_DONT_KNOW'}" in out
     assert stores["position_store"].load() == []
     assert len(sdk.orders.create_calls) == 1  # exactly one submission attempt -- no automatic retry/second order
+    assert len(sdk.orders.retrieve_calls) == 3  # the status lookup itself WAS retried 3 times
     pending = stores["pending_store"].load()
     assert len(pending) == 1
     assert pending[0].fill_reconciled is False  # left re-checkable, not permanently given up on
+
+
+def test_live_temporary_404_then_filled_reconciles_to_one_position_no_duplicate_order(tmp_path, capsys):
+    """Regression for the exact real incident: orders.retrieve() 404s
+    immediately after submission (order CZ510YB5PYWT, in reality), then
+    returns a real FILLED response (cumQuantity=5, avgPx=$0.36) once the
+    exchange makes it visible. This must resolve to exactly ONE position
+    within this SAME script invocation (the built-in retry), with
+    exactly ONE orders.create() call -- never a duplicate/second order
+    submitted to "fix" the initial 404."""
+    slug = "manual-test-live-delayed-fill"
+    order_id = "CZ510YB5PYWT"
+    orders = _FakeOrders(
+        preview_response={"order": {"id": "preview-ok"}},
+        create_response={"id": order_id, "executions": []},
+        retrieve_responses={order_id: [
+            _NotFoundError("Order not found"),  # the real, observed transient 404
+            _order_response("ORDER_STATE_FILLED", quantity=5, cum=5, avg_px="0.36", order_id=order_id),
+        ]},
+    )
+    sdk = _happy_sdk(slug, orders=orders)
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+
+    rc = _run(settings, client, stores, confirm_live=True)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "FILL STATUS: unknown (attempt 1/3" in out  # the first, transient 404 was visibly retried
+    assert "FILL STATUS: filled" in out
+    assert "FILLED SHARES: 5.0" in out
+    assert "POSITION CREATED: YES" in out
+    assert len(sdk.orders.create_calls) == 1  # exactly one order ever submitted -- no duplicate
+    assert len(sdk.orders.retrieve_calls) == 2  # the 404, then the real answer -- never resubmitted
+    positions = stores["position_store"].load()
+    assert len(positions) == 1  # exactly one position, not two
+    assert positions[0].filled_shares == 5.0
+    assert positions[0].avg_fill_price == 0.36
+    assert stores["pending_store"].load()[0].fill_reconciled is True  # now a real terminal answer
 
 
 def test_live_mode_with_no_market_slug_uses_automatic_btc_discovery(tmp_path, capsys):

@@ -104,6 +104,7 @@ class _FakeOrders:
         self.create_calls: list = []
         self.preview_calls: list = []
         self.list_calls: list = []
+        self.retrieve_calls: list = []
 
     def create(self, params):
         self.create_calls.append(params)
@@ -112,9 +113,18 @@ class _FakeOrders:
         return self.create_response
 
     def retrieve(self, order_id):
+        """`retrieve_responses[order_id]` may be a single response/Exception
+        (same result every call -- the common case) OR a LIST of them,
+        consumed in order across successive calls to simulate e.g. a
+        transient 404 followed by a real FILLED response -- once
+        exhausted, the last entry repeats for any further call."""
+        self.retrieve_calls.append(order_id)
         resp = self.retrieve_responses.get(order_id)
         if resp is None:
             raise _NotFoundError(f"no such order {order_id}")
+        if isinstance(resp, list):
+            call_index = self.retrieve_calls.count(order_id) - 1
+            resp = resp[min(call_index, len(resp) - 1)]
         if isinstance(resp, Exception):
             raise resp
         return resp
