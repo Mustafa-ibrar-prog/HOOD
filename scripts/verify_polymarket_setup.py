@@ -17,11 +17,24 @@ means that part was never exercised.
 
 Usage:
     python3 scripts/verify_polymarket_setup.py
+    python3 scripts/verify_polymarket_setup.py --debug-discovery
+
+--debug-discovery (POLYMARKET_VENUE=us only) additionally dumps raw,
+PUBLIC market/event/series metadata from the live search.query(),
+events.list(), and series.list() gateway endpoints — before running
+the normal checks — so a discovery failure can be debugged against the
+actual live response shape instead of guessed at. These are all
+unauthenticated public-gateway calls; nothing printed ever includes
+POLYMARKET_US_KEY_ID/SECRET_KEY, any header, or any account-specific
+data — only public market/event/series fields.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -29,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.polymarket.client import NoActiveMarketError, PolymarketClientError  # noqa: E402
 from src.polymarket.client import get_polymarket_client  # noqa: E402
 from src.polymarket.settings import PolymarketSettings  # noqa: E402
+from src.polymarket.us_client import PolymarketUSClient  # noqa: E402
 
 _results: list[tuple[str, str]] = []  # (label, "PASS"/"FAIL"/"SKIPPED")
 
@@ -41,11 +55,119 @@ def _report(label: str, status: str, detail: str = "") -> None:
     print(line)
 
 
+def _event_summary(event: dict) -> dict:
+    """Extracts exactly the PUBLIC fields useful for debugging discovery
+    — nothing account-specific ever reaches this (events/series/search
+    are unauthenticated gateway endpoints; there is no credential or
+    account data in their responses to begin with)."""
+    start = event.get("startTime")
+    end = event.get("endTime")
+    duration_seconds = None
+    try:
+        if start and end:
+            s = datetime.fromisoformat(start)
+            e = datetime.fromisoformat(end)
+            if s.tzinfo is None:
+                s = s.replace(tzinfo=timezone.utc)
+            if e.tzinfo is None:
+                e = e.replace(tzinfo=timezone.utc)
+            duration_seconds = (e - s).total_seconds()
+    except ValueError:
+        pass
+    series = event.get("series") or {}
+    markets = event.get("markets") or []
+    return {
+        "event_slug": event.get("slug"),
+        "event_title": event.get("title"),
+        "event_startTime": start,
+        "event_endTime": end,
+        "event_duration_seconds": duration_seconds,
+        "event_active": event.get("active"),
+        "event_closed": event.get("closed"),
+        "series_slug": series.get("slug"),
+        "series_title": series.get("title"),
+        "series_recurrence": series.get("recurrence"),
+        "markets": [
+            {"slug": m.get("slug"), "title": m.get("title"), "outcome": m.get("outcome"),
+             "active": m.get("active"), "closed": m.get("closed")}
+            for m in markets
+        ],
+    }
+
+
+def _debug_discovery(settings: PolymarketSettings) -> None:
+    print("=== DEBUG: raw discovery dump (public gateway data only — no credentials, no account data) ===")
+    if not settings.is_us_venue:
+        print("  (--debug-discovery currently only covers POLYMARKET_VENUE=us)")
+        print()
+        return
+
+    us_client = PolymarketUSClient(settings)
+    sdk_client = us_client._client()  # the real polymarket_us.PolymarketUS -- diagnostic use only
+
+    for term in ("bitcoin", "btc", "up or down", "up down", "15m", "15 min"):
+        print(f"\n--- search.query({{'query': {term!r}, 'status': 'active'}}) ---")
+        try:
+            response = sdk_client.search.query({"query": term, "status": "active"})
+            events = response.get("events") or []
+            print(f"  {len(events)} event(s) returned")
+            for event in events:
+                print(json.dumps(_event_summary(event), indent=2, default=str))
+        except Exception as exc:  # noqa: BLE001 - this is a diagnostic dump; one failing call must not abort the rest
+            print(f"  ERROR: {type(exc).__name__}: {exc}")
+
+    print("\n--- events.list({'active': True, 'closed': False, 'limit': 100}) ---")
+    try:
+        response = sdk_client.events.list({"active": True, "closed": False, "limit": 100})
+        events = response.get("events") or []
+        print(f"  {len(events)} event(s) returned")
+        btc_like = [
+            e for e in events
+            if "btc" in (e.get("title") or "").lower() or "bitcoin" in (e.get("title") or "").lower()
+            or "btc" in (e.get("slug") or "").lower() or "bitcoin" in (e.get("slug") or "").lower()
+        ]
+        print(f"  {len(btc_like)} of those look BTC/Bitcoin-related by title or slug:")
+        for event in btc_like:
+            print(json.dumps(_event_summary(event), indent=2, default=str))
+        if not btc_like:
+            print("  (none matched by loose title/slug text -- all event titles/slugs below, for a manual look)")
+            for event in events:
+                print(f"    slug={event.get('slug')!r} title={event.get('title')!r}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ERROR: {type(exc).__name__}: {exc}")
+
+    print("\n--- series.list({'active': True, 'limit': 100}) ---")
+    try:
+        response = sdk_client.series.list({"active": True, "limit": 100})
+        series_list = response.get("series") or []
+        print(f"  {len(series_list)} series returned")
+        for series in series_list:
+            print(json.dumps({
+                "id": series.get("id"), "slug": series.get("slug"), "title": series.get("title"),
+                "recurrence": series.get("recurrence"), "active": series.get("active"),
+                "closed": series.get("closed"),
+            }, indent=2, default=str))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ERROR: {type(exc).__name__}: {exc}")
+
+    print("\n=== END DEBUG DUMP ===\n")
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--debug-discovery", action="store_true",
+        help="Dump raw, public search/events/series metadata from the live API before running the normal checks.",
+    )
+    args = parser.parse_args()
+
     settings = PolymarketSettings.from_env()
     client = get_polymarket_client(settings)
     print(f"POLYMARKET_VENUE={settings.venue} ({type(client).__name__})")
     print()
+
+    if args.debug_discovery:
+        _debug_discovery(settings)
 
     # --- 1. SDK importable --------------------------------------------------
     try:
