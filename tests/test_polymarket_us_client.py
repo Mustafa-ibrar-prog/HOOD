@@ -93,14 +93,17 @@ class _FakeMarkets:
 
 class _FakeOrders:
     def __init__(self, *, create_response=None, create_exc=None, retrieve_responses=None,
-                 preview_response=None, preview_exc=None):
+                 preview_response=None, preview_exc=None, list_response=None, list_exc=None):
         self.create_response = create_response
         self.create_exc = create_exc
         self.retrieve_responses = retrieve_responses or {}
         self.preview_response = preview_response
         self.preview_exc = preview_exc
+        self.list_response = list_response if list_response is not None else {"orders": []}
+        self.list_exc = list_exc
         self.create_calls: list = []
         self.preview_calls: list = []
+        self.list_calls: list = []
 
     def create(self, params):
         self.create_calls.append(params)
@@ -115,6 +118,12 @@ class _FakeOrders:
         if isinstance(resp, Exception):
             raise resp
         return resp
+
+    def list(self, params=None):
+        self.list_calls.append(params)
+        if self.list_exc:
+            raise self.list_exc
+        return self.list_response
 
     def preview(self, params):
         self.preview_calls.append(params)
@@ -134,13 +143,36 @@ class _FakeAccount:
         return self.response
 
 
+class _FakePortfolio:
+    def __init__(self, *, activities_response=None, activities_exc=None, positions_response=None, positions_exc=None):
+        self.activities_response = activities_response if activities_response is not None else {"activities": []}
+        self.activities_exc = activities_exc
+        self.positions_response = positions_response if positions_response is not None else {"positions": {}}
+        self.positions_exc = positions_exc
+        self.activities_calls: list = []
+        self.positions_calls: list = []
+
+    def activities(self, params=None):
+        self.activities_calls.append(params)
+        if self.activities_exc:
+            raise self.activities_exc
+        return self.activities_response
+
+    def positions(self, params=None):
+        self.positions_calls.append(params)
+        if self.positions_exc:
+            raise self.positions_exc
+        return self.positions_response
+
+
 class _FakeSDKClient:
-    def __init__(self, *, search=None, events=None, markets=None, orders=None, account=None):
+    def __init__(self, *, search=None, events=None, markets=None, orders=None, account=None, portfolio=None):
         self.search = search or _FakeSearch()
         self.events = events or _FakeEvents()
         self.markets = markets or _FakeMarkets()
         self.orders = orders or _FakeOrders()
         self.account = account or _FakeAccount()
+        self.portfolio = portfolio or _FakePortfolio()
         self.closed = False
 
     def close(self):
@@ -782,6 +814,22 @@ def test_fok_buy_long_order_construction(tmp_path):
     assert params["type"] == "ORDER_TYPE_LIMIT"
     assert params["price"] == {"value": "0.50", "currency": "USD"}
     assert params["quantity"] == 10  # floor(5.0 / 0.50)
+
+
+def test_place_order_preserves_the_complete_create_response_in_raw(tmp_path):
+    """Regression: a real incident showed an order submitted
+    successfully (ok=True, a real exchange_order_id) whose later
+    orders.retrieve() 404'd -- the ONLY diagnostic trail left is
+    whatever was captured from orders.create()'s own response at
+    submission time, since that process has since exited. SubmissionOutcome.raw
+    must preserve the response verbatim, not just a hand-picked subset
+    (e.g. "executions") that happens to omit fields that could matter."""
+    create_response = {"id": "ord-1", "executions": [], "someFutureFieldNotYetInOurTypeStub": "value"}
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response=create_response))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(outcome="YES", size_usd=5.0, max_price=0.50, order_type="FOK")
+    outcome = client.place_order(order)
+    assert outcome.raw == create_response  # the WHOLE response, not a subset
 
 
 def test_fok_buy_short_order_construction_for_no_outcome(tmp_path):

@@ -364,6 +364,8 @@ def test_live_submission_that_fills_opens_a_position(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "SUBMISSION: submitted" in out
+    assert "EXCHANGE ORDER ID: ord-live-5" in out
+    assert "RAW SUBMISSION RESPONSE: {'id': 'ord-live-5', 'executions': []}" in out
     assert "POSITION CREATED: YES" in out
     positions = stores["position_store"].load()
     assert len(positions) == 1

@@ -328,6 +328,15 @@ def run_manual_test(
         print(f"ERROR: {confirmed.error}")
         return 1
 
+    # The COMPLETE raw orders.create() response, printed now and only now --
+    # this process is the ONLY place that will ever see it. If a later
+    # status lookup for this exact order ever comes back inconclusive (see
+    # scripts/check_order_status.py), this is the one piece of evidence
+    # that cannot be recovered after the fact.
+    assert confirmed.submission is not None
+    print(f"EXCHANGE ORDER ID: {confirmed.submission.exchange_order_id}")
+    print(f"RAW SUBMISSION RESPONSE: {confirmed.submission.raw}")
+
     pending = pending_store.get(pending_id)
     fill = reconciliation.reconcile_order(
         pending, client=client, pending_store=pending_store, position_store=position_store,

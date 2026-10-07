@@ -656,8 +656,14 @@ class PolymarketUSClient:
         """Submits an order. Returns a SubmissionOutcome — NOT a fill
         determination; see models.SubmissionOutcome's docstring and
         reconciliation.py. The response's own `executions` are
-        deliberately ignored here for exactly that reason — see module
-        docstring: get_fill_status() always re-queries fresh."""
+        deliberately IGNORED for fill purposes (see module docstring:
+        get_fill_status() always re-queries fresh) but the COMPLETE raw
+        response is preserved verbatim in `raw` regardless -- a real
+        incident (an order submitted successfully, whose exchange_order_id
+        then 404'd on orders.retrieve()) showed that discarding anything
+        beyond `executions` means that diagnostic information is gone
+        forever the moment this process exits, with no way to
+        investigate afterward."""
         try:
             params = self._build_create_order_params(order)
         except _OrderTooSmallError as exc:
@@ -686,7 +692,7 @@ class PolymarketUSClient:
             )
         return SubmissionOutcome(
             ok=True, exchange_order_id=str(order_id), raw_status="submitted",
-            raw={"executions": response.get("executions", [])},
+            raw=dict(response),  # the COMPLETE orders.create() response, not just a subset
         )
 
     def preview_order(self, order: OrderRequest) -> dict:
