@@ -174,7 +174,14 @@ def run_manual_test(
     print("Risk checks:")
     for result in decision.results:
         print(f"  [{'PASS' if result.passed else 'FAIL'}] {result.name}: {result.detail}")
-    if not decision.allowed:
+    if not decision.allowed and not settings.is_live:
+        # Paper mode: fail fast with the simple message, exactly as
+        # before. LIVE mode deliberately does NOT return here -- a
+        # failed risk check (e.g. MAX_SPREAD/ORDER_BOOK_LIQUIDITY on a
+        # real, currently-too-wide/too-thin market) must still flow all
+        # the way into the consolidated LIVE PREFLIGHT block below, so
+        # "which gate prevented entry" is always shown there, never only
+        # in this early, paper-only message.
         print("REFUSING: risk checks did not pass. No order (paper or live) will be attempted.")
         return 1
 
@@ -263,7 +270,9 @@ def run_manual_test(
         if not auth_ok:
             print(f"  - AUTH: {auth_error}")
         if not decision.allowed:
-            print("  - RISK: one or more risk checks failed (see Risk checks above).")
+            for result in decision.results:
+                if not result.passed:
+                    print(f"  - RISK:{result.name}: {result.detail}")
         if not preview_ok:
             print("  - PREVIEW: orders.preview() did not succeed.")
         if stopped:

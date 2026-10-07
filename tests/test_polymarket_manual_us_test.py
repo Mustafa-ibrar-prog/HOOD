@@ -109,10 +109,10 @@ def _stores_with_emergency_stop_cleared(tmp_path) -> dict:
     return stores
 
 
-def _run(settings, client, stores, *, outcome="YES", amount=5.0, max_price=0.60, confirm_live=False):
+def _run(settings, client, stores, *, outcome="YES", amount=5.0, max_price=0.60, confirm_live=False, now=None):
     return run_manual_test(
         settings=settings, client=client, outcome=outcome, amount=amount, max_price=max_price,
-        confirm_live=confirm_live, **stores,
+        confirm_live=confirm_live, now=now, **stores,
     )
 
 
@@ -486,6 +486,79 @@ def test_live_existing_pending_order_blocks_the_preflight(tmp_path, capsys):
     assert sdk.orders.create_calls == []
 
 
+def test_live_wide_spread_and_thin_liquidity_reaches_the_preflight_and_names_both_gates(tmp_path, capsys):
+    """Regression for the real live scenario reported: best_bid=0.06
+    best_ask=0.07 (15.4% spread, over the 5% default limit) and thin
+    ask-side liquidity (well under the $25 default minimum). This must
+    NOT short-circuit on the early risk-check message -- it must flow
+    all the way into the consolidated LIVE PREFLIGHT block (so AUTH/
+    BALANCE/discovery/order-book are still shown), land on READY: NO,
+    and name BOTH failing risk checks individually in the STOP
+    reasons, not a generic "see above" pointer. No order attempted."""
+    slug = "manual-test-live-wide-spread"
+    thin_book = _book_response([_book_level("0.06", 50)], [_book_level("0.07", 300)])  # $21 of ask liquidity
+    sdk = _happy_sdk(slug)
+    sdk.markets.books[slug] = thin_book
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+
+    rc = _run(settings, client, stores, confirm_live=True, max_price=0.08)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    # Still reaches the full preflight -- this is the fix: a failed risk
+    # check must not pre-empt the consolidated status.
+    assert "LIVE PREFLIGHT" in out
+    assert "AUTH: OK" in out
+    assert "READY FOR FIRST $5 LIVE TEST: NO" in out
+    assert "STOP. The following gate(s) are not satisfied:" in out
+    assert "RISK:MAX_SPREAD" in out
+    assert "RISK:ORDER_BOOK_LIQUIDITY" in out
+    assert sdk.orders.create_calls == []
+    assert stores["pending_store"].load() == []  # no pending order created either
+
+
+def test_automatic_rollover_to_the_next_window_fetches_a_fresh_order_book(tmp_path, capsys):
+    """Points 3/10: with no --market-slug, each invocation re-resolves
+    the CURRENT window via automatic discovery and fetches a FRESH
+    order book for it -- never a cached/stale one from a previous
+    window. Simulates two consecutive 15-minute windows with
+    DIFFERENT order books and confirms each run reflects its own."""
+    window_1 = datetime(2026, 10, 7, 21, 45, tzinfo=timezone.utc)
+    window_2 = datetime(2026, 10, 7, 22, 0, tzinfo=timezone.utc)
+    slug_1 = f"btc-updown-15m-{window_1:%Y-%m-%d-%H%M}z"
+    slug_2 = f"btc-updown-15m-{window_2:%Y-%m-%d-%H%M}z"
+    event_1 = _event(slug=slug_1, start=window_1, end=window_1 + timedelta(minutes=15), market_slug=slug_1)
+    event_2 = _event(slug=slug_2, start=window_2, end=window_2 + timedelta(minutes=15), market_slug=slug_2)
+    book_1 = _book_response([_book_level("0.54", 100)], [_book_level("0.55", 100)])  # tight, liquid
+    book_2 = _book_response([_book_level("0.06", 50)], [_book_level("0.07", 300)])  # wide, thin
+    sdk = _FakeSDKClient(
+        events=_FakeEvents({slug_1: {"event": event_1}, slug_2: {"event": event_2}}),
+        markets=_FakeMarkets(books={slug_1: book_1, slug_2: book_2}),
+        orders=_FakeOrders(preview_response={"order": {"id": "preview-ok"}}),
+        account=_FakeAccount(response={"balances": [{"currency": "USD", "currentBalance": 51.58}]}),
+    )
+    settings_no_slug = PolymarketSettings.from_env(env={
+        "POLYMARKET_VENUE": "us", **_LIVE_CREDS,
+        "POLYMARKET_TRADING_MODE": "live", "POLYMARKET_LIVE_TRADING_CONFIRMED": "true",
+    })
+    client = PolymarketUSClient(settings_no_slug, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+
+    _run(settings_no_slug, client, stores, confirm_live=False, now=window_1 + timedelta(minutes=2))
+    out_1 = capsys.readouterr().out
+    assert f"EVENT SLUG: {slug_1}" in out_1
+    assert "BEST BID: 0.54" in out_1
+
+    _run(settings_no_slug, client, stores, confirm_live=False, now=window_2 + timedelta(minutes=2))
+    out_2 = capsys.readouterr().out
+    assert f"EVENT SLUG: {slug_2}" in out_2
+    assert "BEST BID: 0.06" in out_2  # the SECOND window's own book, not the first's cached one
+
+
 def test_live_unknown_fill_status_stops_and_does_not_assume_a_fill(tmp_path, capsys):
     """If get_fill_status() can't confidently interpret the exchange's
     response, this must STOP and report it, never assume a fill either
@@ -517,7 +590,14 @@ def test_live_mode_with_no_market_slug_uses_automatic_btc_discovery(tmp_path, ca
     """--market-slug is optional: with POLYMARKET_US_MARKET_SLUG unset,
     even in live mode, the preflight resolves the market via the real
     automatic BTC 15m discovery path -- a production live test must
-    never require pasting a fresh slug every 15 minutes."""
+    never require pasting a fresh slug every 15 minutes.
+
+    Deliberately asserts on the EVENT SLUG: line (printed right after
+    discovery, before risk checks run) rather than on reaching the full
+    LIVE PREFLIGHT block or any particular risk outcome -- the real
+    current window's remaining time (ENTRY_CUTOFF) is a function of the
+    wall clock at the moment this test happens to run, which this test
+    must not be sensitive to."""
     now = _real_now()
     settings_no_slug = PolymarketSettings.from_env(env={
         "POLYMARKET_VENUE": "us", **_LIVE_CREDS,
@@ -538,7 +618,8 @@ def test_live_mode_with_no_market_slug_uses_automatic_btc_discovery(tmp_path, ca
     _run(settings_no_slug, client, stores, confirm_live=False)
 
     out = capsys.readouterr().out
-    assert f"CURRENT BTC 15M: 'BTC Up or Down 15m' (condition_id={btc_slug})" in out
+    assert f"EVENT SLUG: {btc_slug}" in out
+    assert f"TRADEABLE MARKET SLUG: {btc_slug}" in out
 
 
 def test_non_us_venue_is_refused(monkeypatch, tmp_path, capsys):
