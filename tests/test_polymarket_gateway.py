@@ -66,6 +66,30 @@ def test_paper_gateway_simulates_a_fill(tmp_path):
     assert result.submission is None  # nothing was ever submitted to an exchange
 
 
+def test_paper_gateway_uses_explicit_quantity_for_a_sell_exit(tmp_path):
+    """A SELL (exit) order carries an exact share count -- the paper
+    simulation must honor it verbatim, never re-derive shares from
+    size_usd/max_price (that reconstruction is unsafe for a SELL -- see
+    OrderRequest.quantity's docstring)."""
+    settings = _settings()
+    gateway = PaperPolymarketGateway(settings, _logger(tmp_path))
+    order = _order(side="SELL", size_usd=2.16, max_price=0.432, quantity=5)
+    result = gateway.submit_order(order)
+    assert result.status == "simulated_fill"
+    assert result.fill_result.filled_shares == 5
+    assert result.fill_result.requested_shares == 5
+    assert result.fill_result.avg_fill_price == 0.432
+
+
+def test_paper_gateway_buy_still_derives_shares_from_size_and_price(tmp_path):
+    """Unchanged BUY behavior: no `quantity` set, shares still come
+    from size_usd/max_price exactly as before this feature."""
+    settings = _settings()
+    gateway = PaperPolymarketGateway(settings, _logger(tmp_path))
+    result = gateway.submit_order(_order(size_usd=5.0, max_price=0.5))
+    assert result.fill_result.filled_shares == pytest.approx(10.0)
+
+
 def test_paper_gateway_refuses_outside_paper_mode(tmp_path):
     settings = _settings(POLYMARKET_TRADING_MODE="live", POLYMARKET_PRIVATE_KEY=_VALID_KEY)
     gateway = PaperPolymarketGateway(settings, _logger(tmp_path))

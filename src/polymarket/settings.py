@@ -206,6 +206,23 @@ class PolymarketSettings:
     # filled" case for new entries by construction.
     default_order_type: str
 
+    # --- Automatic profit-target exit (see exit_manager.py) ----------------
+    # Fraction above the position's ACTUAL average fill price at which an
+    # open position becomes eligible to exit, e.g. 0.20 => exit once the
+    # live best BID reaches avg_fill_price * 1.20. Gross-price trigger —
+    # see exit_manager.compute_target_price's docstring for why this is
+    # intentionally distinct from the NET-of-fees realized P&L that gets
+    # recorded once a fill actually happens.
+    profit_target_pct: float
+    # A second, independent safety switch (same "deliberately overlapping
+    # guards" pattern as live_trading_confirmed/live_auto_execute — see
+    # gateway.py's module docstring) specifically for AUTOMATIC exits.
+    # False (the default) means check_and_execute_profit_target_exits()
+    # never submits a real exit order even if everything else (live mode,
+    # live_trading_confirmed, live_auto_execute) is already green — exit
+    # automation must be turned on explicitly and separately from entries.
+    auto_exit_enabled: bool
+
     # --- Market selection --------------------------------------------------
     # The underlying this system trades. Only "bitcoin" is implemented
     # (see strategy.py's module docstring on why this stays single-asset).
@@ -261,6 +278,8 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE must be >= 0")
         if self.poll_interval_seconds <= 0:
             raise PolymarketConfigError("POLYMARKET_POLL_INTERVAL_SECONDS must be > 0")
+        if self.profit_target_pct <= 0:
+            raise PolymarketConfigError("POLYMARKET_PROFIT_TARGET_PCT must be > 0")
         if self.venue not in VALID_VENUES:
             raise PolymarketConfigError(
                 f"POLYMARKET_VENUE={self.venue!r} is invalid; must be one of {sorted(VALID_VENUES)}"
@@ -375,6 +394,8 @@ class PolymarketSettings:
             min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 25.0),
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
             default_order_type=_get_str(env, "POLYMARKET_DEFAULT_ORDER_TYPE", "FOK").upper(),
+            profit_target_pct=_get_float(env, "POLYMARKET_PROFIT_TARGET_PCT", 0.20),
+            auto_exit_enabled=_get_bool(env, "POLYMARKET_AUTO_EXIT_ENABLED", False),
             asset=_get_str(env, "POLYMARKET_ASSET", "bitcoin").lower(),
             market_duration_minutes=_get_int(env, "POLYMARKET_MARKET_DURATION_MINUTES", 15),
             entry_cutoff_seconds_before_close=_get_int(env, "POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", 120),

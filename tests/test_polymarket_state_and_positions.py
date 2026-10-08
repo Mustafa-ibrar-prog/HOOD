@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from src.polymarket.positions import OpenPosition, PolymarketPositionStore
+from src.polymarket.positions import OpenPosition, PolymarketPositionStore, PolymarketPositionStoreError
 from src.polymarket.state import DailyPnlState, DailyPnlStateStore, PolymarketRiskStateError
 
 
@@ -117,3 +117,62 @@ def test_add_if_absent_is_idempotent_across_a_fresh_store_instance(tmp_path):
     assert PolymarketPositionStore(path).add_if_absent(position) is True
     assert PolymarketPositionStore(path).add_if_absent(position) is False
     assert len(PolymarketPositionStore(path).load()) == 1
+
+
+# --- entry_fee_usd / exit_pending_order_id (automatic profit-target exit) -----
+
+def test_entry_fee_and_exit_pending_order_id_default_and_round_trip(tmp_path):
+    store = PolymarketPositionStore(tmp_path / "positions.json")
+    position = _position()
+    assert position.entry_fee_usd == 0.0
+    assert position.exit_pending_order_id is None
+    store.add_if_absent(position)
+    reloaded = store.load()[0]
+    assert reloaded.entry_fee_usd == 0.0
+    assert reloaded.exit_pending_order_id is None
+
+
+def test_exit_pending_order_id_round_trips_when_set(tmp_path):
+    store = PolymarketPositionStore(tmp_path / "positions.json")
+    position = _position(entry_fee_usd=0.015, exit_pending_order_id="pending-exit-1")
+    store.add_if_absent(position)
+    reloaded = store.load()[0]
+    assert reloaded.entry_fee_usd == pytest.approx(0.015)
+    assert reloaded.exit_pending_order_id == "pending-exit-1"
+
+
+# --- PolymarketPositionStore.get()/update() (exit_manager.py's only way to
+# mutate an existing position -- partial exit fills, idempotency guard) -------
+
+def test_get_returns_none_when_absent(tmp_path):
+    store = PolymarketPositionStore(tmp_path / "positions.json")
+    assert store.get("no-such-id") is None
+
+
+def test_get_finds_by_client_order_id(tmp_path):
+    store = PolymarketPositionStore(tmp_path / "positions.json")
+    position = _position(client_order_id="client-9")
+    store.add_if_absent(position)
+    assert store.get("client-9") == position
+
+
+def test_update_replaces_the_matching_entry_in_place(tmp_path):
+    store = PolymarketPositionStore(tmp_path / "positions.json")
+    position = _position(client_order_id="client-1", filled_shares=10.0)
+    store.add_if_absent(position)
+    other = _position(client_order_id="client-2", condition_id="c2")
+    store.add_if_absent(other)
+
+    reduced = _position(client_order_id="client-1", filled_shares=4.0, exit_pending_order_id=None)
+    store.update(reduced)
+
+    positions = {p.client_order_id: p for p in store.load()}
+    assert len(positions) == 2
+    assert positions["client-1"].filled_shares == pytest.approx(4.0)
+    assert positions["client-2"].filled_shares == 10.0  # untouched
+
+
+def test_update_raises_when_nothing_to_update(tmp_path):
+    store = PolymarketPositionStore(tmp_path / "positions.json")
+    with pytest.raises(PolymarketPositionStoreError):
+        store.update(_position(client_order_id="never-added"))

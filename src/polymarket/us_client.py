@@ -168,6 +168,17 @@ from src.polymarket.settings import PolymarketSettings
 # best-inferred, not confirmed, reading.
 _INTENT_FOR_OUTCOME = {"YES": "ORDER_INTENT_BUY_LONG", "NO": "ORDER_INTENT_BUY_SHORT"}
 
+# CreateOrderParams.intent for CLOSING an existing position in each
+# outcome — i.e. a SELL (exit_manager.py's profit-target exit is the
+# only caller). Confirmed directly from the installed polymarket-us
+# SDK's own OrderIntent Literal (polymarket_us.types.orders), not
+# guessed: closing a YES/LONG position is ORDER_INTENT_SELL_LONG;
+# closing a NO/SHORT position is ORDER_INTENT_SELL_SHORT. These are
+# full closes of what BUY_LONG/BUY_SHORT opened above — never a naked
+# short (there is no path in this codebase that submits a SELL without
+# an existing OpenPosition behind it — see exit_manager.py).
+_CLOSE_INTENT_FOR_OUTCOME = {"YES": "ORDER_INTENT_SELL_LONG", "NO": "ORDER_INTENT_SELL_SHORT"}
+
 # OrderRequest.order_type -> CreateOrderParams.tif. FOK/FAK are both
 # real TimeInForce values on this venue (TIME_IN_FORCE_FILL_OR_KILL /
 # TIME_IN_FORCE_IMMEDIATE_OR_CANCEL), confirmed in
@@ -625,26 +636,59 @@ class PolymarketUSClient:
     def _build_create_order_params(self, order: OrderRequest) -> dict:
         """Shared by place_order() and preview_order() so a preview
         reflects EXACTLY what a real submission would send — never two
-        independent constructions that could silently diverge."""
-        if order.side != "BUY":
-            raise PolymarketUSClientError("SELL is not supported — v1 scope is entries only (see positions.py)")
-        intent = _INTENT_FOR_OUTCOME.get(order.outcome)
-        if intent is None:
-            raise PolymarketUSClientError(f"Unsupported outcome {order.outcome!r} for a Polymarket US order intent")
+        independent constructions that could silently diverge.
+
+        BUY (entry) and SELL (exit_manager.py's profit-target exit) are
+        built from genuinely different fields, on purpose:
+          - BUY derives `quantity` from size_usd/max_price (a USD
+            budget, floored to whole contracts at the ceiling price).
+          - SELL uses `order.quantity` VERBATIM — an exact share count
+            exit_manager.py set from the position's own filled_shares.
+            Deriving it the BUY way instead (from a synthesized size_usd)
+            was tried and rejected: a 100k-trial randomized check found
+            floor-division reconstruction mismatches the intended share
+            count roughly half the time under ordinary floating-point
+            imprecision, which is unacceptable for closing an exact
+            position size.
+        `order.max_price` is used as the single `price` field either
+        way — for a BUY it is the ceiling the exchange will not cross;
+        for a SELL it is read as the FLOOR (the minimum acceptable sale
+        price, i.e. the position's own profit-target price) — this
+        venue's CreateOrderParams has one price field regardless of
+        side, so there is no separate min_price to populate.
+        """
         tif = _TIF_FOR_ORDER_TYPE.get(order.order_type)
         if tif is None:
             raise PolymarketUSClientError(f"Unsupported order_type {order.order_type!r} for Polymarket US tif mapping")
 
-        # quantity is a CONTRACT COUNT on this venue (unlike the
-        # international SDK's USD-notional `amount`) — see module
-        # docstring. Floors to whole contracts at the ceiling price, so
-        # the actual spend is never more than size_usd.
-        quantity = int(order.size_usd // order.max_price)
-        if quantity <= 0:
-            raise _OrderTooSmallError(
-                f"size_usd={order.size_usd} / max_price={order.max_price} rounds down to 0 whole "
-                "contracts — refusing to submit a zero-quantity order."
-            )
+        if order.side == "BUY":
+            intent = _INTENT_FOR_OUTCOME.get(order.outcome)
+            if intent is None:
+                raise PolymarketUSClientError(f"Unsupported outcome {order.outcome!r} for a Polymarket US order intent")
+            # quantity is a CONTRACT COUNT on this venue (unlike the
+            # international SDK's USD-notional `amount`) — see module
+            # docstring. Floors to whole contracts at the ceiling price, so
+            # the actual spend is never more than size_usd.
+            quantity = int(order.size_usd // order.max_price)
+            if quantity <= 0:
+                raise _OrderTooSmallError(
+                    f"size_usd={order.size_usd} / max_price={order.max_price} rounds down to 0 whole "
+                    "contracts — refusing to submit a zero-quantity order."
+                )
+        elif order.side == "SELL":
+            intent = _CLOSE_INTENT_FOR_OUTCOME.get(order.outcome)
+            if intent is None:
+                raise PolymarketUSClientError(f"Unsupported outcome {order.outcome!r} for a Polymarket US closing order intent")
+            if not order.quantity:
+                raise PolymarketUSClientError(
+                    "A SELL (exit) order requires OrderRequest.quantity to be set explicitly to the "
+                    "exact share count being closed — exit_manager.py must always set this from the "
+                    "position's own filled_shares; it is never derived from size_usd/max_price for a SELL."
+                )
+            quantity = order.quantity
+        else:
+            raise PolymarketUSClientError(f"Unsupported side {order.side!r}")
+
         return {
             "marketSlug": order.token_id, "intent": intent, "type": "ORDER_TYPE_LIMIT",
             "price": {"value": f"{order.max_price:.2f}", "currency": "USD"},
@@ -653,9 +697,11 @@ class PolymarketUSClient:
 
     # --- Order placement (implements gateway.py's PolymarketOrderPlacer) -----
     def place_order(self, order: OrderRequest) -> SubmissionOutcome:
-        """Submits an order. Returns a SubmissionOutcome — NOT a fill
-        determination; see models.SubmissionOutcome's docstring and
-        reconciliation.py. The response's own `executions` are
+        """Submits a BUY (entry) or SELL (exit_manager.py's
+        profit-target exit — see _build_create_order_params) order.
+        Returns a SubmissionOutcome — NOT a fill determination; see
+        models.SubmissionOutcome's docstring and reconciliation.py. The
+        response's own `executions` are
         deliberately IGNORED for fill purposes (see module docstring:
         get_fill_status() always re-queries fresh) but the COMPLETE raw
         response is preserved verbatim in `raw` regardless -- a real
@@ -766,9 +812,17 @@ class PolymarketUSClient:
             )
         status = "filled" if cum >= requested else "partially_filled"
         assert status in FILLED_STATUSES  # sanity check against models.py's own vocabulary
+        # Order.commissionNotionalTotalCollected (confirmed in the
+        # installed SDK's types.orders.Order) is this order's actual,
+        # cumulative exchange commission in USD, when reported — used by
+        # exit_manager.py to compute NET realized P&L on a profit-target
+        # exit rather than assuming the gross price move alone was
+        # profitable (see its docstring). _parse_amount() already
+        # returns None (never a fabricated 0.0) when the field is absent.
+        fee_usd = _parse_amount(order.get("commissionNotionalTotalCollected"))
         return FillResult(
             order_id=exchange_order_id, status=status, requested_shares=requested,
-            filled_shares=cum, avg_fill_price=avg_price, raw={"state": state},
+            filled_shares=cum, avg_fill_price=avg_price, raw={"state": state}, fee_usd=fee_usd,
         )
 
     def get_balance_usdc(self) -> float:

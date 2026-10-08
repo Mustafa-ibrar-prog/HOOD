@@ -105,6 +105,36 @@ def test_full_api_credential_triple_is_accepted():
     assert settings.api_passphrase == "p"
 
 
+# --- Automatic profit-target exit settings ------------------------------------
+
+def test_profit_target_pct_defaults_to_twenty_percent():
+    settings = PolymarketSettings.from_env(env={})
+    assert settings.profit_target_pct == pytest.approx(0.20)
+
+
+def test_auto_exit_enabled_defaults_to_false():
+    """A separate, exit-specific switch from live_auto_execute (the
+    entry-only flag) -- off by default, same conservative posture."""
+    settings = PolymarketSettings.from_env(env={})
+    assert settings.auto_exit_enabled is False
+
+
+def test_profit_target_pct_is_configurable():
+    settings = PolymarketSettings.from_env(env=_env(POLYMARKET_PROFIT_TARGET_PCT="0.10"))
+    assert settings.profit_target_pct == pytest.approx(0.10)
+
+
+def test_auto_exit_enabled_is_configurable():
+    settings = PolymarketSettings.from_env(env=_env(POLYMARKET_AUTO_EXIT_ENABLED="true"))
+    assert settings.auto_exit_enabled is True
+
+
+@pytest.mark.parametrize("value", ["0", "-0.1"])
+def test_non_positive_profit_target_pct_rejected(value):
+    with pytest.raises(PolymarketConfigError):
+        PolymarketSettings.from_env(env=_env(POLYMARKET_PROFIT_TARGET_PCT=value))
+
+
 def test_api_triple_alone_does_not_satisfy_live_mode_private_key_requirement():
     """Verified against SecureClient.create()'s real signature (see
     client.py's module docstring): private_key is required even when

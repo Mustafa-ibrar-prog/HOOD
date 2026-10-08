@@ -1,10 +1,14 @@
-"""Open-position tracking. v1 scope is deliberately "buy and hold to
-resolution" — a 15-minute binary market settles automatically at close
-(the YES or NO token you hold pays $1/share if it won, $0 if it
-didn't), so there is no options-style stop-loss/take-profit exit to
-build for a first version. Selling back into the order book before
-resolution (an early exit) is a real Polymarket feature and a natural
-v2, not built here — see engine.py's settle_resolved_positions().
+"""Open-position tracking. Base scope is "buy and hold to resolution" —
+a 15-minute binary market settles automatically at close (the YES or
+NO token you hold pays $1/share if it won, $0 if it didn't) — see
+engine.py's settle_resolved_positions(), still the fallback whenever a
+position's profit target is never reached.
+
+Selling back into the order book BEFORE resolution — an early,
+automatic profit-target exit — is implemented in exit_manager.py.
+`exit_pending_order_id` below is that module's own idempotency guard:
+while set, a position has an exit order in flight (or of genuinely
+unknown outcome) and must never be offered a second one.
 
 A position is only ever created from a verified FillResult
 (models.FillResult.is_fill) — see reconciliation.py. There is no path
@@ -42,6 +46,24 @@ class OpenPosition:
     status: str  # "filled" or "partially_filled" (models.FillStatus) — never anything else
     opened_at: datetime
     close_time: datetime
+    # Actual entry commission/fee, in USD, when the API reported one for
+    # the entry fill (see us_client.get_fill_status's fee_usd) — 0.0
+    # means "none reported," consistent with FillResult.fee_usd being
+    # None in that case (there is no ambiguity to preserve here the way
+    # there is on the exit side, since exit_manager.py's net-P&L
+    # computation is the only place that must distinguish "no fee
+    # reported" from "zero fee" — see its docstring).
+    entry_fee_usd: float = 0.0
+    # Set by exit_manager.py the instant a profit-target exit order is
+    # submitted (the PendingLiveOrder.id of that exit), and cleared only
+    # once that exit is authoritatively reconciled (fully filled, not
+    # filled, or the position's filled_shares has been reduced by a
+    # partial fill and a fresh exit becomes eligible again). This is the
+    # idempotency guard that keeps check_and_execute_profit_target_exits()
+    # from ever submitting a second exit order for the same position
+    # while one is already in flight or of unknown outcome — restart-safe
+    # because it is persisted here, not held in memory.
+    exit_pending_order_id: str | None = None
 
     @property
     def filled_size_usd(self) -> float:
@@ -61,6 +83,8 @@ class OpenPosition:
             filled_shares=float(data["filled_shares"]), avg_fill_price=float(data["avg_fill_price"]),
             order_id=data["order_id"], client_order_id=data["client_order_id"], status=data["status"],
             opened_at=datetime.fromisoformat(data["opened_at"]), close_time=datetime.fromisoformat(data["close_time"]),
+            entry_fee_usd=float(data.get("entry_fee_usd", 0.0)),
+            exit_pending_order_id=data.get("exit_pending_order_id"),
         )
 
 
@@ -103,3 +127,28 @@ class PolymarketPositionStore:
     def remove(self, condition_id: str) -> None:
         positions = [p for p in self.load() if p.condition_id != condition_id]
         self.save(positions)
+
+    def get(self, client_order_id: str) -> OpenPosition | None:
+        for position in self.load():
+            if position.client_order_id == client_order_id:
+                return position
+        return None
+
+    def update(self, position: OpenPosition) -> None:
+        """Replaces the existing entry matching `position.client_order_id`
+        in place (same identity key add_if_absent/exists/get use) —
+        exit_manager.py's only way to record a partial exit fill's
+        reduced filled_shares, or to set/clear exit_pending_order_id,
+        without going through remove()+add_if_absent() (which would
+        briefly make the position vanish from the ledger between the
+        two calls, and would refuse the re-add since add_if_absent is
+        itself an idempotency guard keyed on this same client_order_id)."""
+        positions = self.load()
+        for i, existing in enumerate(positions):
+            if existing.client_order_id == position.client_order_id:
+                positions[i] = position
+                self.save(positions)
+                return
+        raise PolymarketPositionStoreError(
+            f"No position with client_order_id={position.client_order_id!r} to update — it was never added"
+        )

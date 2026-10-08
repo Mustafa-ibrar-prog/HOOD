@@ -113,6 +113,35 @@ class OrderBookSnapshot:
             total += level.price * level.size
         return total
 
+    def executable_shares(self, *, side: str, min_price: float | None = None, max_price: float | None = None) -> float:
+        """Total SHARE size resting on the side of the book an order of
+        this type would consume, restricted to levels at or better than
+        the given price bound. Deliberately a separate method from
+        executable_liquidity_usd (which sums price*size, a USD notional,
+        and only supports a `max_price` ceiling): a profit-target SELL
+        needs a share-count floor check ("is there at least N shares of
+        BID depth at or above my minimum acceptable price"), which is a
+        different question with a different (opposite-direction) price
+        filter — reusing the BUY-oriented ceiling for a SELL floor would
+        silently check the wrong levels.
+
+        `side` is the side of OUR order: a BUY consumes asks (optionally
+        bounded above by `max_price`), a SELL consumes bids (optionally
+        bounded below by `min_price`). An empty or one-sided book
+        correctly returns 0.0, never raises.
+        """
+        if side not in _SIDES:
+            raise ValueError(f"side must be one of {sorted(_SIDES)}, got {side!r}")
+        levels = self.asks if side == "BUY" else self.bids
+        total = 0.0
+        for level in levels:
+            if max_price is not None and level.price > max_price:
+                continue
+            if min_price is not None and level.price < min_price:
+                continue
+            total += level.size
+        return total
+
 
 @dataclass(frozen=True)
 class BinaryMarket:
@@ -199,9 +228,11 @@ class SetupCandidate:
 
 @dataclass(frozen=True)
 class OrderRequest:
-    """A request to BUY shares of one outcome token. SELL is not
-    modeled yet — v1 scope is entries only (see positions.py's module
-    docstring on hold-to-resolution).
+    """A request to BUY or SELL shares of one outcome token. BUY opens/
+    grows a position (see positions.py's module docstring on
+    hold-to-resolution); SELL closes an existing one (see
+    exit_manager.py) — never a naked short, always sized to at most the
+    position's own remaining filled_shares.
 
     `order_type` defaults to FOK (fill-or-kill): the order either fills
     completely at a price no worse than `max_price`, or nothing happens
@@ -211,6 +242,18 @@ class OrderRequest:
     you can, cancel the rest) is supported for callers that explicitly
     want partial fills; the reconciliation path (reconciliation.py)
     handles both correctly either way, never assuming either outcome.
+
+    `quantity` is the EXACT share count for a SELL (exit) order — set
+    directly from the position's own filled_shares, never derived from
+    size_usd/max_price via floor division: reconstructing a share count
+    that way was verified (via a 100k-trial randomized check) to
+    mismatch the intended quantity roughly half the time under
+    ordinary floating-point imprecision. BUY orders leave this None and
+    keep deriving shares from size_usd/max_price exactly as before.
+    `closes_client_order_id` links a SELL back to the PendingLiveOrder
+    (by its own `id`) of the position being closed — see
+    exit_manager.py's idempotency guard, which refuses to submit a
+    second exit referencing the same id.
     """
 
     # condition_id/close_time are never sent to the exchange (client.py's
@@ -232,6 +275,8 @@ class OrderRequest:
     reason: str
     order_type: str = "FOK"
     ref_id: str | None = None
+    quantity: int | None = None
+    closes_client_order_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in _OUTCOMES:
@@ -244,12 +289,15 @@ class OrderRequest:
             raise ValueError("max_price must be between 0.0 and 1.0 (exclusive) — Polymarket shares never trade at or past the bounds")
         if self.size_usd <= 0:
             raise ValueError("size_usd must be > 0")
+        if self.quantity is not None and self.quantity <= 0:
+            raise ValueError("quantity must be > 0 when set")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "condition_id": self.condition_id, "token_id": self.token_id, "outcome": self.outcome, "side": self.side,
             "size_usd": self.size_usd, "max_price": self.max_price, "close_time": self.close_time.isoformat(),
             "reason": self.reason, "order_type": self.order_type, "ref_id": self.ref_id,
+            "quantity": self.quantity, "closes_client_order_id": self.closes_client_order_id,
         }
 
     @classmethod
@@ -260,6 +308,7 @@ class OrderRequest:
             close_time=datetime.fromisoformat(data["close_time"]),
             reason=data.get("reason", ""), order_type=data.get("order_type", "FOK"),
             ref_id=data.get("ref_id"),
+            quantity=data.get("quantity"), closes_client_order_id=data.get("closes_client_order_id"),
         )
 
 
@@ -282,6 +331,12 @@ class FillResult:
     filled_shares: float
     avg_fill_price: float | None  # None iff filled_shares == 0
     raw: Mapping[str, Any] = field(default_factory=dict)
+    # Actual exit commission/fee charged by the exchange for this fill,
+    # in USD, when the API reports one (e.g. Polymarket US's
+    # commissionNotionalTotalCollected) — see us_client.get_fill_status.
+    # None means "not reported," never "zero": exit_manager.py must not
+    # treat an absent fee as a known $0 fee when computing net P&L.
+    fee_usd: float | None = None
 
     def __post_init__(self) -> None:
         if self.status not in _FILL_STATUSES:

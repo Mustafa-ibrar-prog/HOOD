@@ -146,10 +146,15 @@ def test_max_open_positions_blocks_a_second_entry(tmp_path):
     market = _market(yes_bid=0.78, yes_ask=0.80)
     harness = _harness(tmp_path, market=market, recent_mids_seed=[0.50, 0.60, 0.70])
     # Pre-seed an already-open position so the risk gate should block a new one.
+    # avg_fill_price=0.75 is deliberate: its 20% profit target (0.90) is
+    # ABOVE this market's yes_bid=0.78, so the automatic profit-target
+    # exit check (exit_manager.py) correctly leaves it untouched —
+    # keeping this test isolated to what it actually tests (the
+    # max_open_positions gate), not incidentally exercising the exit path.
     now = datetime.now(timezone.utc)
     harness["position_store"].add_if_absent(OpenPosition(
         condition_id="other", token_id="y", outcome="YES", requested_size_usd=5.0,
-        filled_shares=10.0, avg_fill_price=0.5, order_id="paper:seed", client_order_id="seed-1",
+        filled_shares=10.0, avg_fill_price=0.75, order_id="paper:seed", client_order_id="seed-1",
         status="filled", opened_at=now, close_time=now + timedelta(minutes=5),
     ))
     state = harness["state_store"].load()
@@ -159,6 +164,34 @@ def test_max_open_positions_blocks_a_second_entry(tmp_path):
     report = run_cycle(**harness)
     assert not report.entered
     assert len(harness["position_store"].load()) == 1  # unchanged — still just the pre-seeded one
+
+
+def test_run_cycle_settles_via_resolution_fallback_when_target_was_never_reached(tmp_path):
+    """Requirement: keep the existing 15-minute resolution/settlement
+    behavior as the fallback whenever a position's profit target is
+    never reached before its market closes. Full run_cycle()
+    integration: the automatic profit-target exit check
+    (exit_manager.py) runs BEFORE this position's close_time arrives,
+    never triggers (its target is far above this market's prices), and
+    once the market actually closes, the ORIGINAL settlement path —
+    completely untouched by this feature — takes over exactly as before."""
+    market = _market(yes_bid=0.55, yes_ask=0.57)  # well below the pre-seeded position's own target
+    harness = _harness(tmp_path, market=market, recent_mids_seed=[0.50, 0.50, 0.50])
+    past_close = datetime.now(timezone.utc) - timedelta(minutes=1)
+    harness["position_store"].add_if_absent(OpenPosition(
+        condition_id="other-market", token_id="y", outcome="YES", requested_size_usd=5.0,
+        filled_shares=10.0, avg_fill_price=0.5, order_id="paper:x", client_order_id="client-1",
+        status="filled", opened_at=past_close - timedelta(minutes=15), close_time=past_close,
+    ))
+    harness["client"]._resolution = "YES"  # the pre-seeded position's market has now resolved
+
+    report = run_cycle(**harness)
+
+    assert report.settled_count == 1  # the fallback path closed it
+    assert report.exits_submitted == 0  # the profit-target path never touched it (already gone by then)
+    assert harness["position_store"].load() == []
+    state = harness["state_store"].load(today=datetime.now(timezone.utc).date())
+    assert state.realized_pnl_usd == pytest.approx(5.0)  # 10 shares - $5 cost = $5 profit, exactly as settlement computes
 
 
 def test_settle_resolved_positions_realizes_a_win(tmp_path):

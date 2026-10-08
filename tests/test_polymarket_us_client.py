@@ -878,12 +878,106 @@ def test_quantity_rounding_to_zero_refuses_to_submit(tmp_path):
     assert sdk.orders.create_calls == []  # never actually submitted
 
 
-def test_sell_side_is_not_supported(tmp_path):
+def test_sell_without_quantity_is_refused(tmp_path):
+    """A SELL (exit) order must always carry an explicit share count —
+    see OrderRequest.quantity's docstring on why this is never derived
+    from size_usd/max_price for a SELL. exit_manager.py always sets
+    this; a SELL order reaching here without it is a caller bug, not
+    an exchange rejection, so this raises rather than returning a
+    SubmissionOutcome(ok=False)."""
     sdk = _FakeSDKClient()
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
-    order = _order_request(side="SELL")
-    with pytest.raises(PolymarketUSClientError):
+    order = _order_request(side="SELL", quantity=None)
+    with pytest.raises(PolymarketUSClientError, match="quantity"):
         client.place_order(order)
+    assert sdk.orders.create_calls == []
+
+
+def test_sell_yes_uses_sell_long_closing_intent(tmp_path):
+    """Confirmed directly from the installed polymarket-us SDK's own
+    OrderIntent Literal (polymarket_us.types.orders) -- closing a
+    YES/LONG position is ORDER_INTENT_SELL_LONG, never guessed."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "exit-1", "executions": []}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(side="SELL", outcome="YES", max_price=0.432, quantity=5)
+    outcome = client.place_order(order)
+    assert outcome.ok is True
+    params = sdk.orders.create_calls[0]
+    assert params["intent"] == "ORDER_INTENT_SELL_LONG"
+    assert params["quantity"] == 5  # the EXACT requested quantity -- never re-derived from size_usd/max_price
+    assert params["price"]["value"] == "0.43"
+
+
+def test_sell_no_uses_sell_short_closing_intent(tmp_path):
+    """Closing a NO/SHORT position is ORDER_INTENT_SELL_SHORT --
+    confirmed the same way as the YES case above."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "exit-2", "executions": []}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(side="SELL", outcome="NO", max_price=0.60, quantity=7)
+    outcome = client.place_order(order)
+    assert outcome.ok is True
+    assert sdk.orders.create_calls[0]["intent"] == "ORDER_INTENT_SELL_SHORT"
+    assert sdk.orders.create_calls[0]["quantity"] == 7
+
+
+def test_sell_quantity_bypasses_the_buy_side_floor_division(tmp_path):
+    """A SELL's quantity must come from OrderRequest.quantity verbatim,
+    never from floor(size_usd / max_price) the way a BUY's does -- a
+    mismatched size_usd/max_price pair must not silently change how
+    many shares are offered to close."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "exit-3", "executions": []}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    # floor(1.00 / 0.43) would be 2 -- but the real position is 5 shares.
+    order = _order_request(side="SELL", outcome="YES", size_usd=1.00, max_price=0.43, quantity=5)
+    client.place_order(order)
+    assert sdk.orders.create_calls[0]["quantity"] == 5
+
+
+def test_sell_order_uses_fok_or_fak_tif_never_gtc(tmp_path):
+    """Requirement: an exit must use an IOC/FOK-style closing order so
+    the bot never leaves an unintended resting sell order."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "exit-4", "executions": []}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(side="SELL", outcome="YES", max_price=0.432, quantity=5, order_type="FAK")
+    client.place_order(order)
+    assert sdk.orders.create_calls[0]["tif"] == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
+
+
+def test_preview_sell_order_uses_the_exact_same_params_as_place_order(tmp_path):
+    sdk = _FakeSDKClient(
+        orders=_FakeOrders(preview_response={"order": {}}, create_response={"id": "exit-5", "executions": []}),
+    )
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(side="SELL", outcome="YES", max_price=0.432, quantity=5)
+    client.preview_order(order)
+    client.place_order(order)
+    assert sdk.orders.preview_calls[0]["request"] == sdk.orders.create_calls[0]
+
+
+# --- Exit fee parsing (requirement: NET realized P&L, never assumed from
+# gross price alone) --------------------------------------------------------
+
+def test_get_fill_status_parses_reported_commission_into_fee_usd(tmp_path):
+    order_id = "ord-fee-1"
+    response = _order_response("ORDER_STATE_FILLED", quantity=5, cum=5, avg_px="0.432", order_id=order_id)
+    response["order"]["commissionNotionalTotalCollected"] = _amount("0.02")
+    sdk = _FakeSDKClient(orders=_FakeOrders(retrieve_responses={order_id: response}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    fill = client.get_fill_status(order_id)
+    assert fill.status == "filled"
+    assert fill.fee_usd == pytest.approx(0.02)
+
+
+def test_get_fill_status_fee_usd_is_none_when_not_reported(tmp_path):
+    """None means "not reported," never a fabricated 0.0 -- a caller
+    computing net P&L must be able to tell the two apart."""
+    order_id = "ord-fee-2"
+    response = _order_response("ORDER_STATE_FILLED", quantity=5, cum=5, avg_px="0.432", order_id=order_id)
+    assert response["order"]["commissionNotionalTotalCollected"] is None
+    sdk = _FakeSDKClient(orders=_FakeOrders(retrieve_responses={order_id: response}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    fill = client.get_fill_status(order_id)
+    assert fill.fee_usd is None
 
 
 # --- 5b. Order preview (orders.preview() -- never places anything) ----------

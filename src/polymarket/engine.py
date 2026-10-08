@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from src.polymarket import reconciliation
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
+from src.polymarket.exit_manager import check_and_execute_profit_target_exits
 from src.polymarket.gateway import ExecutionGateway
 from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import BinaryMarket, OrderRequest
@@ -30,6 +31,7 @@ class CycleReport:
     entered: bool = False
     settled_count: int = 0
     reconciled_count: int = 0
+    exits_submitted: int = 0
 
 
 @dataclass
@@ -116,11 +118,26 @@ def run_cycle(
         client=client, position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
     )
 
+    # Automatic profit-target exit check (see exit_manager.py):
+    # deliberately placed AFTER settlement (a position that already
+    # resolved this cycle is gone, nothing to exit-check) and BEFORE any
+    # new-entry evaluation below, so the open-position count a new
+    # trade's risk checks read reflects any exit that just closed.
+    # Never touches MAX_BET_SIZE/MAX_DAILY_LOSS/MAX_SPREAD/
+    # ORDER_BOOK_LIQUIDITY/ENTRY_CUTOFF or anything below this point.
+    exits_submitted = check_and_execute_profit_target_exits(
+        client=client, settings=settings, gateway=gateway, position_store=position_store,
+        pending_store=pending_store, state_store=state_store, decision_logger=decision_logger, now=now,
+    )
+
     try:
         market = client.find_active_btc_market(now=now)
     except NoActiveMarketError as exc:
         decision_logger.log_decision(kind="no_trade", reason=str(exc))
-        return CycleReport(ran=True, skipped_reason=str(exc), settled_count=settled, reconciled_count=reconciled)
+        return CycleReport(
+            ran=True, skipped_reason=str(exc), settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
 
     recent_mids = history.observe(market)
 
@@ -130,7 +147,10 @@ def run_cycle(
             kind="no_trade", reason="No qualifying setup this cycle",
             evidence={"question": market.question, "yes_mid": market.yes_mid, "samples": len(recent_mids)},
         )
-        return CycleReport(ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled)
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
 
     token_id = market.token_id_for(candidate.thesis.outcome)
     # The outcome's OWN order book — never inferred from the other side,
@@ -145,7 +165,10 @@ def run_cycle(
             reason=f"No ask-side liquidity in {candidate.thesis.outcome}'s order book on {market.condition_id}",
             evidence={"token_id": token_id},
         )
-        return CycleReport(ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled)
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
 
     # Hard ceiling the exchange will not cross, anchored to the REAL best
     # ask (not the strategy's own suggested_entry_price, which for NO is
@@ -160,7 +183,10 @@ def run_cycle(
     )
     if not decision.allowed:
         decision_logger.log_risk_block(decision, context="new_trade")
-        return CycleReport(ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled)
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
 
     order = OrderRequest(
         condition_id=market.condition_id, token_id=token_id, outcome=candidate.thesis.outcome, side="BUY",
@@ -207,5 +233,5 @@ def run_cycle(
 
     return CycleReport(
         ran=True, market_question=market.question, entered=entered,
-        settled_count=settled, reconciled_count=reconciled,
+        settled_count=settled, reconciled_count=reconciled, exits_submitted=exits_submitted,
     )

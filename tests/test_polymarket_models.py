@@ -140,6 +140,37 @@ def test_liquidity_rejects_invalid_side():
         book.executable_liquidity_usd(side="HOLD", max_price=0.5)
 
 
+# --- OrderBookSnapshot.executable_shares (profit-target exit liquidity check) --
+
+def test_executable_shares_sell_side_sums_bids_at_or_above_min_price():
+    book = _book(bids=(BookLevel(price=0.45, size=10.0), BookLevel(price=0.40, size=20.0)))
+    assert book.executable_shares(side="SELL", min_price=0.45) == pytest.approx(10.0)
+    assert book.executable_shares(side="SELL", min_price=0.40) == pytest.approx(30.0)
+
+
+def test_executable_shares_sell_side_excludes_levels_below_min_price():
+    book = _book(bids=(BookLevel(price=0.432, size=5.0), BookLevel(price=0.40, size=100.0)))
+    # Only the 0.432 level (at/above a 0.432 target) counts -- the much
+    # larger 0.40 level is below the floor and must not count as usable.
+    assert book.executable_shares(side="SELL", min_price=0.432) == pytest.approx(5.0)
+
+
+def test_executable_shares_buy_side_sums_asks_at_or_below_max_price():
+    book = _book(asks=(BookLevel(price=0.50, size=10.0), BookLevel(price=0.60, size=20.0)))
+    assert book.executable_shares(side="BUY", max_price=0.55) == pytest.approx(10.0)
+
+
+def test_executable_shares_empty_book_is_zero_not_an_error():
+    book = _book(bids=())
+    assert book.executable_shares(side="SELL", min_price=0.5) == 0.0
+
+
+def test_executable_shares_rejects_invalid_side():
+    book = _book()
+    with pytest.raises(ValueError):
+        book.executable_shares(side="HOLD", min_price=0.5)
+
+
 def test_best_bid_ask_mid_spread():
     book = _book(bids=(BookLevel(price=0.48, size=10),), asks=(BookLevel(price=0.52, size=10),))
     assert book.best_bid == 0.48
@@ -176,6 +207,27 @@ def test_order_request_defaults_to_fok():
     assert _order().order_type == "FOK"
 
 
+# --- OrderRequest.quantity/closes_client_order_id (profit-target exit) --------
+
+def test_order_request_quantity_defaults_to_none_and_round_trips():
+    buy = _order()
+    assert buy.quantity is None
+    assert buy.closes_client_order_id is None
+    assert OrderRequest.from_dict(buy.to_dict()) == buy
+
+    exit_order = _order(side="SELL", quantity=5, closes_client_order_id="client-1")
+    assert exit_order.quantity == 5
+    assert exit_order.closes_client_order_id == "client-1"
+    assert OrderRequest.from_dict(exit_order.to_dict()) == exit_order
+
+
+def test_order_request_rejects_non_positive_quantity():
+    with pytest.raises(ValueError):
+        _order(side="SELL", quantity=0)
+    with pytest.raises(ValueError):
+        _order(side="SELL", quantity=-1)
+
+
 # --- FillResult (Task 3) -------------------------------------------------------
 
 def test_fill_result_is_fill_only_for_filled_statuses():
@@ -187,6 +239,18 @@ def test_fill_result_is_fill_only_for_filled_statuses():
 
     unknown = FillResult(order_id="o1", status="unknown", requested_shares=10.0, filled_shares=0.0, avg_fill_price=None)
     assert not unknown.is_fill  # fail-closed: unknown is never treated as a fill
+
+
+def test_fill_result_fee_usd_defaults_to_none_not_zero():
+    """None means "not reported" (requirement: compute NET P&L from the
+    ACTUAL fee data available, never fabricate a $0 fee)."""
+    fill = FillResult(order_id="o1", status="filled", requested_shares=5.0, filled_shares=5.0, avg_fill_price=0.432)
+    assert fill.fee_usd is None
+
+    with_fee = FillResult(
+        order_id="o1", status="filled", requested_shares=5.0, filled_shares=5.0, avg_fill_price=0.432, fee_usd=0.02,
+    )
+    assert with_fee.fee_usd == pytest.approx(0.02)
 
 
 def test_fill_result_rejects_inconsistent_shares_and_price():

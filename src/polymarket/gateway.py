@@ -117,7 +117,12 @@ class PaperPolymarketGateway(ExecutionGateway):
 
     def submit_order(self, order: OrderRequest) -> OrderResult:
         assert_paper_mode(self._settings)
-        shares = round(order.size_usd / order.max_price, 6)
+        # A SELL (exit) order always carries an explicit `quantity` (the
+        # exact share count being closed — see OrderRequest's and
+        # us_client._build_create_order_params's docstrings on why this
+        # is never reconstructed from size_usd/max_price). A BUY leaves
+        # `quantity` None and keeps deriving shares the original way.
+        shares = order.quantity if order.quantity is not None else round(order.size_usd / order.max_price, 6)
         fill = FillResult(
             order_id=f"paper:{uuid.uuid4()}", status="filled",
             requested_shares=shares, filled_shares=shares, avg_fill_price=order.max_price,

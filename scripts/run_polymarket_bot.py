@@ -97,7 +97,7 @@ def main() -> int:
             cycles += 1
             print(
                 f"cycle {cycles}: ran={report.ran} market={report.market_question!r} entered={report.entered} "
-                f"settled={report.settled_count} reconciled={report.reconciled_count}"
+                f"settled={report.settled_count} reconciled={report.reconciled_count} exits_submitted={report.exits_submitted}"
             )
             if args.once or (args.max_cycles is not None and cycles >= args.max_cycles):
                 break
