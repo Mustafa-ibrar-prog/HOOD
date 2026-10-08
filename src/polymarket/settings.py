@@ -206,22 +206,46 @@ class PolymarketSettings:
     # filled" case for new entries by construction.
     default_order_type: str
 
-    # --- Automatic profit-target exit (see exit_manager.py) ----------------
-    # Fraction above the position's ACTUAL average fill price at which an
-    # open position becomes eligible to exit, e.g. 0.20 => exit once the
-    # live best BID reaches avg_fill_price * 1.20. Gross-price trigger —
-    # see exit_manager.compute_target_price's docstring for why this is
-    # intentionally distinct from the NET-of-fees realized P&L that gets
-    # recorded once a fill actually happens.
+    # --- Evidence-gated dynamic exit (see exit_manager.py) ------------------
+    # Fraction above the position's ACTUAL average fill price that counts
+    # as the SOFT profit target, e.g. 0.20 => avg_fill_price * 1.20. This
+    # is deliberately NOT an unconditional sell trigger — see
+    # exit_manager.py's module docstring: reaching it is one input to an
+    # evidence-gated cascade (BTC momentum/structure/reversal evidence,
+    # reusing src/strategy/evidence.py's evaluate_momentum() via
+    # btc_intelligence.py), not a sell-by-itself condition.
     profit_target_pct: float
     # A second, independent safety switch (same "deliberately overlapping
     # guards" pattern as live_trading_confirmed/live_auto_execute — see
     # gateway.py's module docstring) specifically for AUTOMATIC exits.
-    # False (the default) means check_and_execute_profit_target_exits()
-    # never submits a real exit order even if everything else (live mode,
+    # False (the default) means check_and_execute_dynamic_exits() never
+    # submits a real exit order even if everything else (live mode,
     # live_trading_confirmed, live_auto_execute) is already green — exit
     # automation must be turned on explicitly and separately from entries.
     auto_exit_enabled: bool
+    # THE master switch for the entire dynamic-exit feature (both the
+    # evidence cascade's decision-making AND any submission, paper or
+    # live). False (the default) makes check_and_execute_dynamic_exits()
+    # a complete no-op — it never even evaluates a position. Ships
+    # disabled; a human must turn this on explicitly once ready to try it,
+    # even in paper mode.
+    dynamic_exit_enabled: bool
+    # How many seconds of fed BTC quote samples (btc_market_data.py) are
+    # aggregated into one OHLC bar for the BTC evidence engine. 60
+    # (one-minute bars) matches this system's own poll_interval_seconds
+    # default order of magnitude — fine enough to accumulate real
+    # structure within a 15-minute market, coarse enough that a handful
+    # of fed quotes per minute is enough to form a real bar.
+    btc_bar_interval_seconds: int
+    # Minimum corroborating weakening/reversing signals required before
+    # an early (below-target) exit is recommended — see
+    # exit_manager.DynamicExitConfig. Same default (2) as the proven
+    # options-side EvaluatorConfig.min_weakening_signals_for_exit,
+    # reused rather than independently re-tuned.
+    min_weakening_signals_for_exit: int
+    # Where fed BTC quote samples persist (btc_market_data.BtcPriceHistoryStore)
+    # — restart-safe, same file-backed convention as every other store here.
+    btc_price_history_file: str
 
     # --- Market selection --------------------------------------------------
     # The underlying this system trades. Only "bitcoin" is implemented
@@ -280,6 +304,10 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_POLL_INTERVAL_SECONDS must be > 0")
         if self.profit_target_pct <= 0:
             raise PolymarketConfigError("POLYMARKET_PROFIT_TARGET_PCT must be > 0")
+        if self.btc_bar_interval_seconds <= 0:
+            raise PolymarketConfigError("POLYMARKET_BTC_BAR_INTERVAL_SECONDS must be > 0")
+        if self.min_weakening_signals_for_exit <= 0:
+            raise PolymarketConfigError("POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT must be > 0")
         if self.venue not in VALID_VENUES:
             raise PolymarketConfigError(
                 f"POLYMARKET_VENUE={self.venue!r} is invalid; must be one of {sorted(VALID_VENUES)}"
@@ -396,6 +424,10 @@ class PolymarketSettings:
             default_order_type=_get_str(env, "POLYMARKET_DEFAULT_ORDER_TYPE", "FOK").upper(),
             profit_target_pct=_get_float(env, "POLYMARKET_PROFIT_TARGET_PCT", 0.20),
             auto_exit_enabled=_get_bool(env, "POLYMARKET_AUTO_EXIT_ENABLED", False),
+            dynamic_exit_enabled=_get_bool(env, "POLYMARKET_DYNAMIC_EXIT_ENABLED", False),
+            btc_bar_interval_seconds=_get_int(env, "POLYMARKET_BTC_BAR_INTERVAL_SECONDS", 60),
+            min_weakening_signals_for_exit=_get_int(env, "POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT", 2),
+            btc_price_history_file=_get_str(env, "POLYMARKET_BTC_PRICE_HISTORY_FILE", "logs/polymarket/btc_price_history.json"),
             asset=_get_str(env, "POLYMARKET_ASSET", "bitcoin").lower(),
             market_duration_minutes=_get_int(env, "POLYMARKET_MARKET_DURATION_MINUTES", 15),
             entry_cutoff_seconds_before_close=_get_int(env, "POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", 120),

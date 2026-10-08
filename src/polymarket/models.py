@@ -39,6 +39,49 @@ FILLED_STATUSES = frozenset({"filled", "partially_filled"})
 
 PENDING_STATUSES = frozenset({"awaiting_approval", "submitted", "rejected", "expired", "failed"})
 
+_SIGNAL_DIRECTIONS = frozenset({"bullish", "bearish", "neutral"})
+
+
+@dataclass(frozen=True)
+class Signal:
+    """One self-contained piece of market evidence — the uniform shape
+    every input to the BTC/Polymarket intelligence engine (see
+    btc_intelligence.py) is wrapped in before it's shown to a human or
+    an LLM explaining the decision: where it came from, when it was
+    observed, its raw value, which way it points, and how much weight
+    it deserves. This is deliberately NOT the only internal
+    representation signals are scored in — evaluate_momentum()
+    (src/strategy/evidence.py) still does the actual STRENGTHENING/
+    WEAKENING/REVERSING scoring from its own typed MomentumEvidence
+    fields, reused unmodified — Signal exists for AUDITABILITY (so
+    every signal that went into a decision can be listed, source and
+    all) and for signals that fall outside evaluate_momentum's existing
+    fields entirely (Polymarket's own order-book microstructure).
+
+    `confidence` is 0.0-1.0, this signal's own weight/reliability — NOT
+    a probability that BTC goes up. A signal with incomplete or stale
+    backing data should carry a low confidence rather than being
+    omitted silently.
+    """
+
+    source: str  # e.g. "btc_rsi", "btc_macd_histogram", "polymarket_order_book_imbalance"
+    timestamp: datetime
+    value: float | bool | None
+    direction: str  # "bullish" | "bearish" | "neutral"
+    confidence: float
+
+    def __post_init__(self) -> None:
+        if self.direction not in _SIGNAL_DIRECTIONS:
+            raise ValueError(f"direction must be one of {sorted(_SIGNAL_DIRECTIONS)}, got {self.direction!r}")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source, "timestamp": self.timestamp.isoformat(), "value": self.value,
+            "direction": self.direction, "confidence": self.confidence,
+        }
+
 
 @dataclass(frozen=True)
 class BookLevel:
@@ -62,6 +105,21 @@ class OrderBookSnapshot:
     bids: tuple[BookLevel, ...]  # best (highest) bid first
     asks: tuple[BookLevel, ...]  # best (lowest) ask first
     fetched_at: datetime
+    # Optional market-statistics fields, populated ONLY on the US venue
+    # from Polymarket US's own MarketBook.stats block (us_client.py's
+    # get_order_book() already fetches this response for bids/asks —
+    # these are additional fields from that SAME response, previously
+    # parsed and discarded). None on the international venue (whose
+    # book response has no equivalent block) or whenever the US venue's
+    # own stats block is itself absent/empty — never fabricated.
+    # last_trade_price/shares_traded are this system's one source for a
+    # real (if coarse) executed-trade/activity signal — see
+    # btc_intelligence.py's assess_polymarket_microstructure().
+    last_trade_price: float | None = None
+    shares_traded: float | None = None
+    session_high: float | None = None
+    session_low: float | None = None
+    open_interest: float | None = None
 
     @property
     def best_bid(self) -> float | None:

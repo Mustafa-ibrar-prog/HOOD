@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from src.polymarket.btc_market_data import BtcPriceHistoryStore
 from src.polymarket.client import NoActiveMarketError
 from src.polymarket.engine import MarketHistory, run_cycle, settle_resolved_positions
 from src.polymarket.gateway import LivePolymarketGateway, PaperPolymarketGateway
@@ -84,10 +85,11 @@ def _harness(tmp_path: Path, market: BinaryMarket | None, *, recent_mids_seed: l
     if recent_mids_seed:
         history.observe(market)
         history.mids = list(recent_mids_seed)
+    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
     return dict(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
     )
 
 
@@ -362,6 +364,7 @@ def test_run_cycle_reconciles_immediately_with_live_auto_execute(tmp_path):
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
         pending_store=pending_store, history=history,
+        btc_price_store=BtcPriceHistoryStore(tmp_path / "btc.json"),
     )
     assert report.entered
     positions = position_store.load()

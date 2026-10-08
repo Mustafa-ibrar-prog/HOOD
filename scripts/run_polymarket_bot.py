@@ -37,6 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.execution.emergency_stop import EmergencyStopStore  # noqa: E402
+from src.polymarket.btc_market_data import BtcPriceHistoryStore  # noqa: E402
 from src.polymarket.client import get_polymarket_client  # noqa: E402
 from src.polymarket.engine import MarketHistory, run_cycle  # noqa: E402
 from src.polymarket.gateway import get_execution_gateway  # noqa: E402
@@ -68,6 +69,13 @@ def main() -> int:
     # gateway.py's PaperPolymarketGateway — it never calls place_order).
     pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file))
     history = MarketHistory()
+    # Dynamic-exit BTC evidence (see exit_manager.py/btc_market_data.py):
+    # stays empty (INSUFFICIENT_DATA -> HOLD) unless something -- an
+    # agent calling scripts/feed_btc_quote.py after reading
+    # get_crypto_quotes -- actually feeds it. A no-op dependency to
+    # construct either way: check_and_execute_dynamic_exits() itself is
+    # a complete no-op while settings.dynamic_exit_enabled is False.
+    btc_price_store = BtcPriceHistoryStore(Path(settings.btc_price_history_file))
 
     order_placer = client if settings.is_live else None
     emergency_stop_store = EmergencyStopStore(Path(settings.emergency_stop_file))
@@ -93,6 +101,7 @@ def main() -> int:
                 settings=settings, client=client, strategy=strategy, risk_manager=risk_manager,
                 gateway=gateway, decision_logger=decision_logger, state_store=state_store,
                 position_store=position_store, pending_store=pending_store, history=history,
+                btc_price_store=btc_price_store,
             )
             cycles += 1
             print(

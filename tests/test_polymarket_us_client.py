@@ -707,6 +707,35 @@ def test_order_book_empty_sides_do_not_crash(tmp_path):
     assert book.best_bid is None and book.best_ask is None
 
 
+def test_order_book_with_no_stats_block_leaves_stats_fields_none(tmp_path):
+    """_book_response defaults stats to None -- confirms this never gets
+    fabricated into a 0.0 or similar."""
+    sdk = _FakeSDKClient(markets=_FakeMarkets(books={"x": _book_response([], [])}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    book = client.get_order_book("x")
+    assert book.last_trade_price is None
+    assert book.shares_traded is None
+    assert book.session_high is None
+    assert book.session_low is None
+    assert book.open_interest is None
+
+
+def test_order_book_parses_real_stats_block(tmp_path):
+    response = _book_response([_book_level("0.44", "10")], [_book_level("0.46", "10")])
+    response["marketData"]["stats"] = {
+        "lastTradePx": _amount("0.45"), "sharesTraded": "123.5",
+        "highPx": _amount("0.50"), "lowPx": _amount("0.30"), "openInterest": "500",
+    }
+    sdk = _FakeSDKClient(markets=_FakeMarkets(books={"x": response}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    book = client.get_order_book("x")
+    assert book.last_trade_price == pytest.approx(0.45)
+    assert book.shares_traded == pytest.approx(123.5)
+    assert book.session_high == pytest.approx(0.50)
+    assert book.session_low == pytest.approx(0.30)
+    assert book.open_interest == pytest.approx(500.0)
+
+
 def test_executable_liquidity_through_the_real_book(tmp_path):
     offers = [_book_level("0.50", "100")]  # $50 notional
     sdk = _FakeSDKClient(markets=_FakeMarkets(books={"x": _book_response([], offers)}))

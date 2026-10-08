@@ -1,40 +1,64 @@
-"""Automatic profit-target exit for an open Polymarket US position — the
-first EARLY-exit path in this codebase alongside hold-to-resolution
+"""Evidence-gated exit for an open Polymarket US position — the first
+EARLY-exit path in this codebase alongside hold-to-resolution
 settlement (engine.settle_resolved_positions), which remains the
-fallback whenever a position's target is never reached before its
-market closes. Nothing here alters settlement, risk.py's entry checks,
-or the existing BUY path in any way.
+fallback whenever a position's thesis never weakens AND its soft
+profit target is never reached before its market closes. Nothing here
+alters settlement, risk.py's entry checks, max_bet/max_daily_loss/
+max_spread/liquidity thresholds, entry_cutoff, or the existing BUY
+path in any way.
 
-TWO DIFFERENT STEPS, NOT A CONTRADICTION — trigger vs. recording:
-  - WHETHER to exit is decided purely from the live order book's best
-    BID against a GROSS target price:
-        target_price = avg_fill_price * (1 + profit_target_pct)
-    (see compute_target_price) — e.g. a $0.36 average fill with the
-    default 0.20 target gives target_price ≈ $0.432, BEFORE accounting
-    for exit fees. This can only ever be checked against real,
-    currently-executable bid liquidity — never the ask or the
+REDESIGN NOTE: reaching +profit_target_pct is deliberately NOT an
+unconditional sell trigger. The decision is made by
+evaluate_dynamic_exit(), which reuses src/strategy/evidence.py's
+evaluate_momentum()/MomentumState engine (via btc_intelligence.py) —
+the SAME evidence-driven cascade shape as the options position-monitor
+(src/position_manager/evaluator.py):
+  - INSUFFICIENT_DATA (not enough real BTC evidence fed in yet — see
+    btc_market_data.py) -> HOLD. Never guessed.
+  - Profitable (any amount, not just at/above target) + BTC evidence
+    WEAKENING/REVERSING with enough corroborating signals -> EXIT now,
+    rather than waiting for the soft target or a full reversal.
+  - Soft target reached + BTC evidence STRENGTHENING -> HOLD (let a
+    confirmed winner run past the target).
+  - Soft target reached, evidence not confirming further continuation
+    -> EXIT (lock in the gain).
+  - Otherwise -> HOLD.
+compute_target_price() itself is unchanged — only HOW its output is
+used changed, from "this alone is sufficient to sell" to "this is one
+input the cascade above weighs against BTC evidence."
+
+TWO DIFFERENT STEPS, NOT A CONTRADICTION — decision vs. recording:
+  - WHETHER to exit now folds in the GROSS move (profit_target_pct
+    against avg_fill_price) and BTC evidence, checked against REAL,
+    currently-executable BID liquidity — never the ask or the
     midpoint, since this system can only SELL into a resting bid, not
-    cross its own spread.
+    cross its own spread. The SELL order, when one is submitted, always
+    prices at the REAL current best bid (not a fixed target) — we are
+    reacting to current evidence/price, not waiting for a specific
+    better number.
   - the REALIZED P&L this module records once an exit actually fills
     (record_exit_fill) is always NET of both entry and exit fees
     whenever the exchange reports them (FillResult.fee_usd) — never an
-    assumption that a 20% gross price move alone made the trade
-    profitable.
+    assumption that a gross price move alone made the trade profitable.
 
 IDEMPOTENCY — the same two-independent-guards philosophy
 reconciliation.py already established for entries, applied to exits:
   1. OpenPosition.exit_pending_order_id is the PRIMARY guard: set the
-     instant an exit order is submitted (submit_profit_target_exit),
-     checked before any new exit is ever proposed
-     (evaluate_profit_target_exit/check_and_execute_profit_target_exits).
-     Persisted on disk — restart-safe by construction, not an
-     in-memory flag.
+     instant an exit order is submitted (submit_dynamic_exit), checked
+     before any new exit is ever proposed
+     (evaluate_dynamic_exit/check_and_execute_dynamic_exits). Persisted
+     on disk — restart-safe by construction, not an in-memory flag.
   2. PolymarketPendingOrderStore's own per-id semantics are the
      secondary guard on the live side (same store entries already use).
   An exit fill status of "unknown" leaves exit_pending_order_id SET —
   never cleared, never assumed filled — so a later sweep
   (reconcile_exit_fill) retries the SAME lookup instead of ever
   proposing a second, duplicate exit for the same position.
+
+MASTER SWITCH: settings.dynamic_exit_enabled (POLYMARKET_DYNAMIC_EXIT_ENABLED,
+default False) — while False, check_and_execute_dynamic_exits() is a
+complete no-op: it never even evaluates a position, in PAPER or LIVE
+mode. The entire feature ships inert until explicitly turned on.
 
 LIVE SUBMISSION, EMERGENCY STOP: an automatic exit that reaches the
 exchange in live mode goes through the EXACT SAME
@@ -45,9 +69,9 @@ check in this module, by design, so the two paths can never drift
 apart. settings.auto_exit_enabled (default False) is a SEPARATE,
 exit-specific switch, independent of settings.live_auto_execute (the
 entry-only flag — left untouched, never enabled by this module): it
-only ever decides whether a LIVE exit that reached its profit target
-is immediately confirmed and placed, or stops at awaiting_approval for
-a human to confirm (scripts/confirm_pending_order.py and
+only ever decides whether a LIVE exit this cascade approved is
+immediately confirmed and placed, or stops at awaiting_approval for a
+human to confirm (scripts/confirm_pending_order.py and
 scripts/confirm_polymarket_order.py already handle this generically,
 regardless of the underlying order's side). PAPER mode is unaffected
 by auto_exit_enabled either way — gateway.submit_order() already
@@ -63,6 +87,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
+from src.polymarket.btc_intelligence import BtcMarketAssessment, assess_btc_market
 from src.polymarket.gateway import ExecutionGateway, LivePolymarketGateway, LiveTradingDisabledError, PolymarketOrderPlacer
 from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import FillResult, OrderBookSnapshot, OrderRequest, OrderResult
@@ -70,15 +95,26 @@ from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import OpenPosition, PolymarketPositionStore
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
+from src.strategy.evidence import MomentumState
+
+# Same default as src/position_manager/evaluator.py's
+# EvaluatorConfig.min_weakening_signals_for_exit — reused verbatim
+# (not independently re-tuned) so a barely-WEAKENING read (few
+# corroborating signals) doesn't trigger an early exit on a
+# technicality, exactly like the proven options-side cascade.
+DEFAULT_MIN_WEAKENING_SIGNALS_FOR_EXIT = 2
 
 
 def compute_target_price(avg_fill_price: float, profit_target_pct: float) -> float:
-    """The GROSS trigger price for a LONG/YES position:
+    """The GROSS soft-target reference price for a LONG/YES position:
     avg_fill_price * (1 + profit_target_pct) — e.g. $0.36 * 1.20 ≈
     $0.432 with the default 0.20 target. Deliberately based on the
     position's own ACTUAL average fill price (never the requested
     order size or a suggested entry price) — see OpenPosition's
     docstring: avg_fill_price already is that verified figure.
+
+    This is a REFERENCE point for evaluate_dynamic_exit()'s cascade,
+    not a sell trigger by itself — see module docstring.
 
     Rounded to 4 decimal places, matching models.OrderBookSnapshot's
     own mid/spread_pct convention — precise enough to compare against
@@ -88,32 +124,62 @@ def compute_target_price(avg_fill_price: float, profit_target_pct: float) -> flo
 
 
 @dataclass(frozen=True)
+class DynamicExitConfig:
+    """Tunable thresholds for the evidence-gated exit cascade —
+    modeled directly on EvaluatorConfig (src/position_manager/
+    evaluator.py)."""
+
+    min_weakening_signals_for_exit: int = DEFAULT_MIN_WEAKENING_SIGNALS_FOR_EXIT
+
+
+@dataclass(frozen=True)
 class ExitDecision:
     """The full, inspectable answer to "should this position exit right
     now," independent of whether anything is actually submitted —
-    evaluate_profit_target_exit() is pure and side-effect free; only
-    submit_profit_target_exit() (called separately, only when
-    `eligible`) ever touches the network or the position ledger."""
+    evaluate_dynamic_exit() is pure and side-effect free; only
+    submit_dynamic_exit() (called separately, only when `eligible`)
+    ever touches the network or the position ledger.
+
+    `btc_assessment` is always attached (even when not eligible) so
+    the full evidence trail — every Signal, source/timestamp/value/
+    direction/confidence — is available to whatever explains the
+    decision (see btc_intelligence.py)."""
 
     position: OpenPosition
     eligible: bool
     reason: str
-    target_price: float
-    best_bid: float | None
+    target_price: float  # the soft profit-target reference price (compute_target_price)
+    best_bid: float | None  # the REAL live best bid -- also the price a submitted exit order would use
     executable_shares_at_target: float
+    gross_pnl_pct: float | None
+    btc_assessment: BtcMarketAssessment | None
 
 
-def evaluate_profit_target_exit(
-    position: OpenPosition, order_book: OrderBookSnapshot, *, profit_target_pct: float,
+def evaluate_dynamic_exit(
+    position: OpenPosition,
+    order_book: OrderBookSnapshot,
+    btc_assessment: BtcMarketAssessment,
+    *,
+    profit_target_pct: float,
+    config: DynamicExitConfig | None = None,
 ) -> ExitDecision:
-    """Pure decision logic — requirement checklist, in order:
+    """Pure decision logic — see module docstring for the full
+    cascade. Checklist, in order:
       1. no exit already pending for this position (idempotency guard);
-      2. the REAL live best BID (never the ask, never the midpoint) has
-         reached the GROSS target price;
-      3. there is enough REAL executable bid liquidity, AT OR ABOVE the
-         target price, to sell the position's entire filled_shares.
+      2. a real live bid must exist at all (can't sell into nothing);
+      3. INSUFFICIENT_DATA BTC evidence -> HOLD, never guess;
+      4. profitable + WEAKENING/REVERSING with enough corroborating
+         signals -> exit now, regardless of whether the soft target
+         was reached;
+      5. soft target reached + STRENGTHENING -> HOLD (let it run);
+         soft target reached otherwise -> exit;
+      6. otherwise -> HOLD;
+      7. (only once exit is decided) enough REAL executable bid
+         liquidity, AT OR ABOVE the current best bid, to sell the
+         position's entire filled_shares.
     Any failure returns `eligible=False` with a human-readable reason;
     nothing here ever submits an order."""
+    config = config or DynamicExitConfig()
     target_price = compute_target_price(position.avg_fill_price, profit_target_pct)
     best_bid = order_book.best_bid
 
@@ -122,30 +188,78 @@ def evaluate_profit_target_exit(
             position=position, eligible=False,
             reason=f"An exit order ({position.exit_pending_order_id}) is already pending for this position",
             target_price=target_price, best_bid=best_bid, executable_shares_at_target=0.0,
+            gross_pnl_pct=None, btc_assessment=btc_assessment,
         )
 
-    if best_bid is None or best_bid < target_price:
+    if best_bid is None:
         return ExitDecision(
-            position=position, eligible=False,
-            reason=f"Best bid ({best_bid}) has not reached the profit target ({target_price})",
-            target_price=target_price, best_bid=best_bid, executable_shares_at_target=0.0,
+            position=position, eligible=False, reason="No live bid available -- cannot sell",
+            target_price=target_price, best_bid=None, executable_shares_at_target=0.0,
+            gross_pnl_pct=None, btc_assessment=btc_assessment,
         )
 
-    available = order_book.executable_shares(side="SELL", min_price=target_price)
+    gross_pnl_pct = (best_bid - position.avg_fill_price) / position.avg_fill_price
+    state = btc_assessment.state
+    signal_count = len(btc_assessment.btc_assessment.signals)
+
+    def _decision(eligible: bool, reason: str) -> ExitDecision:
+        return ExitDecision(
+            position=position, eligible=eligible, reason=reason, target_price=target_price, best_bid=best_bid,
+            executable_shares_at_target=0.0, gross_pnl_pct=gross_pnl_pct, btc_assessment=btc_assessment,
+        )
+
+    # --- 1. Insufficient evidence: fail safe, never guess ------------------
+    if state is MomentumState.INSUFFICIENT_DATA:
+        return _decision(False, "Insufficient BTC market evidence this cycle -- holding rather than guessing")
+
+    should_exit = False
+    exit_reason = ""
+
+    # --- 2. Profitable, evidence-driven early exit --------------------------
+    # Acts on WEAKENING/REVERSING with enough corroborating signals
+    # regardless of whether the soft target was hit -- a reversal can
+    # justify locking in a small profit well below the target.
+    if gross_pnl_pct > 0 and state in (MomentumState.WEAKENING, MomentumState.REVERSING):
+        if signal_count >= config.min_weakening_signals_for_exit:
+            should_exit = True
+            fired = ", ".join(btc_assessment.btc_assessment.signals)
+            exit_reason = (
+                f"Profitable ({gross_pnl_pct:.1%}) but BTC evidence shows the move has "
+                f"{state.value.lower()} ({fired}); exiting now rather than waiting for the soft "
+                "target or a full reversal"
+            )
+
+    # --- 3. Soft profit target reached --------------------------------------
+    if not should_exit and gross_pnl_pct >= profit_target_pct:
+        if state is MomentumState.STRENGTHENING:
+            return _decision(
+                False,
+                f"Soft profit target ({profit_target_pct:.0%}) reached but BTC evidence is STRENGTHENING "
+                f"({', '.join(btc_assessment.btc_assessment.signals)}); holding rather than capping the winner",
+            )
+        should_exit = True
+        exit_reason = (
+            f"Soft profit target ({profit_target_pct:.0%}) reached; BTC evidence is {state.value.lower()}, "
+            "not confirming further continuation -- locking in the gain"
+        )
+
+    if not should_exit:
+        return _decision(
+            False, f"No exit condition met (pnl={gross_pnl_pct:.1%}, BTC evidence {state.value.lower()})",
+        )
+
+    # --- 4. Liquidity check against the REAL price the order would use -----
+    available = order_book.executable_shares(side="SELL", min_price=best_bid)
     if available < position.filled_shares:
-        return ExitDecision(
-            position=position, eligible=False,
-            reason=(
-                f"Insufficient executable bid liquidity at/above target {target_price}: "
-                f"{available} available shares < {position.filled_shares} needed"
-            ),
-            target_price=target_price, best_bid=best_bid, executable_shares_at_target=available,
+        return _decision(
+            False,
+            f"Insufficient executable bid liquidity at/above {best_bid}: "
+            f"{available} available shares < {position.filled_shares} needed",
         )
 
     return ExitDecision(
-        position=position, eligible=True,
-        reason=f"Best bid {best_bid} >= target {target_price} with sufficient bid liquidity ({available} shares)",
-        target_price=target_price, best_bid=best_bid, executable_shares_at_target=available,
+        position=position, eligible=True, reason=exit_reason, target_price=target_price, best_bid=best_bid,
+        executable_shares_at_target=available, gross_pnl_pct=gross_pnl_pct, btc_assessment=btc_assessment,
     )
 
 
@@ -302,7 +416,7 @@ def reconcile_exit_fill(
     )
 
 
-def submit_profit_target_exit(
+def submit_dynamic_exit(
     decision: ExitDecision,
     *,
     client: Any,
@@ -322,16 +436,22 @@ def submit_profit_target_exit(
     it immediately, exactly mirroring how engine.run_cycle() already
     handles the symmetric cases on the entry side.
 
-    Caller (check_and_execute_profit_target_exits) must have already
+    Prices the SELL at `decision.best_bid` — the REAL live price that
+    made this decision eligible — never the soft target_price: we are
+    reacting to current evidence/price, not demanding a specific
+    better number the book may not actually have.
+
+    Caller (check_and_execute_dynamic_exits) must have already
     verified `decision.eligible`; this does not re-check eligibility
     itself."""
     position = decision.position
     now = now or datetime.now(timezone.utc)
+    assert decision.best_bid is not None  # guaranteed by evaluate_dynamic_exit's own eligibility checks
     quantity = int(round(position.filled_shares))
     order = OrderRequest(
         condition_id=position.condition_id, token_id=position.token_id, outcome=position.outcome, side="SELL",
-        size_usd=round(quantity * decision.target_price, 2), max_price=decision.target_price,
-        close_time=position.close_time, reason="profit_target_exit", order_type=settings.default_order_type,
+        size_usd=round(quantity * decision.best_bid, 2), max_price=decision.best_bid,
+        close_time=position.close_time, reason="dynamic_exit", order_type=settings.default_order_type,
         quantity=quantity, closes_client_order_id=position.client_order_id,
     )
     result = gateway.submit_order(order)
@@ -342,12 +462,15 @@ def submit_profit_target_exit(
 
     position_store.update(replace(position, exit_pending_order_id=pending_order_id))
     decision_logger.log_decision(
-        kind="profit_target_exit_submitted",
-        reason=(
-            f"{position.outcome} on {position.condition_id}: submitting exit for {quantity} shares at a minimum "
-            f"of ${decision.target_price} (best_bid was {decision.best_bid})"
-        ),
-        evidence={"position": position.to_dict(), "order": order.to_dict(), "result_status": result.status},
+        kind="dynamic_exit_submitted",
+        reason=f"{position.outcome} on {position.condition_id}: {decision.reason}",
+        evidence={
+            "position": position.to_dict(), "order": order.to_dict(), "result_status": result.status,
+            "gross_pnl_pct": decision.gross_pnl_pct,
+            "btc_state": decision.btc_assessment.state.value if decision.btc_assessment else None,
+            "btc_evidence_score": decision.btc_assessment.evidence_score if decision.btc_assessment else None,
+            "signals": [s.to_dict() for s in decision.btc_assessment.signals] if decision.btc_assessment else [],
+        },
     )
 
     if (
@@ -404,7 +527,7 @@ def submit_profit_target_exit(
     return result
 
 
-def check_and_execute_profit_target_exits(
+def check_and_execute_dynamic_exits(
     *,
     client: Any,
     settings: PolymarketSettings,
@@ -413,24 +536,42 @@ def check_and_execute_profit_target_exits(
     pending_store: PolymarketPendingOrderStore,
     state_store: DailyPnlStateStore,
     decision_logger: PolymarketDecisionLogger,
+    btc_price_store: Any,
+    history: Any = None,
+    config: DynamicExitConfig | None = None,
     now: datetime | None = None,
 ) -> int:
     """One per-cycle pass over every open position — intended to be
     called from engine.run_cycle() right after settle_resolved_positions()
     and before any new-entry evaluation, exactly like that function's
-    own reconciliation sweep. For each position:
+    own reconciliation sweep.
+
+    MASTER SWITCH: returns 0 immediately, without evaluating or
+    touching any position, whenever settings.dynamic_exit_enabled is
+    False (the default) — see module docstring.
+
+    For each open position, otherwise:
       1. a position with an exit already pending is swept via
          reconcile_exit_fill() (restart-safe; never proposes a second
          exit while one is in flight or of unknown status);
       2. otherwise, a FRESH order book is fetched (never a cached/stale
-         snapshot — requirement: re-verify live, right before acting)
-         and evaluate_profit_target_exit() decides eligibility;
-      3. an eligible position gets exactly one exit order submitted via
-         submit_profit_target_exit().
+         snapshot) plus the real BTC bars fed so far
+         (btc_price_store.get_bars) and this market's own recent
+         mid-price history (`history`, if its tracked condition_id
+         matches this position's — duck-typed as `.condition_id`/
+         `.mids` to avoid importing engine.MarketHistory here and
+         creating a circular import; untyped/None is also accepted and
+         degrades to no Polymarket-momentum signal, never a crash);
+      3. assess_btc_market() builds the one structured assessment, and
+         evaluate_dynamic_exit() decides eligibility against it;
+      4. an eligible position gets exactly one exit order submitted via
+         submit_dynamic_exit().
 
     Returns the number of exit orders submitted this call (0 is the
-    overwhelmingly common case: most cycles, no position has reached
-    its target)."""
+    overwhelmingly common case: most cycles, no position exits)."""
+    if not settings.dynamic_exit_enabled:
+        return 0
+
     now = now or datetime.now(timezone.utc)
     order_placer = client if settings.is_live else None
     submitted = 0
@@ -461,11 +602,20 @@ def check_and_execute_profit_target_exits(
             )
             continue
 
-        decision = evaluate_profit_target_exit(current, order_book, profit_target_pct=settings.profit_target_pct)
+        bars = btc_price_store.get_bars(interval_seconds=settings.btc_bar_interval_seconds, now=now)
+        recent_mids = (
+            history.mids if history is not None and getattr(history, "condition_id", None) == current.condition_id
+            else []
+        )
+        btc_assessment = assess_btc_market(bars, order_book, recent_mids, outcome=current.outcome, now=now)
+
+        decision = evaluate_dynamic_exit(
+            current, order_book, btc_assessment, profit_target_pct=settings.profit_target_pct, config=config,
+        )
         if not decision.eligible:
             continue
 
-        submit_profit_target_exit(
+        submit_dynamic_exit(
             decision, client=client, gateway=gateway, position_store=position_store, state_store=state_store,
             decision_logger=decision_logger, settings=settings, order_placer=order_placer, now=now,
         )

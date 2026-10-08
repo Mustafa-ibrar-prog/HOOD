@@ -10,8 +10,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from src.polymarket import reconciliation
+from src.polymarket.btc_market_data import BtcPriceHistoryStore
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
-from src.polymarket.exit_manager import check_and_execute_profit_target_exits
+from src.polymarket.exit_manager import check_and_execute_dynamic_exits
 from src.polymarket.gateway import ExecutionGateway
 from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import BinaryMarket, OrderRequest
@@ -98,6 +99,7 @@ def run_cycle(
     position_store: PolymarketPositionStore,
     pending_store: PolymarketPendingOrderStore,
     history: MarketHistory,
+    btc_price_store: BtcPriceHistoryStore,
     now: datetime | None = None,
 ) -> CycleReport:
     now = now or datetime.now(timezone.utc)
@@ -118,16 +120,18 @@ def run_cycle(
         client=client, position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
     )
 
-    # Automatic profit-target exit check (see exit_manager.py):
+    # Evidence-gated dynamic exit check (see exit_manager.py):
     # deliberately placed AFTER settlement (a position that already
     # resolved this cycle is gone, nothing to exit-check) and BEFORE any
     # new-entry evaluation below, so the open-position count a new
-    # trade's risk checks read reflects any exit that just closed.
-    # Never touches MAX_BET_SIZE/MAX_DAILY_LOSS/MAX_SPREAD/
+    # trade's risk checks read reflects any exit that just closed. A
+    # complete no-op while settings.dynamic_exit_enabled is False (the
+    # default). Never touches MAX_BET_SIZE/MAX_DAILY_LOSS/MAX_SPREAD/
     # ORDER_BOOK_LIQUIDITY/ENTRY_CUTOFF or anything below this point.
-    exits_submitted = check_and_execute_profit_target_exits(
+    exits_submitted = check_and_execute_dynamic_exits(
         client=client, settings=settings, gateway=gateway, position_store=position_store,
-        pending_store=pending_store, state_store=state_store, decision_logger=decision_logger, now=now,
+        pending_store=pending_store, state_store=state_store, decision_logger=decision_logger,
+        btc_price_store=btc_price_store, history=history, now=now,
     )
 
     try:

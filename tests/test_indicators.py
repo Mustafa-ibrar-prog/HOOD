@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import pytest
+
 from src.market.indicators import (
     bid_ask_spread_pct,
+    detect_breakdown_continuation,
     detect_breakout_continuation,
+    detect_failed_breakdown,
     detect_failed_breakout,
+    detect_reversal,
     ema,
     higher_highs_lower_highs,
     is_liquid,
@@ -147,3 +152,72 @@ def test_is_liquid_false_when_missing_data():
 
 def test_is_liquid_false_when_below_minimums():
     assert is_liquid(volume=10, open_interest=5, min_volume=50, min_open_interest=100) is False
+
+
+# --- Downside mirrors: detect_breakdown_continuation / detect_failed_breakdown --
+
+def test_breakdown_continuation_detected_after_holding_below_support():
+    pre = [100.0 + (i % 3) * 0.1 for i in range(20)]
+    confirm = [97.0, 96.0]
+    bars = make_bars(pre + confirm)
+    assert detect_breakdown_continuation(bars, support_lookback=20, confirm_bars=2) is True
+
+
+def test_no_breakdown_continuation_without_enough_history():
+    bars = make_bars([100.0, 99.0, 98.0])
+    assert detect_breakdown_continuation(bars, support_lookback=20, confirm_bars=2) is False
+
+
+def test_no_breakdown_continuation_when_price_stays_above_support():
+    pre = [100.0] * 20
+    still_above = [101.0, 102.0]
+    bars = make_bars(pre + still_above)
+    assert detect_breakdown_continuation(bars, support_lookback=20, confirm_bars=2) is False
+
+
+def test_failed_breakdown_detected_when_price_recovers_back_above_support():
+    pre = [100.0] * 20
+    dip_then_recover = [95.0, 102.0]  # dipped below support, then closed back above
+    bars = make_bars(pre + dip_then_recover)
+    assert detect_failed_breakdown(bars, support_lookback=20) is True
+
+
+def test_no_failed_breakdown_when_never_broke_down():
+    bars = make_bars([100.0] * 25)
+    assert detect_failed_breakdown(bars, support_lookback=20) is False
+
+
+# --- detect_reversal: two-stage structure break -------------------------------
+
+def test_reversal_detected_for_bullish_thesis_on_lower_high_and_lower_low():
+    # Prior swing: a clean move up to ~110. Recent swing: fails to retest
+    # that high AND breaks below the prior swing's own low.
+    prior_swing = [100.0, 102.0, 104.0, 106.0, 108.0, 110.0, 109.0, 107.0, 105.0, 103.0]
+    recent_swing = [101.0, 100.0, 98.0, 96.0, 95.0, 94.0, 93.0, 92.0, 91.0, 90.0]
+    bars = make_bars(prior_swing + recent_swing)
+    assert detect_reversal(bars, thesis_direction="bullish", swing_lookback=10) is True
+
+
+def test_no_reversal_for_bullish_thesis_when_still_making_new_highs():
+    prior_swing = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 104.0, 103.0, 102.0, 101.0]
+    recent_swing = [102.0, 104.0, 106.0, 108.0, 110.0, 112.0, 111.0, 110.0, 109.0, 108.0]
+    bars = make_bars(prior_swing + recent_swing)
+    assert detect_reversal(bars, thesis_direction="bullish", swing_lookback=10) is False
+
+
+def test_reversal_detected_for_bearish_thesis_on_higher_high_and_higher_low():
+    prior_swing = [110.0, 108.0, 106.0, 104.0, 102.0, 100.0, 101.0, 103.0, 105.0, 107.0]
+    recent_swing = [109.0, 110.0, 112.0, 114.0, 115.0, 116.0, 117.0, 118.0, 119.0, 120.0]
+    bars = make_bars(prior_swing + recent_swing)
+    assert detect_reversal(bars, thesis_direction="bearish", swing_lookback=10) is True
+
+
+def test_no_reversal_without_enough_history():
+    bars = make_bars([100.0] * 15)  # needs 2*swing_lookback == 20
+    assert detect_reversal(bars, thesis_direction="bullish", swing_lookback=10) is False
+
+
+def test_reversal_rejects_invalid_thesis_direction():
+    bars = make_bars([100.0] * 25)
+    with pytest.raises(ValueError):
+        detect_reversal(bars, thesis_direction="sideways", swing_lookback=10)

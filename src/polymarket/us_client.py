@@ -316,6 +316,16 @@ def _level(raw: dict) -> BookLevel:
     return BookLevel(price=price if price is not None else 0.0, size=size)
 
 
+def _parse_str_float(raw: Any) -> float | None:
+    """MarketStats.sharesTraded/openInterest are plain numeric strings
+    (not an Amount struct, unlike lastTradePx/highPx/lowPx) — confirmed
+    in the installed SDK's types.markets.MarketStats. Returns None for
+    anything missing/blank rather than a fabricated 0.0."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    return float(raw)
+
+
 class PolymarketUSClient:
     """Implements client.PolymarketClient's method surface for the US
     venue. Structurally duck-typed, not a subclass — see module
@@ -586,13 +596,33 @@ class PolymarketUSClient:
     def get_order_book(self, token_id: str) -> OrderBookSnapshot:
         """`token_id` is the marketSlug (see class docstring). Re-sorts
         both sides itself — see module docstring item 5 on why this
-        never trusts the API's own array ordering."""
+        never trusts the API's own array ordering.
+
+        Also parses `marketData.stats` (MarketStats: lastTradePx,
+        sharesTraded, highPx, lowPx, openInterest) into
+        OrderBookSnapshot's additive stats fields — real data this
+        SAME call already returns, previously parsed and discarded.
+        `stats` itself, or any field within it, may legitimately be
+        absent (confirmed optional in the SDK's own MarketBook/
+        MarketStats TypedDicts) — every field defaults to None in that
+        case, never a fabricated value. See btc_intelligence.py's
+        assess_polymarket_microstructure() for how these feed a real
+        (if coarse) executed-trade/activity signal.
+        """
         client = self._client()
         raw = client.markets.book(token_id)
         data = raw["marketData"]
         bids = tuple(sorted((_level(lvl) for lvl in data.get("bids") or []), key=lambda lvl: lvl.price, reverse=True))
         asks = tuple(sorted((_level(lvl) for lvl in data.get("offers") or []), key=lambda lvl: lvl.price))
-        return OrderBookSnapshot(token_id=token_id, bids=bids, asks=asks, fetched_at=datetime.now(timezone.utc))
+        stats = data.get("stats") or {}
+        return OrderBookSnapshot(
+            token_id=token_id, bids=bids, asks=asks, fetched_at=datetime.now(timezone.utc),
+            last_trade_price=_parse_amount(stats.get("lastTradePx")),
+            shares_traded=_parse_str_float(stats.get("sharesTraded")),
+            session_high=_parse_amount(stats.get("highPx")),
+            session_low=_parse_amount(stats.get("lowPx")),
+            open_interest=_parse_str_float(stats.get("openInterest")),
+        )
 
     def get_resolution(self, condition_id: str) -> str | None:
         """`condition_id` is this market's EVENT slug — the same
