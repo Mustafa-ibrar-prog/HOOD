@@ -141,12 +141,19 @@ def main() -> int:
                         and refresh_result.candle_age_seconds <= settings.btc_max_bar_age_seconds
                     )
                     feed_label = "FRESH" if is_fresh else ("STALE" if refresh_result.candle_age_seconds is not None else "UNAVAILABLE")
+                    newest_before = (
+                        refresh_result.newest_persisted_before.isoformat() if refresh_result.newest_persisted_before else None
+                    )
+                    newest_after = (
+                        refresh_result.newest_persisted_after.isoformat() if refresh_result.newest_persisted_after else None
+                    )
                     reason = (
                         f"BTC feed refresh at {refresh_result.now.isoformat()}: "
                         + (f"ERROR: {refresh_result.error}" if refresh_result.error else
                            f"recorded={refresh_result.candles_recorded} candle(s), newest="
                            f"{refresh_result.newest_candle_time.isoformat() if refresh_result.newest_candle_time else None}, "
-                           f"age={refresh_result.candle_age_seconds}s, {feed_label}")
+                           f"age={refresh_result.candle_age_seconds}s, {feed_label}, "
+                           f"newest_persisted_before={newest_before}, newest_persisted_after={newest_after}")
                     )
                     # log_decision() already prints this to the console
                     # itself (decision_logger defaults to
@@ -162,6 +169,8 @@ def main() -> int:
                             "candle_age_seconds": refresh_result.candle_age_seconds,
                             "feed_label": feed_label,
                             "candles_recorded": refresh_result.candles_recorded,
+                            "newest_persisted_before": newest_before,
+                            "newest_persisted_after": newest_after,
                             "provider_error": refresh_result.error,
                             "provider": btc_source.name,
                         },

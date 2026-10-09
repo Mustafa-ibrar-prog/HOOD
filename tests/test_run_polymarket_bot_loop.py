@@ -164,6 +164,10 @@ def test_successful_refresh_is_logged_with_request_time_candle_age_and_freshness
     assert evidence["provider_error"] is None
     assert evidence["candles_recorded"] == 5  # maybe_refresh()'s own small catch-up window (limit=5)
     assert evidence["provider"] == "fake-coinbase"
+    # The startup bootstrap already persisted candles before the loop's
+    # first maybe_refresh() call, so both reflect that -- not None.
+    assert evidence["newest_persisted_before"] is not None
+    assert evidence["newest_persisted_after"] is not None
 
 
 def test_provider_failure_is_logged_with_the_real_error_and_never_crashes_the_bot(tmp_path, monkeypatch):

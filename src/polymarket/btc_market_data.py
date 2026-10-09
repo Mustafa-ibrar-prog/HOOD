@@ -376,6 +376,14 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def _newest_persisted(store: "BtcPriceHistoryStore") -> datetime | None:
+    """The store's own newest real-candle timestamp right now, or None
+    if nothing is persisted yet — used by BtcFeedRefresher.maybe_refresh()
+    to report newest_persisted_before/after around record_bars()."""
+    bars = store.load_real_bars()
+    return max((_as_utc(b.start_time) for b in bars), default=None)
+
+
 def bootstrap_btc_price_history(store: BtcPriceHistoryStore, source: DirectBtcQuoteSource, *, min_bars: int) -> int:
     """Run ONCE at bot startup (see scripts/run_polymarket_bot.py) —
     fetches enough recent 1-minute candles to cover at least `min_bars`
@@ -430,7 +438,23 @@ class BtcFeedRefreshResult:
     "fresh" from "stale" (per compute_feed_status's own
     max_bar_age_seconds convention — that threshold is NOT duplicated
     here; this class only reports the raw numbers, callers compare
-    them against whatever threshold they already have)."""
+    them against whatever threshold they already have).
+
+    `newest_persisted_before`/`newest_persisted_after` are the
+    STORE's own newest real-candle timestamp, read immediately before
+    and immediately after this attempt's record_bars() call — added
+    after a live incident where the newest candle reported stayed
+    frozen at the same timestamp across several real, one-minute-apart
+    refreshes (recorded=5 every time). Comparing these two numbers
+    answers, directly from the log, whether record_bars() itself ever
+    even saw a newer candle to persist (if newest_persisted_after
+    never advances past newest_persisted_before even though
+    newest_candle_time is NEW each time, the bug is in record_bars()'s
+    own merge/dedup; if newest_candle_time ITSELF is frozen, the bug is
+    upstream, in what the provider actually returned). Both are None
+    whenever there is nothing persisted yet (a fresh store) or this
+    attempt never reached record_bars() (skipped, or a provider
+    error)."""
 
     attempted: bool
     now: datetime
@@ -438,6 +462,8 @@ class BtcFeedRefreshResult:
     newest_candle_time: datetime | None
     candle_age_seconds: float | None
     error: str | None
+    newest_persisted_before: datetime | None = None
+    newest_persisted_after: datetime | None = None
 
 
 class BtcFeedRefresher:
@@ -502,14 +528,18 @@ class BtcFeedRefresher:
                 attempted=True, now=now, candles_recorded=0, newest_candle_time=None, candle_age_seconds=None, error=None,
             )
         newest = max(_as_utc(c.start_time) for c in candles)
+        newest_persisted_before = _newest_persisted(self._store)
         try:
             recorded = self._store.record_bars(candles)
         except Exception as exc:  # noqa: BLE001 - a persistence failure must never crash the bot either
             return BtcFeedRefreshResult(
                 attempted=True, now=now, candles_recorded=0, newest_candle_time=newest,
                 candle_age_seconds=(now - newest).total_seconds(), error=f"failed to persist candles: {exc}",
+                newest_persisted_before=newest_persisted_before, newest_persisted_after=newest_persisted_before,
             )
+        newest_persisted_after = _newest_persisted(self._store)
         return BtcFeedRefreshResult(
             attempted=True, now=now, candles_recorded=recorded, newest_candle_time=newest,
             candle_age_seconds=(now - newest).total_seconds(), error=None,
+            newest_persisted_before=newest_persisted_before, newest_persisted_after=newest_persisted_after,
         )

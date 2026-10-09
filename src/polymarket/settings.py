@@ -227,6 +227,31 @@ class PolymarketSettings:
     # either fills at an acceptable price or doesn't happen."
     max_price_slippage_pct: float
 
+    # --- Entry retry guard (see entry_guard.py) — an IDEMPOTENCY/safety
+    # gate, not a risk threshold: after a live incident showed
+    # auto-execute repeatedly resubmitting a live BUY for the exact same
+    # market/outcome every cycle following an unknown/rejected result
+    # (order_status_unknown -> rejected -> new pending_order, on loop),
+    # this bounds how soon the SAME (condition_id, outcome) may be
+    # retried after a failed/unresolved attempt. Never touches
+    # max_bet_usd/sizing/spread/liquidity/cutoff, and never blocks a
+    # different outcome or a different 15-minute market.
+    #
+    # How long a recently-FAILED (rejected/expired/failed, or reconciled
+    # with no resulting position) attempt blocks a retry on the exact
+    # same market/outcome, UNLESS the price has moved by
+    # entry_retry_min_price_change in the meantime (see below). An
+    # attempt that is still UNRESOLVED (awaiting_approval, or submitted
+    # but not yet reconciled) is NEVER time-bounded -- it blocks
+    # regardless of this value until it actually reconciles.
+    entry_retry_cooldown_seconds: float
+    # Minimum absolute move (in price, e.g. 0.02 = 2 cents) in the
+    # candidate order's max_price, since a recently-failed attempt's own
+    # max_price, required to treat a new attempt as a materially
+    # different setup and allow an immediate retry within the cooldown
+    # window above.
+    entry_retry_min_price_change: float
+
     # --- Order execution -----------------------------------------------------
     # FOK (fill-or-kill) is the default — see models.OrderRequest's
     # docstring for why: it removes the ambiguous "market order partially
@@ -469,6 +494,10 @@ class PolymarketSettings:
             raise PolymarketConfigError(
                 "POLYMARKET_US_RATE_LIMIT_MAX_DELAY_SECONDS must be >= POLYMARKET_US_RATE_LIMIT_BASE_DELAY_SECONDS"
             )
+        if self.entry_retry_cooldown_seconds < 0:
+            raise PolymarketConfigError("POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS must be >= 0")
+        if self.entry_retry_min_price_change < 0:
+            raise PolymarketConfigError("POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE must be >= 0")
 
     @property
     def is_paper(self) -> bool:
@@ -519,6 +548,8 @@ class PolymarketSettings:
             max_spread_usd=_get_float(env, "POLYMARKET_MAX_SPREAD_USD", 0.03),
             min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 10.0),
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
+            entry_retry_cooldown_seconds=_get_float(env, "POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS", 120.0),
+            entry_retry_min_price_change=_get_float(env, "POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE", 0.02),
             default_order_type=_get_str(env, "POLYMARKET_DEFAULT_ORDER_TYPE", "FOK").upper(),
             profit_target_pct=_get_float(env, "POLYMARKET_PROFIT_TARGET_PCT", 0.20),
             auto_exit_enabled=_get_bool(env, "POLYMARKET_AUTO_EXIT_ENABLED", False),

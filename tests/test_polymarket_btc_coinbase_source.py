@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -17,8 +19,9 @@ from src.polymarket.btc_coinbase_source import CoinbaseBtcQuoteSource, CoinbaseB
 
 
 class _FakeHttpResponse:
-    def __init__(self, body: bytes):
+    def __init__(self, body: bytes, *, status: int = 200):
         self._body = body
+        self.status = status
 
     def __enter__(self):
         return self
@@ -122,3 +125,93 @@ def test_requests_the_configured_product_and_one_minute_granularity(monkeypatch)
     assert len(captured) == 1
     assert "BTC-USD" in captured[0].full_url
     assert "granularity=60" in captured[0].full_url
+
+
+# --- Live-incident fix: explicit, now-anchored start/end on every call -----
+# Root cause of the stuck-feed incident: every request used the IDENTICAL
+# URL every time (no start/end at all) -- Coinbase's own documented
+# behavior is that omitting either one means BOTH are ignored, leaving the
+# exact window undefined and identical request-to-request, exactly what a
+# caching layer would serve a stale cached response to. These tests lock
+# in the fix: every request now carries an explicit, unique, now-anchored
+# start/end.
+
+def test_request_includes_explicit_start_and_end_anchored_to_now(monkeypatch):
+    captured: list = []
+    body = _rows((1700000000, 100.0))
+    _patch_urlopen(monkeypatch, body=body, capture=captured)
+    source = CoinbaseBtcQuoteSource()
+    now = datetime(2026, 10, 9, 18, 44, 0, tzinfo=timezone.utc)
+
+    source.get_recent_candles(limit=5, now=now)
+
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(captured[0].full_url).query)
+    assert query["end"] == [now.isoformat()]
+    start = datetime.fromisoformat(query["start"][0])
+    assert start < now  # a real window, not a degenerate/empty one
+    assert (now - start).total_seconds() == pytest.approx(60 * (5 + 5))  # limit + buffer candles' worth
+
+
+def test_two_calls_one_minute_apart_produce_different_request_urls(monkeypatch):
+    """Directly reproduces (and proves fixed) the live symptom: every
+    refresh used to send the EXACT same URL, request after request, with
+    no time-varying parameter at all -- exactly what let a stale cached
+    response go undetected for minutes."""
+    captured: list = []
+    body = _rows((1700000000, 100.0))
+    _patch_urlopen(monkeypatch, body=body, capture=captured)
+    source = CoinbaseBtcQuoteSource()
+
+    source.get_recent_candles(limit=5, now=datetime(2026, 10, 9, 18, 42, 0, tzinfo=timezone.utc))
+    source.get_recent_candles(limit=5, now=datetime(2026, 10, 9, 18, 43, 0, tzinfo=timezone.utc))
+    source.get_recent_candles(limit=5, now=datetime(2026, 10, 9, 18, 44, 0, tzinfo=timezone.utc))
+
+    urls = [c.full_url for c in captured]
+    assert len(set(urls)) == 3  # every single request is genuinely unique
+
+
+def test_defaults_now_to_the_real_wall_clock_when_not_given(monkeypatch):
+    captured: list = []
+    body = _rows((1700000000, 100.0))
+    _patch_urlopen(monkeypatch, body=body, capture=captured)
+    source = CoinbaseBtcQuoteSource()
+    before = datetime.now(timezone.utc)
+
+    source.get_recent_candles(limit=5)
+
+    after = datetime.now(timezone.utc)
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(captured[0].full_url).query)
+    end = datetime.fromisoformat(query["end"][0])
+    assert before <= end <= after
+
+
+def test_request_and_response_details_are_logged(monkeypatch, caplog):
+    body = _rows((1700000120, 100.2), (1700000060, 99.2))
+    _patch_urlopen(monkeypatch, body=body)
+    source = CoinbaseBtcQuoteSource()
+    now = datetime(2026, 10, 9, 18, 44, 0, tzinfo=timezone.utc)
+
+    with caplog.at_level("INFO", logger="src.polymarket.btc_coinbase_source"):
+        source.get_recent_candles(limit=5, now=now)
+
+    messages = [r.getMessage() for r in caplog.records]
+    request_logs = [m for m in messages if "coinbase candles request:" in m]
+    response_logs = [m for m in messages if "coinbase candles response:" in m]
+    assert len(request_logs) == 1
+    assert "'start'" in request_logs[0] and "'end'" in request_logs[0]  # provider URL parameters
+    assert len(response_logs) == 1
+    assert "status=200" in response_logs[0]  # HTTP response status
+    assert "rows=2" in response_logs[0]  # number of candles returned
+    assert "2023-11-14T22:15:20+00:00" in response_logs[0]  # newest_in_raw_response (1700000120)
+
+
+def test_transport_failure_is_logged_with_request_params(monkeypatch, caplog):
+    _patch_urlopen(monkeypatch, raise_exc=urllib.error.URLError("connection refused"))
+    source = CoinbaseBtcQuoteSource()
+
+    with caplog.at_level("WARNING", logger="src.polymarket.btc_coinbase_source"):
+        with pytest.raises(CoinbaseBtcQuoteSourceError):
+            source.get_recent_candles(limit=5)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("request failed" in m and "'start'" in m for m in messages)

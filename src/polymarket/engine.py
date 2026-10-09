@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from src.polymarket import reconciliation
 from src.polymarket.btc_market_data import BtcPriceHistoryStore
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
+from src.polymarket.entry_guard import check_entry_retry_guard
 from src.polymarket.exit_manager import check_and_execute_dynamic_exits
 from src.polymarket.gateway import ExecutionGateway
 from src.polymarket.logger import PolymarketDecisionLogger
@@ -212,6 +213,32 @@ def run_cycle(
     )
     if not decision.allowed:
         decision_logger.log_risk_block(decision, context="new_trade")
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
+
+    # Idempotency/retry guard (see entry_guard.py) — deliberately
+    # separate from the risk checks above: a live incident showed
+    # auto-execute repeatedly resubmitting a live BUY for the exact
+    # same market/outcome every cycle after an unknown/rejected result
+    # (open_position_count never moved, so MAX_OPEN_POSITIONS never
+    # caught it). This never touches reconciliation's own unknown-fill
+    # handling — it only decides whether a NEW submission may happen
+    # yet for this exact (condition_id, outcome).
+    retry_decision = check_entry_retry_guard(
+        pending_store, position_store, condition_id=market.condition_id, outcome=candidate.thesis.outcome,
+        candidate_max_price=max_price, cooldown_seconds=settings.entry_retry_cooldown_seconds,
+        min_price_change=settings.entry_retry_min_price_change, now=now,
+    )
+    if retry_decision.blocked:
+        decision_logger.log_decision(
+            kind="entry_retry_blocked", reason=retry_decision.reason,
+            evidence={
+                "condition_id": market.condition_id, "outcome": candidate.thesis.outcome,
+                "candidate_max_price": max_price, "blocking_pending_order_id": retry_decision.blocking_pending_order_id,
+            },
+        )
         return CycleReport(
             ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
             exits_submitted=exits_submitted,

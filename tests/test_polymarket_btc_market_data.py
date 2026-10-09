@@ -434,6 +434,56 @@ def test_refresher_persistence_failure_is_reported_not_raised(tmp_path, monkeypa
     assert "disk full" in result.error
 
 
+# --- newest_persisted_before/after: diagnosing a stuck feed -----------------
+# Added after a live incident where repeated refreshes all reported
+# recorded=5 with the SAME newest candle timestamp, minute after minute --
+# these fields make the actual root cause (the PROVIDER kept returning an
+# unchanged newest candle, not a record_bars() persistence bug) directly
+# visible in the log, by comparing the store's own newest timestamp
+# immediately before and after each attempt.
+
+def test_newest_persisted_advances_when_genuinely_new_candles_arrive(tmp_path):
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    source = _FakeDirectSource(_real_candles(5))  # newest at _BASE + 4 minutes
+    refresher = BtcFeedRefresher(store, source)
+
+    first = refresher.maybe_refresh(now=_BASE)
+    assert first.newest_persisted_before is None  # nothing persisted yet
+    assert first.newest_persisted_after == _real_candles(5)[-1].start_time
+
+    source.set_candles(_real_candles(10))  # a later batch with real NEW candles
+    second = refresher.maybe_refresh(now=_BASE + timedelta(minutes=1, seconds=5))
+    assert second.newest_persisted_before == _real_candles(5)[-1].start_time
+    assert second.newest_persisted_after == _real_candles(10)[-1].start_time
+    assert second.newest_persisted_after > second.newest_persisted_before  # genuinely advanced
+
+
+def test_newest_persisted_stays_frozen_when_the_provider_returns_the_same_stale_candle(tmp_path):
+    """Reproduces the exact live symptom: the PROVIDER keeps returning
+    the identical newest candle on every attempt -- newest_persisted_
+    before and _after must be EQUAL every time (never silently
+    advanced, never fabricated), making the real root cause (upstream
+    of record_bars entirely) visible by comparing the two fields
+    across consecutive log entries."""
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    stuck_candles = _real_candles(5)  # newest fixed at _BASE + 4 minutes, forever
+    source = _FakeDirectSource(stuck_candles)
+    refresher = BtcFeedRefresher(store, source)
+
+    results = []
+    for minute in range(3):
+        results.append(refresher.maybe_refresh(now=_BASE + timedelta(minutes=minute)))
+
+    for result in results:
+        assert result.attempted is True
+        assert result.newest_candle_time == stuck_candles[-1].start_time  # the provider's own value, frozen
+    # before/after are equal on every attempt after the first -- the
+    # store never advances because the provider never gave it anything
+    # new to advance to.
+    assert results[1].newest_persisted_before == results[1].newest_persisted_after == stuck_candles[-1].start_time
+    assert results[2].newest_persisted_before == results[2].newest_persisted_after == stuck_candles[-1].start_time
+
+
 def test_refresher_accepts_a_different_provider_implementation(tmp_path):
     """Requirement: the provider interface can be replaced by a
     different implementation with zero changes to the refresher or
