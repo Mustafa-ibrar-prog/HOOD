@@ -107,10 +107,20 @@ class _FakeOrders:
         self.retrieve_calls: list = []
 
     def create(self, params):
+        """`create_response` may be a single response (same result every
+        call -- the common case) OR a LIST of them, consumed in order
+        across successive calls to simulate e.g. an entry order followed
+        by a DIFFERENT exit order in the same test -- same convention as
+        retrieve_responses above; once exhausted, the last entry repeats
+        for any further call."""
         self.create_calls.append(params)
         if self.create_exc:
             raise self.create_exc
-        return self.create_response
+        resp = self.create_response
+        if isinstance(resp, list):
+            call_index = len(self.create_calls) - 1
+            resp = resp[min(call_index, len(resp) - 1)]
+        return resp
 
     def retrieve(self, order_id):
         """`retrieve_responses[order_id]` may be a single response/Exception
