@@ -109,7 +109,15 @@ def test_submitted_but_not_yet_reconciled_always_blocks(tmp_path):
     assert "not yet resolved" in decision.reason.lower()
 
 
-def test_reconciled_submitted_with_a_resulting_position_is_not_blocked(tmp_path):
+def test_an_open_position_for_this_market_outcome_always_blocks_a_new_entry(tmp_path):
+    """The second live incident this guard was fixed for: a prior
+    attempt that already succeeded (and still holds an open position)
+    must ALWAYS block a new entry for the exact same (condition_id,
+    outcome) -- regardless of cooldown or price change, and regardless
+    of MAX_OPEN_POSITIONS having "room" for another position elsewhere.
+    The old version of this guard explicitly let this case through,
+    assuming MAX_OPEN_POSITIONS (a GLOBAL count) would catch it -- it
+    doesn't, since it never checks per-market uniqueness."""
     pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
     position_store = PolymarketPositionStore(tmp_path / "positions.json")
     pending = _pending(
@@ -123,11 +131,15 @@ def test_reconciled_submitted_with_a_resulting_position_is_not_blocked(tmp_path)
         opened_at=_NOW, close_time=_NOW + timedelta(minutes=10),
     ))
 
+    # Even a hugely different price, and even a zero cooldown, must
+    # never excuse a duplicate position on a market already held.
     decision = check_entry_retry_guard(
-        pending_store, position_store, condition_id="c1", outcome="YES", candidate_max_price=0.40,
-        cooldown_seconds=120, min_price_change=0.02, now=_NOW,
+        pending_store, position_store, condition_id="c1", outcome="YES", candidate_max_price=0.90,
+        cooldown_seconds=0, min_price_change=0.0, now=_NOW,
     )
-    assert decision.blocked is False
+    assert decision.blocked is True
+    assert "already exists" in decision.reason.lower()
+    assert decision.blocking_pending_order_id == pending.id
 
 
 def test_rejected_blocks_within_cooldown_at_the_same_price(tmp_path):
@@ -419,3 +431,168 @@ def test_scenario_4_a_genuinely_new_market_is_not_blocked_by_the_previous_market
     second = run_cycle(**harness, now=now + timedelta(seconds=15))
     assert len(placer.place_order_calls) == 2  # market-b's entry was never blocked by market-a's guard
     assert second.entered is True
+
+
+# --- The second live incident, reproduced exactly and fixed ----------------
+# order D0B9C7Y7JZ8H -> unknown -> (later) position_opened 7 @ $0.69
+# order D0B9RW0CJZ8H -> unknown -> (later) position_opened 7 @ $0.63
+# (same condition_id, same outcome) -- see entry_guard.py's module docstring.
+
+def test_unknown_then_retry_cycle_blocked_then_original_resolves_filled(tmp_path):
+    """Exactly reproduces the live incident's state machine:
+      1. order #1 submitted, fill status unknown.
+      2. a retry cycle (same market, same price, moments later, still
+         unknown) -- the second BUY attempt MUST be blocked.
+      3. order #1's fill status becomes authoritatively FILLED (a later
+         reconcile_pending_orders() sweep) -- the position is adopted,
+         never duplicated.
+      4. a THIRD cycle, now that a position exists, must ALSO refuse a
+         new entry -- this is the exact case the old guard got wrong."""
+    now = datetime.now(timezone.utc)
+    market = _market(yes_bid=0.60, yes_ask=0.62)
+    placer = _FakePlacer([SubmissionOutcome(ok=True, exchange_order_id="ex-1", raw_status="matched")])
+    # MAX_OPEN_POSITIONS=2 -- the exact real-incident configuration.
+    # With the default of 1, risk.py's own MAX_OPEN_POSITIONS check
+    # would ALSO block step 4 for an unrelated reason (no "room" at
+    # all), masking whether THIS guard's new duplicate-position check
+    # is what's actually doing the work.
+    harness = _live_harness(tmp_path, market, placer, POLYMARKET_MAX_OPEN_POSITIONS="2")
+    harness["client"].set_fill_result("ex-1", FillResult(
+        order_id="ex-1", status="unknown", requested_shares=0.0, filled_shares=0.0, avg_fill_price=None,
+    ))
+
+    first = run_cycle(**harness, now=now)
+    assert first.entered is False
+    assert len(placer.place_order_calls) == 1
+    assert harness["position_store"].load() == []
+
+    # Step 2: a retry cycle, moments later, still unknown -- MUST be blocked.
+    second = run_cycle(**harness, now=now + timedelta(seconds=15))
+    assert second.entered is False
+    assert len(placer.place_order_calls) == 1  # no second BUY submitted
+    blocked_entries = [e for e in harness["decision_logger"].read_all() if e.get("kind") == "entry_retry_blocked"]
+    assert len(blocked_entries) == 1
+    assert "not yet resolved" in blocked_entries[0]["reason"].lower()
+
+    # Step 3: order #1 authoritatively resolves FILLED (a later sweep).
+    # reconcile_pending_orders() runs FIRST in every run_cycle() call
+    # (see engine.py), so THIS cycle both (a) adopts order #1's fill
+    # into a position, creating it, AND (b) goes on to re-evaluate a
+    # fresh entry afterward in that same call -- which now immediately
+    # hits the brand-new duplicate-position guard too, since the
+    # position it just adopted already exists by the time entry
+    # evaluation runs. That is a stronger result than "only the next
+    # cycle catches it": the guard closes the gap on the very same
+    # cycle the duplicate would otherwise have been attempted.
+    harness["client"].set_fill_result("ex-1", FillResult(
+        order_id="ex-1", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.69,
+    ))
+    third = run_cycle(**harness, now=now + timedelta(seconds=30))
+    positions = harness["position_store"].load()
+    assert len(positions) == 1  # the ORIGINAL order's position, adopted via reconciliation
+    assert positions[0].filled_shares == pytest.approx(7.0)
+    assert positions[0].avg_fill_price == pytest.approx(0.69)
+    assert len(placer.place_order_calls) == 1  # still only the one real submission ever
+    assert third.entered is False  # reconciled the prior attempt; never submitted a second real order
+
+    duplicate_blocks_after_third = [
+        e for e in harness["decision_logger"].read_all()
+        if e.get("kind") == "entry_retry_blocked" and "already exists" in e.get("reason", "").lower()
+    ]
+    assert len(duplicate_blocks_after_third) == 1  # caught in the SAME cycle the position was adopted
+
+    # Step 4: a FOURTH cycle, with the position still genuinely open --
+    # must ALSO refuse a new entry (the exact bug: the old guard let
+    # this exact case through).
+    fourth = run_cycle(**harness, now=now + timedelta(seconds=45))
+    assert fourth.entered is False
+    assert len(placer.place_order_calls) == 1  # NEVER a second real order
+    assert len(harness["position_store"].load()) == 1  # exactly one position, never duplicated
+    duplicate_blocks_after_fourth = [
+        e for e in harness["decision_logger"].read_all()
+        if e.get("kind") == "entry_retry_blocked" and "already exists" in e.get("reason", "").lower()
+    ]
+    assert len(duplicate_blocks_after_fourth) == 2  # one more than after the third cycle -- blocked again
+
+
+def test_unknown_then_authoritative_rejected_then_retry_permitted_after_cooldown(tmp_path):
+    """UNKNOWN -> authoritative REJECTED (a real exchange cancellation/
+    rejection discovered on reconciliation, not the gateway-level
+    rejection) -> retry blocked within the cooldown -> retry permitted
+    once the cooldown elapses."""
+    now = datetime.now(timezone.utc)
+    market = _market(yes_bid=0.60, yes_ask=0.62)
+    placer = _FakePlacer([
+        SubmissionOutcome(ok=True, exchange_order_id="ex-1", raw_status="matched"),
+        SubmissionOutcome(ok=True, exchange_order_id="ex-2", raw_status="matched"),
+    ])
+    harness = _live_harness(tmp_path, market, placer, POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS="60")
+    harness["client"].set_fill_result("ex-1", FillResult(
+        order_id="ex-1", status="unknown", requested_shares=0.0, filled_shares=0.0, avg_fill_price=None,
+    ))
+
+    first = run_cycle(**harness, now=now)
+    assert first.entered is False
+    assert len(placer.place_order_calls) == 1
+
+    # Order #1 authoritatively resolves as REJECTED (not unknown, not a fill).
+    harness["client"].set_fill_result("ex-1", FillResult(
+        order_id="ex-1", status="rejected", requested_shares=0.0, filled_shares=0.0, avg_fill_price=None,
+    ))
+    second = run_cycle(**harness, now=now + timedelta(seconds=10))  # reconciles #1 as a genuine failure
+    assert second.entered is False
+    assert harness["position_store"].load() == []
+
+    # Still within the 60s cooldown -- blocked.
+    third = run_cycle(**harness, now=now + timedelta(seconds=20))
+    assert len(placer.place_order_calls) == 1
+    assert third.entered is False
+
+    # Cooldown elapsed -- retry permitted.
+    harness["client"].set_fill_result("ex-2", FillResult(
+        order_id="ex-2", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.63,
+    ))
+    fourth = run_cycle(**harness, now=now + timedelta(seconds=75))
+    assert len(placer.place_order_calls) == 2  # the retry went through
+    assert fourth.entered is True
+    positions = harness["position_store"].load()
+    assert len(positions) == 1
+    assert positions[0].avg_fill_price == pytest.approx(0.63)
+
+
+def test_two_distinct_markets_can_both_occupy_the_max_open_positions_limit(tmp_path):
+    """MAX_OPEN_POSITIONS=2 must still allow two DIFFERENT markets to
+    each hold a position -- the duplicate-position fix is scoped to
+    the exact (condition_id, outcome) pair, never a blanket limit on
+    distinct markets."""
+    now = datetime.now(timezone.utc)
+    market_a = _market(condition_id="market-a", token_id_yes="ya", token_id_no="na", yes_bid=0.60, yes_ask=0.62)
+    placer = _FakePlacer([
+        SubmissionOutcome(ok=True, exchange_order_id="ex-a", raw_status="matched"),
+        SubmissionOutcome(ok=True, exchange_order_id="ex-b", raw_status="matched"),
+    ])
+    harness = _live_harness(tmp_path, market_a, placer, POLYMARKET_MAX_OPEN_POSITIONS="2")
+    harness["client"].set_fill_result("ex-a", FillResult(
+        order_id="ex-a", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.62,
+    ))
+
+    first = run_cycle(**harness, now=now)
+    assert first.entered is True
+    assert len(harness["position_store"].load()) == 1
+
+    market_b = _market(condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.60, yes_ask=0.62)
+    harness["client"].set_market(market_b)
+    harness["client"].set_fill_result("ex-b", FillResult(
+        order_id="ex-b", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.62,
+    ))
+    harness["history"].observe(market_b)
+    harness["history"].mids = [0.50, 0.55, 0.60]
+
+    second = run_cycle(**harness, now=now + timedelta(seconds=15))
+    assert second.entered is True  # market-b's entry succeeded too -- at the cap, not over it
+    positions = harness["position_store"].load()
+    assert len(positions) == 2
+    assert {p.condition_id for p in positions} == {"market-a", "market-b"}
+
+    state = harness["state_store"].load(today=now.date())
+    assert state.open_position_count == 2  # exactly at MAX_OPEN_POSITIONS=2, both distinct markets
