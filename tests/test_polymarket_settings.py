@@ -64,7 +64,9 @@ def test_credentials_default_to_none():
 
 def test_risk_defaults_are_conservative_placeholders():
     settings = PolymarketSettings.from_env(env={})
-    assert settings.max_bet_usd <= 10.0
+    # $20.00 is the confidence-sizing hard ceiling (entry_confidence.py) --
+    # not the everyday value; most trades size well below it.
+    assert settings.max_bet_usd <= 20.0
     assert settings.max_daily_loss_usd <= 50.0
     assert settings.max_open_positions == 1
 

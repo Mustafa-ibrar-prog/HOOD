@@ -309,12 +309,15 @@ def test_h_polymarket_price_falling_alone_never_triggers_a_no_entry(tmp_path):
     assert harness["position_store"].load() == []
 
 
-# --- O: entry sizing remains capped at $5, end to end -----------------------
+# --- O: entry sizing is confidence-based and bounded $5-$20, end to end ----
 
-def test_o_entry_size_is_capped_at_the_configured_max_bet(tmp_path):
+def test_o_entry_size_is_confidence_based_and_within_bounds(tmp_path):
+    """This fixture's own edge_points(+2)/fired_signal_count(2) maps to
+    the MINIMUM confidence bucket (see entry_confidence.py) -- the $5
+    floor for any APPROVED trade, never $0 (which would mean no trade
+    at all) and never above the $20 hard ceiling."""
     market = _market(yes_bid=0.78, yes_ask=0.80)
     settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
-    assert settings.max_bet_usd == 5.0  # the documented default this requirement protects
     from tests.test_polymarket_engine import _FakeClient
 
     client = _FakeClient(market)
@@ -339,6 +342,44 @@ def test_o_entry_size_is_capped_at_the_configured_max_bet(tmp_path):
     assert report.entered is True
     position = position_store.load()[0]
     assert position.requested_size_usd == pytest.approx(5.0)
+
+
+# --- P: the risk manager remains the final authority -- a confidence-
+# approved size can still be blocked by an unrelated, pre-existing risk
+# control (here: MAX_BET_SIZE configured below what confidence
+# approved). Confidence sizing must never bypass risk.py. -------------
+
+def test_p_risk_manager_still_blocks_a_confidence_approved_size(tmp_path):
+    market = _market(yes_bid=0.78, yes_ask=0.80)
+    # This fixture's confidence-recommended size is $5.00 (see test O) --
+    # configuring MAX_BET_SIZE below that must still block the trade,
+    # exactly as it would for any other size.
+    settings = PolymarketSettings.from_env(
+        env={"POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_MAX_BET_USD": "4.00"},
+    )
+    from tests.test_polymarket_engine import _FakeClient
+
+    client = _FakeClient(market)
+    strategy = BtcMomentumStrategy()
+    risk = PolymarketRiskManager(settings)
+    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
+    gateway = PaperPolymarketGateway(settings, logger)
+    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
+    position_store = PolymarketPositionStore(tmp_path / "positions.json")
+    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
+    history = MarketHistory()
+    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed(btc_price_store, _strengthening_closes(), seed=5)
+    now = end_t + timedelta(seconds=5)
+
+    report = run_cycle(
+        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
+        decision_logger=logger, state_store=state_store, position_store=position_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
+    )
+
+    assert report.entered is False
+    assert position_store.load() == []
 
 
 # --- Q: no lookahead -- only data available as of `now` is ever used -------

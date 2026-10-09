@@ -13,6 +13,7 @@ from src.polymarket import reconciliation
 from src.polymarket.btc_entry_signal import assess_btc_entry_direction, build_entry_candidate
 from src.polymarket.btc_market_data import BtcPriceHistoryStore
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
+from src.polymarket.entry_confidence import assess_confidence
 from src.polymarket.entry_guard import check_entry_retry_guard
 from src.polymarket.exit_manager import check_and_execute_dynamic_exits
 from src.polymarket.gateway import ExecutionGateway
@@ -235,10 +236,58 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
+    # --- CONFIDENCE -> whether to enter and how much to risk (see
+    # entry_confidence.py) -- reads this cycle's own already-computed
+    # Coinbase evidence (edge_points/fired_signal_count); never a second
+    # indicator engine, never a second directional signal. Direction
+    # itself was already decided above and is never touched here.
+    confidence = assess_confidence(
+        direction=btc_direction.direction, edge_points=btc_direction.edge_points,
+        fired_signal_count=btc_direction.fired_signal_count,
+    )
+    decision_logger.log_decision(
+        kind="entry_confidence",
+        reason=(
+            f"BTC_DIRECTION={btc_direction.direction} BASE_CONFIDENCE={confidence.base_confidence} "
+            f"CONFIDENCE_BUCKET={confidence.bucket} RECOMMENDED_SIZE=${confidence.recommended_size_usd:.2f} "
+            f"ENTRY_DECISION={'ALLOW' if confidence.approved else 'BLOCK'}"
+        ),
+        evidence={
+            "condition_id": market.condition_id,
+            "btc_direction": btc_direction.direction,
+            "base_confidence": confidence.base_confidence,
+            "confidence_bucket": confidence.bucket,
+            "recommended_size_usd": confidence.recommended_size_usd,
+            "edge_points": btc_direction.edge_points,
+            "momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
+            "fired_signal_count": btc_direction.fired_signal_count,
+            "feed_status": feed_status.status,
+            "remaining_seconds": market.seconds_to_close,
+            "selected_outcome": btc_direction.outcome,
+            "decision": "ALLOW" if confidence.approved else "BLOCK",
+        },
+    )
+    if not confidence.approved:
+        decision_logger.log_decision(
+            kind="no_trade",
+            reason=(
+                f"BTC_DIRECTION={btc_direction.direction} confidence {confidence.base_confidence} is below "
+                f"the minimum entry threshold (50) on {market.condition_id}"
+            ),
+            evidence={
+                "question": market.question, "rejection_reason": "confidence_below_minimum",
+                "base_confidence": confidence.base_confidence, "remaining_seconds": market.seconds_to_close,
+            },
+        )
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
+
     # --- POLYMARKET -> execution confirmation (direction already decided above) --
     # Maps bullish->YES / bearish->NO against the CURRENT market's own
     # two-sided quote -- never a price guess, never the other side.
-    candidate = build_entry_candidate(market, btc_direction, size_usd=settings.max_bet_usd)
+    candidate = build_entry_candidate(market, btc_direction, size_usd=confidence.recommended_size_usd)
     if candidate is None:
         decision_logger.log_decision(
             kind="no_trade",
@@ -341,6 +390,41 @@ def run_cycle(
             ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
             exits_submitted=exits_submitted,
         )
+
+    # Full Task-1 required field set (see entry_confidence.py) -- the
+    # confidence/sizing fields plus the execution-side facts
+    # (entry_price/spread/liquidity) only known now that the order book
+    # and risk checks above have run. `actual_allowed_size_usd` ==
+    # `candidate.suggested_size_usd` here because risk.check_bet_size's
+    # own gate (size_usd <= settings.max_bet_usd) never shrinks a
+    # confidence-approved size -- it only ever blocks (decision.allowed
+    # is False above) or passes it through unchanged.
+    decision_logger.log_decision(
+        kind="entry_allowed",
+        reason=(
+            f"BTC_DIRECTION={btc_direction.direction} BASE_CONFIDENCE={confidence.base_confidence} "
+            f"CONFIDENCE_BUCKET={confidence.bucket} ACTUAL_ALLOWED_SIZE=${candidate.suggested_size_usd:.2f} "
+            f"ENTRY_DECISION=ALLOW"
+        ),
+        evidence={
+            "condition_id": market.condition_id,
+            "btc_direction": btc_direction.direction,
+            "base_confidence": confidence.base_confidence,
+            "confidence_bucket": confidence.bucket,
+            "recommended_size_usd": confidence.recommended_size_usd,
+            "actual_allowed_size_usd": candidate.suggested_size_usd,
+            "edge_points": btc_direction.edge_points,
+            "momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
+            "fired_signal_count": btc_direction.fired_signal_count,
+            "feed_status": feed_status.status,
+            "remaining_seconds": market.seconds_to_close,
+            "selected_outcome": candidate.thesis.outcome,
+            "entry_price": candidate.suggested_entry_price,
+            "spread": market.yes_spread_pct,
+            "liquidity": order_book.executable_liquidity_usd(side="BUY", max_price=max_price),
+            "decision": "ALLOW",
+        },
+    )
 
     order = OrderRequest(
         condition_id=market.condition_id, token_id=token_id, outcome=candidate.thesis.outcome, side="BUY",

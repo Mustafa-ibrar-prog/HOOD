@@ -194,6 +194,13 @@ class PolymarketSettings:
     # --- Risk controls — deliberately tiny defaults. Read every one of
     # these yourself in .env.polymarket.example before going live; they
     # are placeholders, not a recommendation. ------------------------------
+    # The HARD ceiling risk.py's check_bet_size enforces -- confidence-
+    # based sizing (entry_confidence.py) never proposes more than
+    # $20.00 (its own top bucket), so this is the backstop, not the
+    # everyday value. $5.00 remains the floor for any APPROVED trade
+    # (entry_confidence.MIN_APPROVED_TRADE_SIZE_USD) -- below the
+    # lowest confidence bucket, no trade is proposed at all (size $0),
+    # never a smaller approved size.
     max_bet_usd: float
     max_daily_loss_usd: float
     max_open_positions: int
@@ -581,7 +588,7 @@ class PolymarketSettings:
             us_rate_limit_max_retries=_get_int(env, "POLYMARKET_US_RATE_LIMIT_MAX_RETRIES", 4),
             us_rate_limit_base_delay_seconds=_get_float(env, "POLYMARKET_US_RATE_LIMIT_BASE_DELAY_SECONDS", 0.5),
             us_rate_limit_max_delay_seconds=_get_float(env, "POLYMARKET_US_RATE_LIMIT_MAX_DELAY_SECONDS", 8.0),
-            max_bet_usd=_get_float(env, "POLYMARKET_MAX_BET_USD", 5.0),
+            max_bet_usd=_get_float(env, "POLYMARKET_MAX_BET_USD", 20.0),
             max_daily_loss_usd=_get_float(env, "POLYMARKET_MAX_DAILY_LOSS_USD", 20.0),
             max_open_positions=_get_int(env, "POLYMARKET_MAX_OPEN_POSITIONS", 1),
             cooldown_seconds_after_exit=_get_int(env, "POLYMARKET_COOLDOWN_SECONDS_AFTER_EXIT", 60),
