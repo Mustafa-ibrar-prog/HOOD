@@ -178,6 +178,19 @@ class PolymarketSettings:
     # (the default) leaves BTC 15m discovery completely unaffected.
     us_market_slug: str | None
 
+    # --- US venue API resilience: bounded retry/backoff for a 429
+    # polymarket_us.errors.RateLimitError on a READ-ONLY call (market
+    # discovery, order book, settlement, fill lookup, balance -- never
+    # order submission; see us_client.py's _retry_on_rate_limit). A real
+    # incident (Cloudflare 1015 on gateway.polymarket.us) crashed
+    # run_cycle() via an uncaught RateLimitError out of get_order_book();
+    # these three bound exactly how hard this client will retry before
+    # giving up and letting the caller degrade safely (no trade this
+    # cycle) rather than hammering an already-rate-limited endpoint.
+    us_rate_limit_max_retries: int
+    us_rate_limit_base_delay_seconds: float
+    us_rate_limit_max_delay_seconds: float
+
     # --- Risk controls — deliberately tiny defaults. Read every one of
     # these yourself in .env.polymarket.example before going live; they
     # are placeholders, not a recommendation. ------------------------------
@@ -448,6 +461,14 @@ class PolymarketSettings:
                 raise PolymarketConfigError("POLYMARKET_US_API_BASE_URL must not be blank")
             if not self.us_gateway_base_url:
                 raise PolymarketConfigError("POLYMARKET_US_GATEWAY_BASE_URL must not be blank")
+        if self.us_rate_limit_max_retries < 0:
+            raise PolymarketConfigError("POLYMARKET_US_RATE_LIMIT_MAX_RETRIES must be >= 0")
+        if self.us_rate_limit_base_delay_seconds <= 0:
+            raise PolymarketConfigError("POLYMARKET_US_RATE_LIMIT_BASE_DELAY_SECONDS must be > 0")
+        if self.us_rate_limit_max_delay_seconds < self.us_rate_limit_base_delay_seconds:
+            raise PolymarketConfigError(
+                "POLYMARKET_US_RATE_LIMIT_MAX_DELAY_SECONDS must be >= POLYMARKET_US_RATE_LIMIT_BASE_DELAY_SECONDS"
+            )
 
     @property
     def is_paper(self) -> bool:
@@ -486,6 +507,9 @@ class PolymarketSettings:
             us_api_base_url=_get_str(env, "POLYMARKET_US_API_BASE_URL", DEFAULT_US_API_BASE_URL),
             us_gateway_base_url=_get_str(env, "POLYMARKET_US_GATEWAY_BASE_URL", DEFAULT_US_GATEWAY_BASE_URL),
             us_market_slug=_get_optional_str(env, "POLYMARKET_US_MARKET_SLUG"),
+            us_rate_limit_max_retries=_get_int(env, "POLYMARKET_US_RATE_LIMIT_MAX_RETRIES", 4),
+            us_rate_limit_base_delay_seconds=_get_float(env, "POLYMARKET_US_RATE_LIMIT_BASE_DELAY_SECONDS", 0.5),
+            us_rate_limit_max_delay_seconds=_get_float(env, "POLYMARKET_US_RATE_LIMIT_MAX_DELAY_SECONDS", 8.0),
             max_bet_usd=_get_float(env, "POLYMARKET_MAX_BET_USD", 5.0),
             max_daily_loss_usd=_get_float(env, "POLYMARKET_MAX_DAILY_LOSS_USD", 20.0),
             max_open_positions=_get_int(env, "POLYMARKET_MAX_OPEN_POSITIONS", 1),

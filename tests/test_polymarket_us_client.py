@@ -67,16 +67,28 @@ class _FakeEvents:
 
 
 class _FakeMarkets:
-    def __init__(self, *, books=None, settlements=None, details=None, book_exc=None):
+    def __init__(self, *, books=None, settlements=None, details=None, book_exc=None, book_side_effects=None):
         self.books = books or {}
         self.settlements = settlements or {}
         self.details = details or {}
         self.book_exc = book_exc
+        # A queue of per-call outcomes (exception instance -> raised,
+        # anything else -> returned), consumed in call order -- lets a
+        # test script e.g. "first call rate-limited, second succeeds"
+        # without needing a new fake class. Falls back to book_exc/
+        # self.books once exhausted, same as book() always did before
+        # this was added (purely additive).
+        self.book_side_effects = list(book_side_effects) if book_side_effects is not None else None
         self.book_calls: list = []
         self.retrieve_by_slug_calls: list = []
 
     def book(self, slug):
         self.book_calls.append(slug)
+        if self.book_side_effects:
+            outcome = self.book_side_effects.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
         if self.book_exc:
             raise self.book_exc
         return self.books[slug]

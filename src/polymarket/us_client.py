@@ -146,10 +146,13 @@ src/polymarket/__init__.py). Most importantly:
 
 from __future__ import annotations
 
+import logging
+import random
 import re
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from src.polymarket.client import NoActiveMarketError, PolymarketClientError
 from src.polymarket.models import (
@@ -252,6 +255,89 @@ def _sdk():
             "module's docstring."
         ) from exc
     return polymarket_us
+
+
+_T = TypeVar("_T")
+_logger = logging.getLogger(__name__)
+
+
+def _retry_on_rate_limit(
+    action: Callable[[], _T], *, endpoint: str, max_retries: int, base_delay_seconds: float,
+    max_delay_seconds: float, sleep: Callable[[float], None] | None = None,
+) -> _T:
+    """Calls `action()` (a zero-arg callable wrapping ONE read-only
+    polymarket_us SDK call) and transparently retries ONLY on
+    polymarket_us.errors.RateLimitError (a 429 — the real incident
+    this exists for was a Cloudflare 1015 "You are being rate limited"
+    response from gateway.polymarket.us that reached
+    engine.run_cycle() as an UNCAUGHT exception via get_order_book()
+    and crashed the bot), with BOUNDED exponential backoff and full
+    jitter. Every OTHER exception type propagates immediately,
+    unretried and unchanged — a NotFoundError/AuthenticationError/etc.
+    means something else is wrong, and this function has no business
+    deciding how a caller's EXISTING handling for that should behave.
+
+    Backoff is `min(max_delay_seconds, base_delay_seconds * 2**attempt)`,
+    then the ACTUAL sleep is a uniformly random jitter in [0, that]
+    (AWS's well-known "full jitter" algorithm) — bounded by
+    max_delay_seconds regardless of how many retries have already
+    happened, and never a synchronized retry storm across multiple
+    cycles/processes hammering the same already-rate-limited endpoint
+    (requirement: never retry immediately, never increase request
+    frequency).
+
+    Never retries more than `max_retries` times. If the LAST attempt
+    still raises RateLimitError, RE-RAISES it — this function never
+    invents a "no data" result on its own; callers (get_order_book(),
+    find_active_btc_market(), etc.) are responsible for degrading
+    safely from there, exactly as they already do for any other
+    exception a read-only call can raise (see each method's own
+    docstring).
+
+    Every attempt is logged via the standard `logging` module —
+    endpoint, that a rate limit was detected, the retry number, and
+    the backoff — deliberately keeping this low-level client decoupled
+    from PolymarketDecisionLogger (see module docstring). The FINAL
+    degraded outcome, once retries exhaust, is logged by whichever
+    caller actually decides how to degrade (engine.py/exit_manager.py),
+    since only they know what "no trade"/"skip this position" means
+    for that specific call site.
+
+    If polymarket_us itself is not installed, this degrades to a pure
+    passthrough (calls `action()` once, propagates whatever it raises,
+    unchanged) rather than raising on the attempt to even look up the
+    real RateLimitError class — preserving this module's test contract
+    (see test_polymarket_us_client.py's own docstring: these tests
+    exercise a FAKE sdk_client and must never require the real SDK
+    package to be installed just to run)."""
+    try:
+        rate_limit_error: type[BaseException] | tuple[()] = _sdk().errors.RateLimitError
+    except PolymarketUSClientError:
+        rate_limit_error = ()  # SDK not installed -- nothing can ever match a real RateLimitError; never retry
+    sleep = sleep or time.sleep  # resolved at CALL time, not binding time -- lets tests monkeypatch module-level time.sleep
+    attempt = 0
+    while True:
+        try:
+            result = action()
+        except rate_limit_error as exc:
+            if attempt >= max_retries:
+                _logger.warning(
+                    "polymarket_us %s: rate limited -- exhausted all %d retries, giving up (%s)",
+                    endpoint, max_retries, exc,
+                )
+                raise
+            delay = min(max_delay_seconds, base_delay_seconds * (2 ** attempt))
+            backoff = random.uniform(0, delay)
+            attempt += 1
+            _logger.warning(
+                "polymarket_us %s: rate limited (retry %d/%d), backing off %.2fs before retrying (%s)",
+                endpoint, attempt, max_retries, backoff, exc,
+            )
+            sleep(backoff)
+            continue
+        if attempt > 0:
+            _logger.info("polymarket_us %s: succeeded after %d retry/retries", endpoint, attempt)
+        return result
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -362,6 +448,18 @@ class PolymarketUSClient:
         if client is not None:
             client.close()
 
+    def _retry(self, action: Callable[[], _T], *, endpoint: str) -> _T:
+        """Bound convenience wrapper over _retry_on_rate_limit() using
+        this client's own settings.us_rate_limit_* bounds — every
+        READ-ONLY call site below goes through this, never
+        place_order() (order submission is never automatically
+        retried — see place_order's own docstring)."""
+        return _retry_on_rate_limit(
+            action, endpoint=endpoint, max_retries=self._settings.us_rate_limit_max_retries,
+            base_delay_seconds=self._settings.us_rate_limit_base_delay_seconds,
+            max_delay_seconds=self._settings.us_rate_limit_max_delay_seconds,
+        )
+
     # --- Market discovery (public data, no credentials needed) ---------------
     def find_active_btc_market(self, *, now: datetime | None = None) -> BinaryMarket:
         """Deterministic discovery — CONFIRMED LIVE by the user against
@@ -403,8 +501,8 @@ class PolymarketUSClient:
 
         client = self._client()
         try:
-            response = client.events.retrieve_by_slug(expected_slug)
-        except Exception as exc:  # noqa: BLE001 - not-found or a transport failure both mean "nothing to trade this cycle"
+            response = self._retry(lambda: client.events.retrieve_by_slug(expected_slug), endpoint="events.retrieve_by_slug")
+        except Exception as exc:  # noqa: BLE001 - not-found, a transport failure, or exhausted rate-limit retries all mean "nothing to trade this cycle"
             raise NoActiveMarketError(
                 f"Expected Polymarket US event {expected_slug!r} for the current "
                 f"{self._settings.market_duration_minutes}-minute window "
@@ -441,7 +539,7 @@ class PolymarketUSClient:
         """
         client = self._client()
         try:
-            event_response = client.events.retrieve_by_slug(slug)
+            event_response = self._retry(lambda: client.events.retrieve_by_slug(slug), endpoint="events.retrieve_by_slug")
         except Exception as exc:  # noqa: BLE001
             raise NoActiveMarketError(
                 f"POLYMARKET_US_MARKET_SLUG={slug!r} could not be retrieved as an event "
@@ -608,9 +706,19 @@ class PolymarketUSClient:
         case, never a fabricated value. See btc_intelligence.py's
         assess_polymarket_microstructure() for how these feed a real
         (if coarse) executed-trade/activity signal.
+
+        A polymarket_us.errors.RateLimitError (429 — a real incident
+        saw a Cloudflare 1015 "You are being rate limited" response
+        from gateway.polymarket.us here specifically) is retried with
+        bounded backoff via _retry() before this method gives up; if
+        retries exhaust, this still RAISES — callers (engine.py's
+        entry path, exit_manager.py's dynamic-exit sweep) are
+        responsible for catching that and degrading to a safe no-
+        trade/skip-this-position outcome, exactly as they already do
+        for any other exception this call can raise.
         """
         client = self._client()
-        raw = client.markets.book(token_id)
+        raw = self._retry(lambda: client.markets.book(token_id), endpoint="markets.book")
         data = raw["marketData"]
         bids = tuple(sorted((_level(lvl) for lvl in data.get("bids") or []), key=lambda lvl: lvl.price, reverse=True))
         asks = tuple(sorted((_level(lvl) for lvl in data.get("offers") or []), key=lambda lvl: lvl.price))
@@ -644,8 +752,8 @@ class PolymarketUSClient:
         resolved market."""
         client = self._client()
         try:
-            event_response = client.events.retrieve_by_slug(condition_id)
-        except Exception:  # noqa: BLE001 - not-found or a transport failure both mean "don't know yet"
+            event_response = self._retry(lambda: client.events.retrieve_by_slug(condition_id), endpoint="events.retrieve_by_slug")
+        except Exception:  # noqa: BLE001 - not-found, a transport failure, or exhausted rate-limit retries all mean "don't know yet"
             return None
         event = event_response.get("event") or {}
         markets = event.get("markets") or []
@@ -655,7 +763,7 @@ class PolymarketUSClient:
         if not market_slug or not markets[0].get("closed"):
             return None
         try:
-            settlement = client.markets.settlement(market_slug)
+            settlement = self._retry(lambda: client.markets.settlement(market_slug), endpoint="markets.settlement")
         except Exception:  # noqa: BLE001 - same as above
             return None
         value = settlement.get("settlement")
@@ -739,7 +847,18 @@ class PolymarketUSClient:
         then 404'd on orders.retrieve()) showed that discarding anything
         beyond `executions` means that diagnostic information is gone
         forever the moment this process exits, with no way to
-        investigate afterward."""
+        investigate afterward.
+
+        Deliberately NEVER goes through _retry()/_retry_on_rate_limit():
+        this is the one SDK call that actually SUBMITS something.
+        Automatically retrying a RateLimitError here could resubmit an
+        order the exchange may have already accepted before the 429
+        was returned — see the module docstring's note on
+        AuthenticationError/BadRequestError/RateLimitError/etc. already
+        being treated uniformly as "no exchange_order_id, nothing to
+        reconcile" below, which is the correct, safe degrade for ANY of
+        those, including a rate limit, with zero risk of a duplicate
+        submission."""
         try:
             params = self._build_create_order_params(order)
         except _OrderTooSmallError as exc:
@@ -787,7 +906,7 @@ class PolymarketUSClient:
         could never actually be submitted."""
         params = self._build_create_order_params(order)
         client = self._client()
-        response = client.orders.preview({"request": params})
+        response = self._retry(lambda: client.orders.preview({"request": params}), endpoint="orders.preview")
         return response.get("order") or {}
 
     # --- Reconciliation (the authoritative fill lookup — see Task 3/5) -------
@@ -800,8 +919,8 @@ class PolymarketUSClient:
         """
         client = self._client()
         try:
-            response = client.orders.retrieve(exchange_order_id)
-        except Exception as exc:  # noqa: BLE001 - order-not-found or a transport failure both mean "we don't know" here
+            response = self._retry(lambda: client.orders.retrieve(exchange_order_id), endpoint="orders.retrieve")
+        except Exception as exc:  # noqa: BLE001 - order-not-found, a transport failure, or exhausted rate-limit retries all mean "we don't know" here
             return FillResult(
                 order_id=exchange_order_id, status="unknown", requested_shares=0.0,
                 filled_shares=0.0, avg_fill_price=None, raw={"lookup_error": str(exc)},
@@ -862,7 +981,7 @@ class PolymarketUSClient:
         there is no wallet/collateral concept on this venue. Returns
         the USD UserBalance entry's currentBalance."""
         client = self._client()
-        response = client.account.balances()
+        response = self._retry(lambda: client.account.balances(), endpoint="account.balances")
         for balance in response.get("balances") or []:
             if balance.get("currency") == "USD":
                 return float(balance.get("currentBalance", 0.0))

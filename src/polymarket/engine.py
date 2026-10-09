@@ -163,7 +163,31 @@ def run_cycle(
     # models.OrderBookSnapshot's and BinaryMarket's docstrings). This is
     # the only book the liquidity check and the order's max_price may be
     # computed from.
-    order_book = client.get_order_book(token_id)
+    #
+    # A real incident: an uncaught polymarket_us.errors.RateLimitError
+    # (Cloudflare 1015 on gateway.polymarket.us) out of this exact call
+    # crashed the whole bot process. us_client.get_order_book() already
+    # retries a rate limit internally with bounded backoff (see
+    # us_client._retry_on_rate_limit) before ever raising, so reaching
+    # this except at all means retries were exhausted (or some other,
+    # non-rate-limit failure happened) — either way, a safe no-trade
+    # skip for THIS cycle, never a crash and never a fabricated order
+    # book. No order is placed down either path.
+    try:
+        order_book = client.get_order_book(token_id)
+    except Exception as exc:  # noqa: BLE001 - a book-fetch failure (rate limit or otherwise) must never crash the bot or be treated as tradeable
+        decision_logger.log_decision(
+            kind="no_trade",
+            reason=(
+                f"Could not fetch {candidate.thesis.outcome}'s order book on {market.condition_id} "
+                f"after retries: {type(exc).__name__}: {exc} -- sitting this cycle out"
+            ),
+            evidence={"token_id": token_id, "error_type": type(exc).__name__, "error": str(exc)},
+        )
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
     if order_book.best_ask is None:
         decision_logger.log_decision(
             kind="no_trade",
