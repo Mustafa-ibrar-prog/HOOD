@@ -69,6 +69,27 @@ def test_risk_defaults_are_conservative_placeholders():
     assert settings.max_open_positions == 1
 
 
+def test_entry_microstructure_defaults_tuned_for_the_btc_15m_market():
+    """Adapted specifically for this market's low-priced, fast-moving
+    binary contracts -- see risk.py's check_spread() docstring."""
+    settings = PolymarketSettings.from_env(env={})
+    assert settings.max_spread_pct == pytest.approx(0.05)
+    assert settings.max_spread_usd == pytest.approx(0.03)
+    assert settings.min_order_book_liquidity_usd == pytest.approx(10.0)
+    assert settings.entry_cutoff_seconds_before_close == 60
+
+
+@pytest.mark.parametrize("value", ["0", "1", "-0.01"])
+def test_non_positive_or_too_large_max_spread_usd_rejected(value):
+    with pytest.raises(PolymarketConfigError, match="MAX_SPREAD_USD"):
+        PolymarketSettings.from_env(env=_env(POLYMARKET_MAX_SPREAD_USD=value))
+
+
+def test_max_spread_usd_is_configurable():
+    settings = PolymarketSettings.from_env(env=_env(POLYMARKET_MAX_SPREAD_USD="0.10"))
+    assert settings.max_spread_usd == pytest.approx(0.10)
+
+
 # --- Fail-closed credential checks (Task 7) -----------------------------------
 
 def test_live_mode_without_private_key_is_rejected():

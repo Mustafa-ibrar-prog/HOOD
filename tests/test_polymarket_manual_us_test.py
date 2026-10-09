@@ -501,16 +501,22 @@ def test_live_existing_pending_order_blocks_the_preflight(tmp_path, capsys):
     assert sdk.orders.create_calls == []
 
 
-def test_live_wide_spread_and_thin_liquidity_reaches_the_preflight_and_names_both_gates(tmp_path, capsys):
-    """Regression for the real live scenario reported: best_bid=0.06
-    best_ask=0.07 (15.4% spread, over the 5% default limit) and thin
-    ask-side liquidity (well under the $25 default minimum). This must
-    NOT short-circuit on the early risk-check message -- it must flow
-    all the way into the consolidated LIVE PREFLIGHT block (so AUTH/
-    BALANCE/discovery/order-book are still shown), land on READY: NO,
-    and name BOTH failing risk checks individually in the STOP
-    reasons, not a generic "see above" pointer. No order attempted."""
-    slug = "manual-test-live-wide-spread"
+def test_low_priced_contract_with_a_tiny_absolute_spread_now_passes_the_preflight(tmp_path, capsys):
+    """The real live scenario that motivated risk.py's check_spread()
+    redesign: best_bid=0.06 best_ask=0.07 is only a 1-cent ABSOLUTE
+    spread, but reads as 15.4% RELATIVE spread (over the 5% default)
+    purely because the contract is priced low -- the denominator
+    (mid=0.065) is tiny. check_spread() now also passes on a tight
+    absolute spread (default $0.03; $0.01 here clears it easily), not
+    just the relative percentage, and the $21 of ask-side liquidity
+    clears the reduced $10 default minimum (previously $25) -- so this
+    trade now correctly reaches READY: YES instead of being refused
+    for being "too wide" when it was actually fine. confirm_live=False
+    here on purpose: this test is about the risk gate's verdict, not
+    the order-submission pipeline (already covered by
+    test_live_submission_that_fills_opens_a_position's own, separately
+    tight-spread fixture)."""
+    slug = "manual-test-live-tight-absolute-spread"
     thin_book = _book_response([_book_level("0.06", 50)], [_book_level("0.07", 300)])  # $21 of ask liquidity
     sdk = _happy_sdk(slug)
     sdk.markets.books[slug] = thin_book
@@ -520,12 +526,41 @@ def test_live_wide_spread_and_thin_liquidity_reaches_the_preflight_and_names_bot
     client = PolymarketUSClient(settings, sdk_client=sdk)
     stores = _stores_with_emergency_stop_cleared(tmp_path)
 
-    rc = _run(settings, client, stores, confirm_live=True, max_price=0.08)
+    rc = _run(settings, client, stores, confirm_live=False, max_price=0.08)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "SPREAD: 0.1538" in out  # the relative figure alone still looks wide -- the absolute check rescues it
+    assert "LIQUIDITY: $21.00" in out
+    assert "RISK: PASS" in out
+    assert "READY FOR FIRST $5 LIVE TEST: YES" in out
+    assert sdk.orders.create_calls == []  # confirm_live=False -- nothing submitted either way
+
+
+def test_live_genuinely_wide_spread_and_thin_liquidity_still_names_both_gates(tmp_path, capsys):
+    """Distinct from the tight-absolute-spread case above: best_bid=0.06
+    best_ask=0.20 is a genuinely wide spread by BOTH measures (14 cents
+    absolute, well over the $0.03 default, and 87.5% relative, well
+    over the 5% default), and the resulting ask-side liquidity is well
+    under the reduced $10 minimum too. Must still flow into the full
+    LIVE PREFLIGHT block, land on READY: NO, and name both failing
+    risk checks individually -- the redesign must never rescue a book
+    that is actually untradeable by both the relative AND absolute
+    measures. No order attempted."""
+    slug = "manual-test-live-genuinely-wide-spread"
+    thin_book = _book_response([_book_level("0.06", 5)], [_book_level("0.20", 5)])  # $1 of ask liquidity
+    sdk = _happy_sdk(slug)
+    sdk.markets.books[slug] = thin_book
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+
+    rc = _run(settings, client, stores, confirm_live=True, max_price=0.25)
 
     assert rc == 1
     out = capsys.readouterr().out
-    # Still reaches the full preflight -- this is the fix: a failed risk
-    # check must not pre-empt the consolidated status.
     assert "LIVE PREFLIGHT" in out
     assert "AUTH: OK" in out
     assert "READY FOR FIRST $5 LIVE TEST: NO" in out

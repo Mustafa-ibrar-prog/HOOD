@@ -130,6 +130,70 @@ def test_missing_quote_blocks_spread_check():
     assert not decision.allowed
 
 
+# --- Spread: absolute threshold rescues a low-priced contract ---------------
+# A binary contract priced near 0 (or 1) has a tiny mid, so (ask-bid)/mid can
+# read as a huge relative percentage even though ask-bid itself is a
+# perfectly tradeable couple of cents. check_spread() passes on EITHER a
+# tight relative spread OR a tight absolute spread -- these tests are the
+# unit-level counterpart to tests/test_polymarket_manual_us_test.py's
+# integration-level coverage of the same real reported scenario.
+
+def test_low_priced_contract_with_tiny_absolute_spread_passes():
+    """The exact real reported case: bid=0.05/ask=0.06 is an 18.2%
+    relative spread (over the 5% default) but only a 1-cent absolute
+    spread (well under the $0.03 default) -- must now be ALLOWED."""
+    risk = PolymarketRiskManager(_settings())
+    market = _market(yes_bid=0.05, yes_ask=0.06)
+    decision = _evaluate(risk, market=market)
+    spread_result = next(r for r in decision.results if r.name == "MAX_SPREAD")
+    assert spread_result.passed, spread_result.detail
+
+
+def test_low_priced_contract_with_genuinely_wide_absolute_spread_still_blocks():
+    """Same low-priced regime, but the absolute spread is ALSO wide (8
+    cents, over the $0.03 default) -- the rescue path must not apply to
+    a book that's untradeable by both measures."""
+    risk = PolymarketRiskManager(_settings())
+    market = _market(yes_bid=0.02, yes_ask=0.10)
+    decision = _evaluate(risk, market=market)
+    spread_result = next(r for r in decision.results if r.name == "MAX_SPREAD")
+    assert not spread_result.passed
+    assert not decision.allowed
+
+
+def test_high_priced_contract_wide_relative_spread_without_tiny_absolute_still_blocks():
+    """The symmetric high-price case (mid near 1): a spread wide enough
+    to fail both measures must still block, confirming the rescue path
+    is specific to a genuinely tight absolute spread, not a general
+    loosening of the relative check."""
+    risk = PolymarketRiskManager(_settings())
+    market = _market(yes_bid=0.80, yes_ask=0.95)  # 15c absolute, ~17.1% relative -- both over default
+    decision = _evaluate(risk, market=market)
+    spread_result = next(r for r in decision.results if r.name == "MAX_SPREAD")
+    assert not spread_result.passed
+
+
+def test_crossed_book_blocks_spread_check():
+    """ask < bid must fail outright, not be read as a (meaningless,
+    trivially-passing) negative spread percentage."""
+    risk = PolymarketRiskManager(_settings())
+    crossed = _market(yes_bid=0.50, yes_ask=0.40)
+    decision = _evaluate(risk, market=crossed)
+    spread_result = next(r for r in decision.results if r.name == "MAX_SPREAD")
+    assert not spread_result.passed
+    assert "crossed" in spread_result.detail.lower()
+
+
+def test_max_spread_usd_is_configurable():
+    """A tightened POLYMARKET_MAX_SPREAD_USD must stop rescuing a spread
+    the default would have let through."""
+    risk = PolymarketRiskManager(_settings(POLYMARKET_MAX_SPREAD_USD="0.005"))
+    market = _market(yes_bid=0.05, yes_ask=0.06)  # the same 1-cent-absolute case as above
+    decision = _evaluate(risk, market=market)
+    spread_result = next(r for r in decision.results if r.name == "MAX_SPREAD")
+    assert not spread_result.passed  # 1 cent > the tightened 0.5-cent limit
+
+
 def test_multiple_failures_all_reported_together():
     risk = PolymarketRiskManager(_settings())
     bad_market = _market(yes_bid=0.30, yes_ask=0.70, close_time=datetime.now(timezone.utc) + timedelta(seconds=10))

@@ -187,6 +187,19 @@ class PolymarketSettings:
     cooldown_seconds_after_exit: int
     stale_data_max_seconds: float
     max_spread_pct: float
+    # Companion ABSOLUTE threshold (in price/USD terms, e.g. 0.03 = 3
+    # cents) for check_spread(), checked as an alternative to
+    # max_spread_pct, not a replacement — see risk.py's check_spread()
+    # docstring. A binary contract priced near 0 or 1 has a tiny
+    # denominator in (ask-bid)/mid, so an entirely normal few-cent
+    # spread can read as a huge relative percentage; this absolute cap
+    # rescues that specific case (relative percentage is mathematically
+    # guaranteed to be >= the absolute spread for any mid in (0,1], so
+    # this can only ever ADD a passing path for a genuinely tight
+    # absolute spread, never let through a trade that's wide by both
+    # measures). Keep this small and tight — it is not a general
+    # escape hatch from max_spread_pct.
+    max_spread_usd: float
     # Minimum EXECUTABLE liquidity (USD notional, price x size, summed
     # across book levels at or better than the order's max_price) on the
     # side of the book a new entry would consume. See
@@ -307,6 +320,8 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_STALE_DATA_MAX_SECONDS must be > 0")
         if not 0 < self.max_spread_pct < 1:
             raise PolymarketConfigError("POLYMARKET_MAX_SPREAD_PCT must be between 0 and 1 (exclusive)")
+        if not 0 < self.max_spread_usd < 1:
+            raise PolymarketConfigError("POLYMARKET_MAX_SPREAD_USD must be between 0 and 1 (exclusive)")
         if self.min_order_book_liquidity_usd < 0:
             raise PolymarketConfigError("POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD must be >= 0")
         if not 0 <= self.max_price_slippage_pct < 1:
@@ -477,7 +492,8 @@ class PolymarketSettings:
             cooldown_seconds_after_exit=_get_int(env, "POLYMARKET_COOLDOWN_SECONDS_AFTER_EXIT", 60),
             stale_data_max_seconds=_get_float(env, "POLYMARKET_STALE_DATA_MAX_SECONDS", 20.0),
             max_spread_pct=_get_float(env, "POLYMARKET_MAX_SPREAD_PCT", 0.05),
-            min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 25.0),
+            max_spread_usd=_get_float(env, "POLYMARKET_MAX_SPREAD_USD", 0.03),
+            min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 10.0),
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
             default_order_type=_get_str(env, "POLYMARKET_DEFAULT_ORDER_TYPE", "FOK").upper(),
             profit_target_pct=_get_float(env, "POLYMARKET_PROFIT_TARGET_PCT", 0.20),
@@ -489,7 +505,7 @@ class PolymarketSettings:
             btc_price_history_file=_get_str(env, "POLYMARKET_BTC_PRICE_HISTORY_FILE", "logs/polymarket/btc_price_history.json"),
             asset=_get_str(env, "POLYMARKET_ASSET", "bitcoin").lower(),
             market_duration_minutes=_get_int(env, "POLYMARKET_MARKET_DURATION_MINUTES", 15),
-            entry_cutoff_seconds_before_close=_get_int(env, "POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", 120),
+            entry_cutoff_seconds_before_close=_get_int(env, "POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", 60),
             poll_interval_seconds=_get_int(env, "POLYMARKET_POLL_INTERVAL_SECONDS", 10),
             log_dir=_get_str(env, "POLYMARKET_LOG_DIR", "logs/polymarket"),
             decision_log_file=_get_str(env, "POLYMARKET_DECISION_LOG_FILE", "logs/polymarket/decisions.jsonl"),

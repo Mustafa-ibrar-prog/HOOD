@@ -90,14 +90,40 @@ class PolymarketRiskManager:
         )
 
     def check_spread(self, market: BinaryMarket) -> RiskCheckResult:
-        spread = market.yes_spread_pct
-        if spread is None:
+        """Passes on EITHER a tight relative spread (max_spread_pct) OR a
+        tight absolute spread (max_spread_usd) -- not just the relative
+        one. A binary contract priced near 0 or 1 has a tiny mid, so
+        (ask-bid)/mid can read as a huge percentage even when ask-bid
+        itself is a perfectly tradeable couple of cents; relative
+        percentage alone was rejecting those trades for being "too wide"
+        when they were actually fine. This can only ever ADD a passing
+        path for a genuinely tight absolute spread -- it can never let
+        through a trade that's wide by both measures, because relative
+        spread is mathematically >= absolute spread for any mid in
+        (0, 1] (dividing by something <= 1 never shrinks it), so
+        max_spread_usd is kept small and tight, not a general escape
+        hatch. Still fails closed on a crossed book or a missing
+        bid/ask -- those are never tradeable regardless of either
+        threshold."""
+        bid, ask = market.yes_bid, market.yes_ask
+        if bid is None or ask is None:
             return RiskCheckResult("MAX_SPREAD", False, "No two-sided quote available to measure spread")
-        ok = spread <= self._settings.max_spread_pct
+        if ask < bid:
+            return RiskCheckResult(
+                "MAX_SPREAD", False, f"Crossed book: ask ${ask:.4f} < bid ${bid:.4f} -- not tradeable",
+            )
+        absolute_spread = round(ask - bid, 4)
+        relative_spread = market.yes_spread_pct  # safe: bid/ask presence and ask>=bid already confirmed above
+        relative_ok = relative_spread is not None and relative_spread <= self._settings.max_spread_pct
+        absolute_ok = absolute_spread <= self._settings.max_spread_usd
+        ok = relative_ok or absolute_ok
+        relative_str = f"{relative_spread:.1%}" if relative_spread is not None else "n/a"
         return RiskCheckResult(
             "MAX_SPREAD", ok,
-            f"Spread {spread:.1%} within limit {self._settings.max_spread_pct:.1%}" if ok
-            else f"Spread too wide ({spread:.1%}, limit {self._settings.max_spread_pct:.1%})",
+            f"Spread {relative_str} (${absolute_spread:.4f}) within relative limit {self._settings.max_spread_pct:.1%} "
+            f"or absolute limit ${self._settings.max_spread_usd:.4f}" if ok
+            else f"Spread too wide: {relative_str} (${absolute_spread:.4f}), exceeds both the relative limit "
+                 f"{self._settings.max_spread_pct:.1%} and the absolute limit ${self._settings.max_spread_usd:.4f}",
         )
 
     def check_entry_cutoff(self, market: BinaryMarket) -> RiskCheckResult:
