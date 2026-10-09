@@ -252,6 +252,34 @@ class PolymarketSettings:
     # window above.
     entry_retry_min_price_change: float
 
+    # --- Exit retry guard (see exit_retry_guard.py) -- the SAME
+    # idempotency/safety philosophy as entry_retry_cooldown_seconds
+    # above, applied to automatic EXIT (SELL) resubmission: after a
+    # live incident showed a position repeatedly cycling
+    # EXIT -> UNKNOWN -> EXPIRED -> EXIT -> UNKNOWN -> EXPIRED -> EXIT
+    # with zero cooldown between attempts, this bounds how soon a NEW
+    # exit may be resubmitted for the SAME position after a recently-
+    # FAILED attempt (an authoritative, no-fill terminal outcome --
+    # never the in-flight/UNKNOWN case, which exit_pending_order_id
+    # already blocks unconditionally regardless of this value). Never
+    # touches max_bet_usd/sizing/BTC evidence scoring/the exit
+    # decision's own evidence-gated cascade, and never blocks a exit
+    # whose underlying evidence hasn't yet been judged exit-worthy in
+    # the first place.
+    #
+    # How long a recently-FAILED exit attempt blocks a retry on the
+    # same position, UNLESS the BTC edge score (exit_manager.
+    # EdgeAssessment.btc_points) has moved by exit_retry_min_evidence_change
+    # in the meantime (see below).
+    exit_retry_cooldown_seconds: float
+    # Minimum absolute move (in btc_points, the same continuous
+    # evidence/expected-value score evaluate_dynamic_exit's own
+    # exit-worthy decision is based on) since a recently-failed exit
+    # attempt's own btc_points reading, required to treat a new attempt
+    # as materially changed evidence and allow an immediate retry
+    # within the cooldown window above.
+    exit_retry_min_evidence_change: float
+
     # --- Order execution -----------------------------------------------------
     # FOK (fill-or-kill) is the default — see models.OrderRequest's
     # docstring for why: it removes the ambiguous "market order partially
@@ -498,6 +526,10 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS must be >= 0")
         if self.entry_retry_min_price_change < 0:
             raise PolymarketConfigError("POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE must be >= 0")
+        if self.exit_retry_cooldown_seconds < 0:
+            raise PolymarketConfigError("POLYMARKET_EXIT_RETRY_COOLDOWN_SECONDS must be >= 0")
+        if self.exit_retry_min_evidence_change < 0:
+            raise PolymarketConfigError("POLYMARKET_EXIT_RETRY_MIN_EVIDENCE_CHANGE must be >= 0")
 
     @property
     def is_paper(self) -> bool:
@@ -550,6 +582,8 @@ class PolymarketSettings:
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
             entry_retry_cooldown_seconds=_get_float(env, "POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS", 120.0),
             entry_retry_min_price_change=_get_float(env, "POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE", 0.02),
+            exit_retry_cooldown_seconds=_get_float(env, "POLYMARKET_EXIT_RETRY_COOLDOWN_SECONDS", 90.0),
+            exit_retry_min_evidence_change=_get_float(env, "POLYMARKET_EXIT_RETRY_MIN_EVIDENCE_CHANGE", 2.0),
             default_order_type=_get_str(env, "POLYMARKET_DEFAULT_ORDER_TYPE", "FOK").upper(),
             profit_target_pct=_get_float(env, "POLYMARKET_PROFIT_TARGET_PCT", 0.20),
             auto_exit_enabled=_get_bool(env, "POLYMARKET_AUTO_EXIT_ENABLED", False),

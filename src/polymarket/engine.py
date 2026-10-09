@@ -113,9 +113,27 @@ def run_cycle(
     # runs first, before this cycle proposes anything new, so the
     # position/state ledger a new trade's risk checks read from (open
     # position count, daily P&L) reflects reality.
+    #
+    # A DELAYED entry (one that sat UNKNOWN across earlier cycles) can
+    # resolve FILLED right here, creating a position THIS call -- a
+    # live incident showed that position then getting immediately
+    # exited by the dynamic-exit pass a few lines below, in the SAME
+    # cycle, on fresh evidence that had nothing to do with the stale
+    # thesis the entry was originally made under. An ordinary brand-new
+    # entry never has this problem (it's created further down in this
+    # same function, AFTER the dynamic-exit pass already ran) -- so the
+    # fix is just giving a delayed adoption the same one-cycle grace an
+    # ordinary entry already gets for free: snapshot which
+    # client_order_ids exist before this sweep, diff against after, and
+    # tell check_and_execute_dynamic_exits() to defer evaluating exactly
+    # those (see exit_manager.py's module docstring, DELAYED-ENTRY GRACE).
+    client_order_ids_before_reconcile = {p.client_order_id for p in position_store.load()}
     reconciled = reconciliation.reconcile_pending_orders(
         client=client, pending_store=pending_store, position_store=position_store,
         state_store=state_store, decision_logger=decision_logger, now=now,
+    )
+    newly_adopted_client_order_ids = frozenset(
+        p.client_order_id for p in position_store.load() if p.client_order_id not in client_order_ids_before_reconcile
     )
 
     settled = settle_resolved_positions(
@@ -133,7 +151,8 @@ def run_cycle(
     exits_submitted = check_and_execute_dynamic_exits(
         client=client, settings=settings, gateway=gateway, position_store=position_store,
         pending_store=pending_store, state_store=state_store, decision_logger=decision_logger,
-        btc_price_store=btc_price_store, history=history, btc_feed_source=btc_feed_source, now=now,
+        btc_price_store=btc_price_store, history=history, btc_feed_source=btc_feed_source,
+        skip_client_order_ids=newly_adopted_client_order_ids, now=now,
     )
 
     try:

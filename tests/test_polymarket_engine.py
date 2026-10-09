@@ -226,6 +226,76 @@ def test_max_open_positions_blocks_new_entry_but_never_short_circuits_dynamic_ex
     assert position_store.load() == []  # paper mode: the exit fills immediately
 
 
+def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_dynamic_exit(tmp_path):
+    """A second live incident this round fixes: an entry order
+    submitted in an EARLIER cycle that sat UNKNOWN finally reconciles
+    FILLED via reconcile_pending_orders()'s sweep at the top of THIS
+    cycle -- creating a position this very call. Dynamic-exit
+    evaluation must NOT immediately reverse that stale-thesis entry on
+    this same cycle's fresh (here, materially opposing) evidence -- it
+    gets the same one-cycle grace an ordinary brand-new entry already
+    gets for free (see engine.py/exit_manager.py's module docstrings).
+    A second cycle then proves the deferral is exactly one cycle, never
+    a permanent shield: the genuinely bad position still exits, just
+    one poll interval later."""
+    from tests.test_polymarket_dynamic_exit_replay import _REVERSING_CLOSES, _REVERSING_SEED, _feed
+
+    market = _market(yes_bid=0.50, yes_ask=0.52)  # flat -- no NEW entry this cycle, keeps the test focused
+    settings = PolymarketSettings.from_env(env={
+        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_DYNAMIC_EXIT_ENABLED": "true",
+    })
+    client = _FakeClient(market)
+    strategy = BtcMomentumStrategy()
+    risk = PolymarketRiskManager(settings)
+    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
+    gateway = PaperPolymarketGateway(settings, logger)
+    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
+    position_store = PolymarketPositionStore(tmp_path / "positions.json")
+    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
+    history = MarketHistory()
+    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed(btc_price_store, _REVERSING_CLOSES, seed=_REVERSING_SEED)  # real, materially-reversing BTC evidence
+    now = end_t + timedelta(seconds=5)
+
+    from src.polymarket.models import OrderRequest, PendingLiveOrder
+    order = OrderRequest(
+        condition_id="c1", token_id="y", outcome="YES", side="BUY", size_usd=5.0, max_price=0.56,
+        close_time=now + timedelta(minutes=10), reason="earlier cycle's entry, went unknown",
+    )
+    pending = PendingLiveOrder.new(order=order, expiry_seconds=600, now=now - timedelta(minutes=2))
+    pending = pending.with_status("submitted", exchange_order_id="ex-delayed-1")
+    pending_store.add(pending)
+    client.set_fill_result("ex-delayed-1", FillResult(
+        order_id="ex-delayed-1", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.56,
+    ))
+
+    report = run_cycle(
+        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
+        decision_logger=logger, state_store=state_store, position_store=position_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
+    )
+
+    assert report.reconciled_count == 1  # the delayed order WAS adopted this cycle
+    positions = position_store.load()
+    assert len(positions) == 1
+    assert positions[0].client_order_id == pending.id  # the SAME position, never duplicated/replaced
+    assert report.exits_submitted == 0  # deferred -- NOT immediately exited this same cycle
+    deferred = [e for e in logger.read_all() if e.get("kind") == "exit_check_deferred"]
+    assert len(deferred) == 1
+
+    # A SECOND cycle, evidence unchanged (still materially REVERSING):
+    # now evaluated completely normally, with no special-casing -- and,
+    # since the evidence genuinely still opposes it, correctly exits.
+    second_report = run_cycle(
+        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
+        decision_logger=logger, state_store=state_store, position_store=position_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        now=now + timedelta(seconds=10),
+    )
+    assert second_report.exits_submitted == 1
+    assert position_store.load() == []  # paper mode: the exit fills immediately
+
+
 def test_run_cycle_settles_via_resolution_fallback_when_target_was_never_reached(tmp_path):
     """Requirement: keep the existing 15-minute resolution/settlement
     behavior as the fallback whenever a position's profit target is

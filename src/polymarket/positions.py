@@ -64,6 +64,36 @@ class OpenPosition:
     # while one is already in flight or of unknown outcome — restart-safe
     # because it is persisted here, not held in memory.
     exit_pending_order_id: str | None = None
+    # The three fields below back exit_retry_guard.py's bounded
+    # retry/cooldown gate (a live incident: EXIT -> UNKNOWN -> EXPIRED ->
+    # EXIT -> UNKNOWN -> EXPIRED -> EXIT, repeating with zero cooldown
+    # and no check that anything had changed). All three are persisted
+    # here, on the position itself, rather than in a separate store —
+    # restart-safe by the same construction as exit_pending_order_id,
+    # and naturally keyed to this exact position since one already
+    # exists by the time an exit is ever considered (unlike the entry
+    # side's retry guard, which has no position yet to attach to).
+    #
+    # pending_exit_edge_points: the EdgeAssessment.btc_points reading
+    # (exit_manager.compute_edge_assessment) that justified the
+    # CURRENTLY in-flight exit named by exit_pending_order_id above —
+    # captured the instant that exit is submitted, so it's still
+    # available later, in a possibly different cycle or after a
+    # restart, when that attempt's outcome is finally learned. None
+    # whenever exit_pending_order_id is None.
+    pending_exit_edge_points: float | None = None
+    # last_exit_attempt_at / last_exit_attempt_edge_points: when the
+    # most recent exit attempt for this position resolved to an
+    # authoritative, NO-FILL terminal outcome (expired/rejected/failed
+    # — never a genuine fill, and never the non-authoritative "unknown"
+    # status), and the pending_exit_edge_points value that attempt was
+    # submitted under. Both None whenever there is no such recently-
+    # failed attempt to rate-limit a retry against. Cleared back to
+    # None the moment any later exit for this position fills (even
+    # partially) — a successful fill means there is nothing left to
+    # retry-guard against.
+    last_exit_attempt_at: datetime | None = None
+    last_exit_attempt_edge_points: float | None = None
 
     @property
     def filled_size_usd(self) -> float:
@@ -73,6 +103,7 @@ class OpenPosition:
         d = asdict(self)
         d["opened_at"] = self.opened_at.isoformat()
         d["close_time"] = self.close_time.isoformat()
+        d["last_exit_attempt_at"] = self.last_exit_attempt_at.isoformat() if self.last_exit_attempt_at else None
         return d
 
     @classmethod
@@ -85,6 +116,11 @@ class OpenPosition:
             opened_at=datetime.fromisoformat(data["opened_at"]), close_time=datetime.fromisoformat(data["close_time"]),
             entry_fee_usd=float(data.get("entry_fee_usd", 0.0)),
             exit_pending_order_id=data.get("exit_pending_order_id"),
+            pending_exit_edge_points=data.get("pending_exit_edge_points"),
+            last_exit_attempt_at=(
+                datetime.fromisoformat(data["last_exit_attempt_at"]) if data.get("last_exit_attempt_at") else None
+            ),
+            last_exit_attempt_edge_points=data.get("last_exit_attempt_edge_points"),
         )
 
 

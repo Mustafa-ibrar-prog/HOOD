@@ -98,6 +98,45 @@ reconciliation.py already established for entries, applied to exits:
   (reconcile_exit_fill) retries the SAME lookup instead of ever
   proposing a second, duplicate exit for the same position.
 
+RETRY/COOLDOWN GUARD (see exit_retry_guard.py): the idempotency guard
+above only ever blocks while an exit is IN FLIGHT or of UNKNOWN
+status. A live incident showed what happens once an exit instead
+resolves to an authoritative, no-fill TERMINAL outcome
+(expired/rejected/failed): exit_pending_order_id was cleared
+immediately, with no cooldown and no check that the evidence had
+changed, so the very next cycle just resubmitted another exit on the
+SAME still-exit-worthy evidence — observed live as
+"EXIT -> UNKNOWN -> EXPIRED -> EXIT -> UNKNOWN -> EXPIRED -> EXIT" on
+loop, never actually reducing the position's exposure.
+evaluate_dynamic_exit() now consults check_exit_retry_guard() (see
+that module for the full mechanism) once it has already decided
+current evidence is exit-worthy on its own — a RATE LIMIT on retrying
+a recently-failed attempt, requiring either a cooldown or materially
+changed evidence, never a reason by itself to hold a position whose
+evidence still supports exiting.
+
+DELAYED-ENTRY GRACE (see check_and_execute_dynamic_exits'
+`skip_client_order_ids`): an ordinary brand-new entry structurally
+never gets evaluated for a dynamic exit on the SAME cycle it opens —
+engine.run_cycle() calls check_and_execute_dynamic_exits() BEFORE the
+entry path even runs, so a position created this cycle by a fresh BUY
+isn't in position_store yet when the exit pass reads it. A DELAYED
+entry breaks that symmetry: an order submitted cycles earlier that sat
+UNKNOWN finally reconciles FILLED via reconcile_pending_orders()'s
+sweep, which runs at the very TOP of run_cycle() — BEFORE the exit
+pass — so the newly-adopted position WAS already visible to this same
+cycle's dynamic-exit check, with zero cycles of grace. A live incident
+showed exactly this: an old, stale-thesis entry filled, and the SAME
+cycle's fresh evidence immediately exited it, net of fees, for no
+benefit. `skip_client_order_ids` restores the same one-cycle grace
+delayed adoptions were missing — see engine.py's run_cycle(), which
+computes it as "whatever reconcile_pending_orders() just created this
+call" and passes it straight through. It is a one-cycle deferral only:
+next cycle, with nothing special persisted and no exception carved
+out, the position is evaluated completely normally — a genuinely bad
+newly-opened position is still caught exactly one poll interval later,
+never permanently shielded.
+
 MASTER SWITCH: settings.dynamic_exit_enabled (POLYMARKET_DYNAMIC_EXIT_ENABLED,
 default False) — while False, check_and_execute_dynamic_exits() is a
 complete no-op: it never even evaluates a position, in PAPER or LIVE
@@ -131,6 +170,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.polymarket.btc_intelligence import BtcMarketAssessment, assess_btc_market, thesis_direction_for_outcome
+from src.polymarket.exit_retry_guard import check_exit_retry_guard
 from src.polymarket.gateway import ExecutionGateway, LivePolymarketGateway, LiveTradingDisabledError, PolymarketOrderPlacer
 from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import FillResult, OrderBookSnapshot, OrderRequest, OrderResult
@@ -289,7 +329,15 @@ class ExitDecision:
     the module docstring's EXPECTED-VALUE REDESIGN section. They are
     always computed and logged (useful for a human or LLM reviewing
     the decision, and for scripts that print them), but
-    evaluate_dynamic_exit never branches on either."""
+    evaluate_dynamic_exit never branches on either.
+
+    `edge_btc_points` is EdgeAssessment.btc_points at the time of this
+    decision — None whenever it was never computed (the
+    exit_pending_order_id/no-bid/INSUFFICIENT_DATA guards all return
+    before it exists). submit_dynamic_exit() persists it on the
+    position the instant a new exit is submitted, so exit_retry_guard.py
+    has it available later to judge whether evidence has materially
+    changed since a recently-failed attempt — see that module."""
 
     position: OpenPosition
     eligible: bool
@@ -299,6 +347,7 @@ class ExitDecision:
     executable_shares_at_target: float
     gross_pnl_pct: float | None  # context only -- never a branch condition, see module docstring
     btc_assessment: BtcMarketAssessment | None
+    edge_btc_points: float | None = None
 
 
 def evaluate_dynamic_exit(
@@ -308,6 +357,9 @@ def evaluate_dynamic_exit(
     *,
     profit_target_pct: float,
     config: DynamicExitConfig | None = None,
+    exit_retry_cooldown_seconds: float = 0.0,
+    exit_retry_min_evidence_change: float = 0.0,
+    now: datetime | None = None,
 ) -> ExitDecision:
     """Pure decision logic — see module docstring's EXPECTED-VALUE
     REDESIGN section for the full reasoning. Checklist, in order:
@@ -325,12 +377,25 @@ def evaluate_dynamic_exit(
          clearly contradict that read; otherwise HOLD. gross_pnl_pct/
          target_price are computed for context/logging only and never
          participate in this decision;
-      5. (only once exit is decided) enough REAL executable bid
-         liquidity, AT OR ABOVE the current best bid, to sell the
-         position's entire filled_shares.
+      5. (only once exit is decided exit-worthy) check_exit_retry_guard
+         (see exit_retry_guard.py) -- a RECENTLY-FAILED attempt (an
+         authoritative, no-fill terminal outcome) on this exact
+         position rate-limits an immediate retry unless the cooldown
+         has elapsed or the evidence has materially changed. A
+         position with no such prior failure is never affected by this
+         step at all;
+      6. (only once exit clears the retry guard too) enough REAL
+         executable bid liquidity, AT OR ABOVE the current best bid,
+         to sell the position's entire filled_shares.
+    `exit_retry_cooldown_seconds`/`exit_retry_min_evidence_change`
+    default to 0.0 (no rate-limiting at all) so existing callers that
+    never pass them keep their original behavior exactly; engine.py's
+    production call site passes settings.exit_retry_cooldown_seconds/
+    settings.exit_retry_min_evidence_change explicitly.
     Any failure returns `eligible=False` with a human-readable reason;
     nothing here ever submits an order."""
     config = config or DynamicExitConfig()
+    now = now or datetime.now(timezone.utc)
     target_price = compute_target_price(position.avg_fill_price, profit_target_pct)
     best_bid = order_book.best_bid
 
@@ -354,10 +419,11 @@ def evaluate_dynamic_exit(
     gross_pnl_pct = (best_bid - position.avg_fill_price) / position.avg_fill_price
     state = btc_assessment.state
 
-    def _decision(eligible: bool, reason: str, executable: float = 0.0) -> ExitDecision:
+    def _decision(eligible: bool, reason: str, executable: float = 0.0, edge_btc_points: float | None = None) -> ExitDecision:
         return ExitDecision(
             position=position, eligible=eligible, reason=reason, target_price=target_price, best_bid=best_bid,
             executable_shares_at_target=executable, gross_pnl_pct=gross_pnl_pct, btc_assessment=btc_assessment,
+            edge_btc_points=edge_btc_points,
         )
 
     # --- Hard safety: insufficient/stale BTC evidence -> HOLD, never guess -
@@ -386,13 +452,26 @@ def evaluate_dynamic_exit(
                 f"BTC evidence opposes the thesis ({state.value.lower()}, btc_points={edge.btc_points:+.0f}) but "
                 f"Polymarket order-book flow contradicts it (microstructure_net={edge.microstructure_net:+.2f}, "
                 f"{', '.join(edge.microstructure_supporting)}); holding regardless of pnl={gross_pnl_pct:+.1%}",
+                edge_btc_points=edge.btc_points,
             )
         return _decision(
             False,
             f"BTC evidence still favors or is neutral on the thesis ({state.value.lower()}, "
             f"btc_points={edge.btc_points:+.0f}); holding regardless of pnl={gross_pnl_pct:+.1%} -- "
             "P&L is context, not a trigger",
+            edge_btc_points=edge.btc_points,
         )
+
+    # --- Retry/cooldown guard (see exit_retry_guard.py) -- only reached
+    # once evidence is ALREADY exit-worthy on its own; rate-limits a
+    # resubmission after a recently-failed attempt, never a reason by
+    # itself to hold a position whose evidence still supports exiting.
+    retry_decision = check_exit_retry_guard(
+        position, candidate_btc_points=edge.btc_points, cooldown_seconds=exit_retry_cooldown_seconds,
+        min_evidence_change=exit_retry_min_evidence_change, now=now,
+    )
+    if retry_decision.blocked:
+        return _decision(False, retry_decision.reason, edge_btc_points=edge.btc_points)
 
     exit_reason = (
         f"BTC evidence has materially turned against the thesis ({state.value.lower()}, "
@@ -407,11 +486,13 @@ def evaluate_dynamic_exit(
             False,
             f"Insufficient executable bid liquidity at/above {best_bid}: "
             f"{available} available shares < {position.filled_shares} needed",
+            edge_btc_points=edge.btc_points,
         )
 
     return ExitDecision(
         position=position, eligible=True, reason=exit_reason, target_price=target_price, best_bid=best_bid,
         executable_shares_at_target=available, gross_pnl_pct=gross_pnl_pct, btc_assessment=btc_assessment,
+        edge_btc_points=edge.btc_points,
     )
 
 
@@ -465,9 +546,19 @@ def record_exit_fill(
         # A genuine terminal non-fill (rejected/cancelled/expired), or a
         # resting state that should never actually happen for an
         # IOC/FOK exit -- authoritative and safe to clear: free to
-        # retry a fresh exit next cycle, nothing about the position
-        # itself changed.
-        cleared = replace(current, exit_pending_order_id=None)
+        # retry a fresh exit, nothing about the position itself
+        # changed. THIS is exit_retry_guard.py's own trigger: record
+        # last_exit_attempt_at/last_exit_attempt_edge_points (from
+        # whatever evidence this now-failed attempt was submitted
+        # under) so the NEXT proposed exit is rate-limited by cooldown/
+        # evidence-change rather than resubmitted immediately and
+        # unconditionally -- the exact live incident this closes
+        # (EXIT -> UNKNOWN -> EXPIRED -> EXIT, repeating with zero
+        # cooldown).
+        cleared = replace(
+            current, exit_pending_order_id=None, pending_exit_edge_points=None,
+            last_exit_attempt_at=now, last_exit_attempt_edge_points=current.pending_exit_edge_points,
+        )
         position_store.update(cleared)
         decision_logger.log_decision(
             kind="exit_not_filled",
@@ -522,8 +613,12 @@ def record_exit_fill(
         position_store.remove(current.condition_id)
         return None
 
+    # A real fill (even partial) succeeded -- any retry-guard history
+    # from an earlier failed attempt is no longer relevant; the next
+    # exit decision for the remaining shares starts with a clean slate.
     updated = replace(
-        current, filled_shares=remaining_shares, exit_pending_order_id=None,
+        current, filled_shares=remaining_shares, exit_pending_order_id=None, pending_exit_edge_points=None,
+        last_exit_attempt_at=None, last_exit_attempt_edge_points=None,
         entry_fee_usd=max(0.0, current.entry_fee_usd - entry_fee_for_closed),
     )
     position_store.update(updated)
@@ -612,7 +707,14 @@ def submit_dynamic_exit(
     if pending_order_id is None and result.fill_result is not None:
         pending_order_id = result.fill_result.order_id  # paper mode's synthetic id -- same idempotency role
 
-    position_store.update(replace(position, exit_pending_order_id=pending_order_id))
+    # pending_exit_edge_points travels WITH exit_pending_order_id (see
+    # exit_retry_guard.py/positions.py): the evidence that justified
+    # THIS attempt, stashed so a later cycle -- or a restart -- can
+    # still judge "has the evidence materially changed" if this attempt
+    # ends up failing with no fill.
+    position_store.update(replace(
+        position, exit_pending_order_id=pending_order_id, pending_exit_edge_points=decision.edge_btc_points,
+    ))
     decision_logger.log_decision(
         kind="dynamic_exit_submitted",
         reason=f"{position.outcome} on {position.condition_id}: {decision.reason}",
@@ -639,10 +741,15 @@ def submit_dynamic_exit(
             # this position must NOT stay permanently exit-blocked:
             # clear the guard so a later cycle can re-propose a fresh
             # exit once the block lifts. "Emergency stop blocks
-            # automatic exits," not "...forever."
+            # automatic exits," not "...forever." Deliberately does NOT
+            # set last_exit_attempt_at/exit_retry_guard cooldown -- this
+            # is an OPERATIONAL block, not an evidence-based failure;
+            # the attempt never even reached the exchange, so there is
+            # nothing here for exit_retry_guard.py's "has the evidence
+            # changed since the last FAILED attempt" question to apply to.
             refreshed = position_store.get(position.client_order_id)
             if refreshed is not None:
-                position_store.update(replace(refreshed, exit_pending_order_id=None))
+                position_store.update(replace(refreshed, exit_pending_order_id=None, pending_exit_edge_points=None))
             decision_logger.log_decision(
                 kind="exit_blocked",
                 reason=f"Automatic exit for {position.condition_id} blocked before reaching the exchange: {exc}",
@@ -665,11 +772,23 @@ def submit_dynamic_exit(
                 decision_logger=decision_logger, now=now,
             )
     elif result.status in ("rejected", "failed"):
-        # Terminal, no-position-change outcomes with nothing to wait
-        # on -- free the guard so a later cycle can retry.
+        # Terminal, no-fill, no-position-change outcomes with nothing
+        # to wait on -- a gateway-level rejection discovered
+        # synchronously (never reached the exchange, or was refused on
+        # the spot). This IS the authoritative-failure case
+        # exit_retry_guard.py rate-limits: free exit_pending_order_id
+        # so a later cycle CAN retry, but record last_exit_attempt_at/
+        # last_exit_attempt_edge_points first so that retry is subject
+        # to the cooldown/evidence-change guard, not immediate and
+        # unconditional -- see this module's own docstring on the
+        # repeating EXIT -> UNKNOWN -> EXPIRED -> EXIT incident this
+        # closes.
         refreshed = position_store.get(position.client_order_id)
         if refreshed is not None and refreshed.exit_pending_order_id == pending_order_id:
-            position_store.update(replace(refreshed, exit_pending_order_id=None))
+            position_store.update(replace(
+                refreshed, exit_pending_order_id=None, pending_exit_edge_points=None,
+                last_exit_attempt_at=now, last_exit_attempt_edge_points=refreshed.pending_exit_edge_points,
+            ))
     # result.status == "awaiting_approval": exit_pending_order_id stays
     # set -- a human confirm_and_place() call (scripts/confirm_pending_order.py
     # or confirm_polymarket_order.py, both already side-agnostic), or a
@@ -692,6 +811,7 @@ def check_and_execute_dynamic_exits(
     history: Any = None,
     config: DynamicExitConfig | None = None,
     btc_feed_source: str = "manual",
+    skip_client_order_ids: frozenset[str] = frozenset(),
     now: datetime | None = None,
 ) -> int:
     """One per-cycle pass over every open position — intended to be
@@ -736,6 +856,18 @@ def check_and_execute_dynamic_exits(
     "manual" (the default) when only the interim feed_btc_quote.py
     bridge is in use.
 
+    `skip_client_order_ids` (see module docstring's DELAYED-ENTRY GRACE
+    section): positions adopted into the ledger THIS SAME call to
+    engine.run_cycle() via a delayed reconcile_pending_orders() sweep
+    (an old entry order that sat UNKNOWN across earlier cycles finally
+    resolving FILLED) are skipped entirely this one cycle — logged as
+    `exit_check_deferred` — so a stale, already-superseded entry
+    decision is never immediately reversed by this same cycle's fresh
+    evidence. Empty by default (no-op for any caller that doesn't pass
+    it, including every direct test call site); engine.py's production
+    call site computes it from what reconcile_pending_orders() just
+    created.
+
     Returns the number of exit orders submitted this call (0 is the
     overwhelmingly common case: most cycles, no position exits)."""
     if not settings.dynamic_exit_enabled:
@@ -752,6 +884,19 @@ def check_and_execute_dynamic_exits(
         # "verify the position still exists").
         current = position_store.get(snapshot.client_order_id)
         if current is None:
+            continue
+
+        if current.client_order_id in skip_client_order_ids:
+            decision_logger.log_decision(
+                kind="exit_check_deferred",
+                reason=(
+                    f"{current.outcome} on {current.condition_id}: position was just adopted via a "
+                    "delayed entry-order reconciliation THIS cycle -- deferring dynamic-exit evaluation "
+                    "one cycle so a stale, already-superseded entry decision is never immediately "
+                    "reversed by this same cycle's fresh evidence (see exit_manager.py's module docstring)"
+                ),
+                evidence={"position": current.to_dict()},
+            )
             continue
 
         if current.exit_pending_order_id is not None:
@@ -821,6 +966,8 @@ def check_and_execute_dynamic_exits(
 
         decision = evaluate_dynamic_exit(
             current, order_book, btc_assessment, profit_target_pct=settings.profit_target_pct, config=config,
+            exit_retry_cooldown_seconds=settings.exit_retry_cooldown_seconds,
+            exit_retry_min_evidence_change=settings.exit_retry_min_evidence_change, now=now,
         )
         if not decision.eligible:
             continue
