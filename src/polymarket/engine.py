@@ -21,6 +21,7 @@ from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import BinaryMarket, OrderRequest
 from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import PolymarketPositionStore
+from src.polymarket.reference_divergence import assess_divergence
 from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
@@ -121,6 +122,8 @@ def run_cycle(
     btc_price_store: BtcPriceHistoryStore,
     btc_feed_source: str = "manual",
     trade_store: CompletedTradeStore | None = None,
+    reference_price_store: BtcPriceHistoryStore | None = None,
+    reference_feed_source: str = "manual",
     now: datetime | None = None,
 ) -> CycleReport:
     now = now or datetime.now(timezone.utc)
@@ -285,6 +288,44 @@ def run_cycle(
             "decision": "ALLOW" if confidence.approved else "BLOCK",
         },
     )
+    # --- REFERENCE DIVERGENCE -> Coinbase vs. the settlement-aligned
+    # reference feed (see reference_divergence.py). A no-op (penalty
+    # stays 0.0, status REFERENCE_UNAVAILABLE) whenever no reference
+    # feed is configured for this run -- today's default, since no
+    # legitimate free/live source exists yet (see that module's
+    # docstring); this never changes Coinbase-only behavior until a
+    # licensed feed is actually wired in.
+    reference_direction = None
+    if settings.reference_feed_enabled and reference_price_store is not None:
+        try:
+            reference_bars = reference_price_store.get_bars(
+                interval_seconds=settings.btc_bar_interval_seconds, now=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - a reference-feed read failure must never crash the bot
+            decision_logger.log_decision(
+                kind="reference_feed_read_failed",
+                reason=f"Could not read reference price history for {market.condition_id}: {exc}",
+                evidence={"condition_id": market.condition_id, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            reference_bars = []
+        reference_direction = assess_btc_entry_direction(
+            reference_bars, now=now, max_bar_age_seconds=settings.btc_max_bar_age_seconds,
+            feed_source=reference_feed_source, min_strengthening_signals=settings.min_strengthening_signals_for_entry,
+        )
+    divergence = assess_divergence(
+        btc_direction, reference_direction, divergence_penalty=settings.reference_divergence_penalty,
+    )
+    decision_logger.log_decision(
+        kind="reference_divergence",
+        reason=f"REFERENCE_STATUS={divergence.status} CONFIDENCE_PENALTY={divergence.confidence_penalty:+.1f} {divergence.reason}",
+        evidence={
+            "condition_id": market.condition_id, "coinbase_direction": btc_direction.direction,
+            "reference_direction": reference_direction.direction if reference_direction else None,
+            "reference_feed_status": reference_direction.feed_status.status if reference_direction else None,
+            "status": divergence.status, "confidence_penalty": divergence.confidence_penalty,
+        },
+    )
+
     # --- LEARNING -> a SECONDARY, bounded adjustment from this bot's own
     # completed-trade history (see trade_learning.py, TASK 2). Never
     # applied when base_confidence is already 0 (neutral/no-trade --
@@ -293,7 +334,7 @@ def run_cycle(
     # (adjustment stays 0.0) whenever learning is disabled or no
     # trade_store was configured for this run.
     historical_adjustment = 0.0
-    final_confidence = confidence.base_confidence
+    final_confidence = apply_historical_adjustment(confidence.base_confidence, divergence.confidence_penalty)
     historical_sample_count = 0
     historical_win_rate = None
     historical_expectancy = None
@@ -303,12 +344,12 @@ def run_cycle(
         # price this setup is being entered at" -- the real avg_fill_price
         # isn't known until after the order book fetch/order submission
         # below, and setup-matching only needs a $0.05 bucket anyway.
-        reference_entry_price = market.yes_mid if market.yes_mid is not None else 0.0
+        setup_key_price_proxy = market.yes_mid if market.yes_mid is not None else 0.0
         setup_key = build_setup_key(
             btc_direction=btc_direction.direction,
             momentum_state=btc_direction.momentum_state.value if btc_direction.momentum_state else None,
             fired_signal_count=btc_direction.fired_signal_count,
-            entry_fill_price=reference_entry_price, seconds_remaining_at_entry=market.seconds_to_close,
+            entry_fill_price=setup_key_price_proxy, seconds_remaining_at_entry=market.seconds_to_close,
         )
         try:
             completed_trades = trade_store.load()
@@ -332,7 +373,9 @@ def run_cycle(
         historical_sample_count = stats.sample_count
         historical_win_rate = stats.win_rate
         historical_expectancy = stats.expectancy_usd
-        final_confidence = apply_historical_adjustment(confidence.base_confidence, historical_adjustment)
+        final_confidence = apply_historical_adjustment(
+            confidence.base_confidence, historical_adjustment + divergence.confidence_penalty,
+        )
 
     final_bucket = confidence_bucket(final_confidence)
     final_size_usd = recommended_size_usd(final_confidence)
@@ -535,6 +578,8 @@ def run_cycle(
         ),
         "btc_price_at_entry": bars[-1].close if bars else None,
         "coinbase_feed_status": feed_status.status,
+        "reference_direction_at_entry": reference_direction.direction if reference_direction else None,
+        "reference_divergence_status": divergence.status,
         "polymarket_yes_bid": market.yes_bid,
         "polymarket_yes_ask": market.yes_ask,
         "entry_spread": market.yes_spread_pct,

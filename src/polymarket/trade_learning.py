@@ -126,6 +126,12 @@ class CompletedTrade:
     exit_btc_state: str | None = None
     exit_btc_evidence_score: float | None = None
     stale_entry: bool = False
+    # Settlement-aligned reference feed (see reference_divergence.py).
+    # Always None today -- no licensed reference feed is wired in yet
+    # (see that module's docstring) -- but once one is, these populate
+    # automatically via entry_context with zero further changes here.
+    reference_direction_at_entry: str | None = None
+    reference_divergence_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -158,6 +164,8 @@ class CompletedTrade:
             final_confidence=data.get("final_confidence"), historical_adjustment=data.get("historical_adjustment"),
             exit_btc_state=data.get("exit_btc_state"), exit_btc_evidence_score=data.get("exit_btc_evidence_score"),
             stale_entry=bool(data.get("stale_entry", False)),
+            reference_direction_at_entry=data.get("reference_direction_at_entry"),
+            reference_divergence_status=data.get("reference_divergence_status"),
         )
 
 
@@ -363,6 +371,119 @@ def record_completed_trade(
         base_confidence=entry_context.get("base_confidence"), confidence_bucket=entry_context.get("confidence_bucket"),
         final_confidence=entry_context.get("final_confidence"), historical_adjustment=entry_context.get("historical_adjustment"),
         exit_btc_state=exit_btc_state, exit_btc_evidence_score=exit_btc_evidence_score, stale_entry=stale_entry,
+        reference_direction_at_entry=entry_context.get("reference_direction_at_entry"),
+        reference_divergence_status=entry_context.get("reference_divergence_status"),
     )
     trade_store.append(trade)
     return trade
+
+
+# --- Loss replay/analysis utility --------------------------------------
+# For each losing completed trade, determines as much as can actually
+# be read off the stored record about WHY it lost -- never a guess,
+# never fabricated data for a field this bot never captured. Built for
+# the reference-data architecture investigation: whether losses are
+# primarily (A) incorrect BTC direction, (B) Coinbase/reference-feed
+# divergence, (C) poor timing, (D) a poor Polymarket entry price,
+# (E) an execution/reconciliation problem, or (F) exit logic.
+#
+# (B) is ALWAYS reported as "cannot be determined" today: no
+# historical reference-feed data exists yet for any trade (see
+# reference_divergence.py's module docstring -- no legitimate free/
+# live Chainlink Data Streams access exists), so inventing a verdict
+# here would be exactly the kind of fabrication this whole feature
+# must never do. A trade's own `reference_direction_at_entry` (see
+# record_completed_trade/engine.py's entry_context) becomes available
+# automatically, with zero further code changes here, the moment a
+# licensed reference feed is actually wired in and starts recording it.
+
+CAUSE_BTC_DIRECTION = "A_btc_direction"
+CAUSE_REFERENCE_DIVERGENCE_UNKNOWN = "B_reference_divergence_unknown"
+CAUSE_REFERENCE_DIVERGENCE = "B_reference_divergence"
+CAUSE_TIMING = "C_timing"
+CAUSE_ENTRY_PRICE = "D_entry_price"
+CAUSE_EXECUTION_RECONCILIATION = "E_execution_reconciliation"
+CAUSE_EXIT_LOGIC = "F_exit_logic"
+
+DEFAULT_TIMING_THRESHOLD_SECONDS = 120.0
+DEFAULT_SPREAD_THRESHOLD = 0.05
+
+
+@dataclass(frozen=True)
+class LossAnalysis:
+    condition_id: str
+    exit_timestamp: datetime
+    realized_pnl_usd: float
+    outcome_classification: str
+    btc_direction: str | None
+    coinbase_price_at_entry: float | None  # btc_price_at_entry -- Coinbase, the only feed with real historical data today
+    reference_direction_at_entry: str | None  # None on every trade until a licensed reference feed exists (see above)
+    seconds_remaining_at_entry: float | None
+    polymarket_yes_bid: float | None
+    polymarket_yes_ask: float | None
+    entry_fill_price: float
+    exit_price: float
+    exit_reason: str
+    likely_causes: tuple[str, ...]  # subset of the CAUSE_* constants above
+
+
+def analyze_losing_trades(
+    trades: list[CompletedTrade], *,
+    timing_threshold_seconds: float = DEFAULT_TIMING_THRESHOLD_SECONDS,
+    spread_threshold: float = DEFAULT_SPREAD_THRESHOLD,
+) -> list[LossAnalysis]:
+    """Pure function over already-persisted trades -- no I/O, no live
+    data, fully deterministic and testable. A non-strategy loss
+    (EXECUTION_LOSS/API_RECONCILIATION_EVENT/STALE_ORDER_EVENT) is
+    flagged with ONLY cause E -- exactly 2E's own rule that an
+    execution/reconciliation problem must never be read as "the
+    strategy's BTC-direction call was wrong," so it is never also
+    tagged A/B/C/D/F."""
+    results = []
+    for t in trades:
+        if t.realized_pnl_usd >= 0:
+            continue
+        causes: list[str] = []
+        if t.outcome_classification in (OUTCOME_EXECUTION_LOSS, OUTCOME_API_RECONCILIATION_EVENT, OUTCOME_STALE_ORDER_EVENT):
+            causes.append(CAUSE_EXECUTION_RECONCILIATION)
+        else:
+            if t.outcome_classification == OUTCOME_STRATEGY_LOSS:
+                causes.append(CAUSE_BTC_DIRECTION)
+            # Only ever a real verdict when this trade actually recorded
+            # a reference-feed reading (reference_divergence_status ==
+            # "DIVERGENCE") -- on every trade today, this is None (no
+            # licensed reference feed exists yet -- see
+            # reference_divergence.py's module docstring), so this is
+            # reported as "cannot be determined," never fabricated.
+            if t.reference_divergence_status == "DIVERGENCE":
+                causes.append(CAUSE_REFERENCE_DIVERGENCE)
+            elif t.reference_divergence_status is None:
+                causes.append(CAUSE_REFERENCE_DIVERGENCE_UNKNOWN)
+            if t.seconds_remaining_at_entry is not None and t.seconds_remaining_at_entry < timing_threshold_seconds:
+                causes.append(CAUSE_TIMING)
+            if t.entry_spread is not None and t.entry_spread > spread_threshold:
+                causes.append(CAUSE_ENTRY_PRICE)
+            if t.exit_reason == "DYNAMIC_EXIT":
+                causes.append(CAUSE_EXIT_LOGIC)
+        results.append(LossAnalysis(
+            condition_id=t.condition_id, exit_timestamp=t.exit_timestamp, realized_pnl_usd=t.realized_pnl_usd,
+            outcome_classification=t.outcome_classification, btc_direction=t.btc_direction,
+            coinbase_price_at_entry=t.btc_price_at_entry,
+            reference_direction_at_entry=t.reference_direction_at_entry,  # None until a reference feed exists -- never fabricated
+            seconds_remaining_at_entry=t.seconds_remaining_at_entry,
+            polymarket_yes_bid=t.polymarket_yes_bid, polymarket_yes_ask=t.polymarket_yes_ask,
+            entry_fill_price=t.entry_fill_price, exit_price=t.exit_price, exit_reason=t.exit_reason,
+            likely_causes=tuple(causes),
+        ))
+    return results
+
+
+def summarize_loss_causes(analyses: list[LossAnalysis]) -> dict[str, int]:
+    """How many losing trades each cause appears in -- a trade with
+    multiple plausible contributing causes counts once toward each,
+    so these counts need not sum to len(analyses)."""
+    counts: dict[str, int] = {}
+    for analysis in analyses:
+        for cause in analysis.likely_causes:
+            counts[cause] = counts.get(cause, 0) + 1
+    return counts

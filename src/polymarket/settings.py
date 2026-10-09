@@ -356,6 +356,31 @@ class PolymarketSettings:
     # — restart-safe, same file-backed convention as every other store here.
     btc_price_history_file: str
 
+    # --- Settlement-aligned reference feed (see reference_divergence.py) ---
+    # Coinbase (above) stays the PRIMARY live market-momentum signal;
+    # this is a SEPARATE, OPTIONAL feed for whatever source actually
+    # settles the traded market (research finding: Polymarket's own
+    # 15-minute BTC Up/Down rules cite Chainlink's BTC/USD Data Stream,
+    # not CF Benchmarks' BRTI -- see reference_divergence.py's module
+    # docstring). Chainlink Data Streams requires a PAID subscription
+    # with no free/public tier, so this defaults to disabled -- no live
+    # fetcher exists yet; wiring one in later never requires touching
+    # engine.py again (same DirectBtcQuoteSource Protocol Coinbase
+    # already implements). False/None here reproduces TODAY's exact
+    # Coinbase-only behavior, byte for byte.
+    reference_feed_enabled: bool
+    reference_price_history_file: str
+    # Confidence penalty applied ONLY when the reference feed is FRESH
+    # and materially disagrees with Coinbase's own chosen direction
+    # (reference_divergence.assess_divergence's DIVERGENCE case) --
+    # large enough by default to always force a NO_TRADE (see
+    # entry_confidence.py's clamp), never merely a soft nudge, per
+    # "confidence should decrease OR the trade should be blocked."
+    # Never applied when the reference feed is unavailable, stale, or
+    # itself non-directional -- those degrade to a zero penalty (no
+    # change to Coinbase-only behavior).
+    reference_divergence_penalty: float
+
     # --- Self-learning (see trade_learning.py) ------------------------------
     # Historical performance is a SECONDARY, BOUNDED adjustment to the
     # PRIMARY Coinbase-driven confidence score (entry_confidence.py) --
@@ -447,6 +472,8 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT must be > 0")
         if self.min_strengthening_signals_for_entry <= 0:
             raise PolymarketConfigError("POLYMARKET_MIN_STRENGTHENING_SIGNALS_FOR_ENTRY must be > 0")
+        if self.reference_divergence_penalty > 0:
+            raise PolymarketConfigError("POLYMARKET_REFERENCE_DIVERGENCE_PENALTY must be <= 0")
         if self.learning_min_sample_size <= 0:
             raise PolymarketConfigError("POLYMARKET_LEARNING_MIN_SAMPLE_SIZE must be > 0")
         if self.learning_min_adjustment > 0:
@@ -640,6 +667,11 @@ class PolymarketSettings:
             min_weakening_signals_for_exit=_get_int(env, "POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT", 2),
             min_strengthening_signals_for_entry=_get_int(env, "POLYMARKET_MIN_STRENGTHENING_SIGNALS_FOR_ENTRY", 2),
             btc_price_history_file=_get_str(env, "POLYMARKET_BTC_PRICE_HISTORY_FILE", "logs/polymarket/btc_price_history.json"),
+            reference_feed_enabled=_get_bool(env, "POLYMARKET_REFERENCE_FEED_ENABLED", False),
+            reference_price_history_file=_get_str(
+                env, "POLYMARKET_REFERENCE_PRICE_HISTORY_FILE", "logs/polymarket/reference_price_history.json",
+            ),
+            reference_divergence_penalty=_get_float(env, "POLYMARKET_REFERENCE_DIVERGENCE_PENALTY", -100.0),
             learning_enabled=_get_bool(env, "POLYMARKET_LEARNING_ENABLED", True),
             learning_min_sample_size=_get_int(env, "POLYMARKET_LEARNING_MIN_SAMPLE_SIZE", 20),
             learning_min_adjustment=_get_float(env, "POLYMARKET_LEARNING_MIN_ADJUSTMENT", -10.0),

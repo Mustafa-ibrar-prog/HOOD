@@ -16,6 +16,13 @@ import pytest
 
 from src.polymarket.positions import OpenPosition
 from src.polymarket.trade_learning import (
+    CAUSE_BTC_DIRECTION,
+    CAUSE_ENTRY_PRICE,
+    CAUSE_EXECUTION_RECONCILIATION,
+    CAUSE_EXIT_LOGIC,
+    CAUSE_REFERENCE_DIVERGENCE,
+    CAUSE_REFERENCE_DIVERGENCE_UNKNOWN,
+    CAUSE_TIMING,
     OUTCOME_API_RECONCILIATION_EVENT,
     OUTCOME_EXECUTION_LOSS,
     OUTCOME_NORMAL_WIN,
@@ -24,12 +31,14 @@ from src.polymarket.trade_learning import (
     CompletedTrade,
     CompletedTradeStore,
     CompletedTradeStoreError,
+    analyze_losing_trades,
     apply_historical_adjustment,
     build_setup_key,
     classify_outcome,
     compute_historical_adjustment,
     compute_setup_stats,
     record_completed_trade,
+    summarize_loss_causes,
 )
 
 _T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -297,3 +306,75 @@ def test_i4_stale_entry_fill_classifies_as_stale_order_event_not_strategy_loss(t
     )
     assert trade.outcome_classification == OUTCOME_STALE_ORDER_EVENT
     assert trade.stale_entry is True
+
+
+# --- J: loss replay/analysis utility -----------------------------------
+
+def test_j_winning_trades_are_excluded_from_loss_analysis():
+    trades = [_trade(realized_pnl_usd=5.0, win=True, outcome_classification=OUTCOME_NORMAL_WIN)]
+    assert analyze_losing_trades(trades) == []
+
+
+def test_j2_strategy_loss_is_tagged_btc_direction_and_reference_unknown():
+    trades = [_trade(
+        realized_pnl_usd=-1.0, win=False, outcome_classification=OUTCOME_STRATEGY_LOSS,
+        reference_direction_at_entry=None, reference_divergence_status=None,
+    )]
+    [analysis] = analyze_losing_trades(trades)
+    assert CAUSE_BTC_DIRECTION in analysis.likely_causes
+    assert CAUSE_REFERENCE_DIVERGENCE_UNKNOWN in analysis.likely_causes
+    assert CAUSE_REFERENCE_DIVERGENCE not in analysis.likely_causes
+
+
+def test_j3_confirmed_divergence_is_tagged_when_recorded():
+    trades = [_trade(
+        realized_pnl_usd=-1.0, win=False, outcome_classification=OUTCOME_STRATEGY_LOSS,
+        reference_direction_at_entry="bearish", reference_divergence_status="DIVERGENCE",
+    )]
+    [analysis] = analyze_losing_trades(trades)
+    assert CAUSE_REFERENCE_DIVERGENCE in analysis.likely_causes
+    assert CAUSE_REFERENCE_DIVERGENCE_UNKNOWN not in analysis.likely_causes
+    assert analysis.reference_direction_at_entry == "bearish"
+
+
+def test_j4_execution_reconciliation_losses_are_never_also_tagged_strategy_causes():
+    trades = [_trade(
+        realized_pnl_usd=-5.0, win=False, outcome_classification=OUTCOME_EXECUTION_LOSS,
+        seconds_remaining_at_entry=10.0, entry_spread=0.5,  # would otherwise trip C/D
+    )]
+    [analysis] = analyze_losing_trades(trades)
+    assert analysis.likely_causes == (CAUSE_EXECUTION_RECONCILIATION,)
+
+
+def test_j5_timing_and_entry_price_and_exit_logic_causes_fire_on_their_own_thresholds():
+    trades = [_trade(
+        realized_pnl_usd=-1.0, win=False, outcome_classification=OUTCOME_STRATEGY_LOSS,
+        seconds_remaining_at_entry=30.0, entry_spread=0.10, exit_reason="DYNAMIC_EXIT",
+    )]
+    [analysis] = analyze_losing_trades(trades)
+    assert CAUSE_TIMING in analysis.likely_causes
+    assert CAUSE_ENTRY_PRICE in analysis.likely_causes
+    assert CAUSE_EXIT_LOGIC in analysis.likely_causes
+
+
+def test_j6_settlement_loss_with_good_timing_and_tight_spread_has_no_timing_price_exit_causes():
+    trades = [_trade(
+        realized_pnl_usd=-1.0, win=False, outcome_classification=OUTCOME_STRATEGY_LOSS,
+        seconds_remaining_at_entry=600.0, entry_spread=0.01, exit_reason="SETTLEMENT",
+    )]
+    [analysis] = analyze_losing_trades(trades)
+    assert CAUSE_TIMING not in analysis.likely_causes
+    assert CAUSE_ENTRY_PRICE not in analysis.likely_causes
+    assert CAUSE_EXIT_LOGIC not in analysis.likely_causes
+
+
+def test_j7_summarize_loss_causes_counts_each_cause_across_trades():
+    trades = [
+        _trade(realized_pnl_usd=-1.0, win=False, outcome_classification=OUTCOME_STRATEGY_LOSS),
+        _trade(realized_pnl_usd=-2.0, win=False, outcome_classification=OUTCOME_STRATEGY_LOSS),
+        _trade(realized_pnl_usd=-3.0, win=False, outcome_classification=OUTCOME_EXECUTION_LOSS),
+    ]
+    analyses = analyze_losing_trades(trades)
+    counts = summarize_loss_causes(analyses)
+    assert counts[CAUSE_BTC_DIRECTION] == 2
+    assert counts[CAUSE_EXECUTION_RECONCILIATION] == 1
