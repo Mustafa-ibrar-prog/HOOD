@@ -404,6 +404,42 @@ def bootstrap_btc_price_history(store: BtcPriceHistoryStore, source: DirectBtcQu
     return store.record_bars(candles)
 
 
+@dataclass(frozen=True)
+class BtcFeedRefreshResult:
+    """The full, inspectable outcome of ONE maybe_refresh() call —
+    every call returns one of these; nothing about a refresh attempt
+    is ever discarded silently (the pre-this-field version returned a
+    bare int, so a persistent provider failure was invisible except as
+    its eventual downstream symptom — a climbing BTC_BAR_AGE_SECONDS —
+    with no record anywhere of WHY: no request time, no provider
+    error, nothing to distinguish "Coinbase timed out" from "Coinbase
+    returned no candles" from "never even attempted this cycle").
+
+    `attempted` is False only for the intentional same-minute skip (see
+    maybe_refresh's own docstring) — no network call was made, nothing
+    else on this result is meaningful. Every OTHER case (success,
+    provider exception, empty response, a failure persisting to the
+    store) has `attempted=True`, so a caller logging only attempted
+    calls (see scripts/run_polymarket_bot.py) never misses a real
+    attempt and never spams a log with routine skips.
+
+    `newest_candle_time`/`candle_age_seconds` are populated from the
+    candles THIS attempt actually received (never from what was
+    already persisted) — age is measured against `now`, the same wall-
+    clock moment this call was evaluated at, so a caller can tell
+    "fresh" from "stale" (per compute_feed_status's own
+    max_bar_age_seconds convention — that threshold is NOT duplicated
+    here; this class only reports the raw numbers, callers compare
+    them against whatever threshold they already have)."""
+
+    attempted: bool
+    now: datetime
+    candles_recorded: int
+    newest_candle_time: datetime | None
+    candle_age_seconds: float | None
+    error: str | None
+
+
 class BtcFeedRefresher:
     """Keeps BTC price history warm across the bot's own poll loop
     WITHOUT hammering the direct provider: only actually calls it once
@@ -424,26 +460,56 @@ class BtcFeedRefresher:
         self._source = source
         self._last_refresh_minute: datetime | None = None
 
-    def maybe_refresh(self, *, now: datetime | None = None) -> int:
-        """No-ops (returns 0, makes no network call) unless a new
-        1-minute boundary has passed since the last call that actually
-        reached the provider — this is the "cache/reuse data within
-        the current candle, refresh when a new minute becomes
+    def maybe_refresh(self, *, now: datetime | None = None) -> BtcFeedRefreshResult:
+        """No-ops (makes no network call, `attempted=False`) unless a
+        new 1-minute boundary has passed since the last call that
+        actually reached the provider — this is the "cache/reuse data
+        within the current candle, refresh when a new minute becomes
         available" requirement, enforced here rather than left to the
-        caller to get right. Never raises: a provider hiccup is logged
-        nowhere special and simply skipped — the NEXT minute's attempt
-        tries again on its own; see compute_feed_status() for how a
-        prolonged outage is actually detected and acted on (this class
-        is purely about call cadence, not safety)."""
+        caller to get right.
+
+        Never raises: a provider hiccup (or a failure persisting the
+        fetched candles) is captured on the returned
+        BtcFeedRefreshResult.error rather than propagated — the NEXT
+        minute's attempt tries again on its own regardless; see
+        compute_feed_status() for how a prolonged outage is actually
+        DETECTED and ACTED ON by the exit-decision path (this class is
+        purely about call cadence and reporting, not that safety gate
+        — nothing here changes the 300s staleness threshold or ever
+        reuses stale data)."""
         now = now or datetime.now(timezone.utc)
         current_minute = now.replace(second=0, microsecond=0)
         if self._last_refresh_minute is not None and current_minute <= self._last_refresh_minute:
-            return 0  # already attempted this minute -- reuse what's persisted, no new call
+            # Already attempted this minute -- reuse what's persisted,
+            # no new call. Not logged as an "attempt" by design (see
+            # this result type's own docstring) -- a caller that wants
+            # to confirm maybe_refresh() is being invoked every loop
+            # iteration should count CALLS to this method, not
+            # attempted=True results, which only happens once a minute.
+            return BtcFeedRefreshResult(
+                attempted=False, now=now, candles_recorded=0, newest_candle_time=None, candle_age_seconds=None, error=None,
+            )
         self._last_refresh_minute = current_minute
         try:
             candles = self._source.get_recent_candles(limit=5)  # a small, cheap catch-up window
-        except Exception:  # noqa: BLE001 - provider hiccup -- never crash, never fabricate; just skip this refresh
-            return 0
+        except Exception as exc:  # noqa: BLE001 - provider hiccup -- never crash, never fabricate; report, then skip
+            return BtcFeedRefreshResult(
+                attempted=True, now=now, candles_recorded=0, newest_candle_time=None, candle_age_seconds=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         if not candles:
-            return 0
-        return self._store.record_bars(candles)
+            return BtcFeedRefreshResult(
+                attempted=True, now=now, candles_recorded=0, newest_candle_time=None, candle_age_seconds=None, error=None,
+            )
+        newest = max(_as_utc(c.start_time) for c in candles)
+        try:
+            recorded = self._store.record_bars(candles)
+        except Exception as exc:  # noqa: BLE001 - a persistence failure must never crash the bot either
+            return BtcFeedRefreshResult(
+                attempted=True, now=now, candles_recorded=0, newest_candle_time=newest,
+                candle_age_seconds=(now - newest).total_seconds(), error=f"failed to persist candles: {exc}",
+            )
+        return BtcFeedRefreshResult(
+            attempted=True, now=now, candles_recorded=recorded, newest_candle_time=newest,
+            candle_age_seconds=(now - newest).total_seconds(), error=None,
+        )

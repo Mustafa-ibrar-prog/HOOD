@@ -168,6 +168,64 @@ def test_max_open_positions_blocks_a_second_entry(tmp_path):
     assert len(harness["position_store"].load()) == 1  # unchanged — still just the pre-seeded one
 
 
+def test_max_open_positions_blocks_new_entry_but_never_short_circuits_dynamic_exit(tmp_path):
+    """Requirement: MAX_OPEN_POSITIONS may block NEW entries only -- it
+    must never short-circuit dynamic-exit evaluation for an EXISTING
+    position. engine.run_cycle() already places
+    check_and_execute_dynamic_exits() before find_active_btc_market()/
+    risk_manager.evaluate_new_trade() (where check_open_positions is
+    actually enforced -- see risk.py); this proves that ordering holds
+    end to end with real BTC evidence, not just by reading the source.
+    A market that would otherwise clearly qualify for a brand-new
+    entry is present too, specifically so this test can also confirm
+    that entry really was blocked, not merely never attempted."""
+    from tests.test_polymarket_dynamic_exit_replay import _REVERSING_CLOSES, _REVERSING_SEED, _feed
+
+    market = _market(yes_bid=0.78, yes_ask=0.80)  # would otherwise qualify for a brand-new entry too
+    settings = PolymarketSettings.from_env(env={
+        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_DYNAMIC_EXIT_ENABLED": "true",
+        "POLYMARKET_MAX_OPEN_POSITIONS": "1",
+    })
+    client = _FakeClient(market)
+    strategy = BtcMomentumStrategy()
+    risk = PolymarketRiskManager(settings)
+    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
+    gateway = PaperPolymarketGateway(settings, logger)
+    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
+    position_store = PolymarketPositionStore(tmp_path / "positions.json")
+    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
+    history = MarketHistory()
+    history.observe(market)
+    history.mids = [0.50, 0.60, 0.70]
+    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed(btc_price_store, _REVERSING_CLOSES, seed=_REVERSING_SEED)  # real, materially-reversing BTC evidence
+    now = end_t + timedelta(seconds=5)
+
+    # An EXISTING open position, already at the max_open_positions cap,
+    # deeply profitable at the live book (0.78 bid vs 0.36 entry) --
+    # under the v2 edge model that huge gain must NOT be what decides
+    # anything; only the real, materially-reversing BTC evidence above
+    # should.
+    position_store.add_if_absent(OpenPosition(
+        condition_id="existing-market", token_id="y", outcome="YES", requested_size_usd=5.0,
+        filled_shares=10.0, avg_fill_price=0.36, order_id="paper:seed", client_order_id="seed-1",
+        status="filled", opened_at=now - timedelta(minutes=5), close_time=now + timedelta(minutes=5),
+    ))
+    state = state_store.load(today=now.date())
+    state.open_position_count = 1
+    state_store.save(state)
+
+    report = run_cycle(
+        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
+        decision_logger=logger, state_store=state_store, position_store=position_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
+    )
+
+    assert report.exits_submitted == 1  # the existing position's exit ran and fired despite being AT the cap
+    assert not report.entered  # the new entry was still correctly blocked by max_open_positions
+    assert position_store.load() == []  # paper mode: the exit fills immediately
+
+
 def test_run_cycle_settles_via_resolution_fallback_when_target_was_never_reached(tmp_path):
     """Requirement: keep the existing 15-minute resolution/settlement
     behavior as the fallback whenever a position's profit target is

@@ -111,13 +111,61 @@ def main() -> int:
             # Isolated from the Polymarket cycle below on purpose (see
             # requirement that a BTC-provider outage never affects
             # normal Polymarket functionality): maybe_refresh() never
-            # raises on its own, but this belt-and-suspenders guard
-            # also protects against a failure in record_bars() itself
-            # (e.g. a disk/IO problem) ever reaching the trading loop.
+            # raises on its own (every failure mode is captured on the
+            # returned BtcFeedRefreshResult instead -- see
+            # btc_market_data.py), but this belt-and-suspenders guard
+            # also protects against something unexpected escaping it.
+            # Called unconditionally, every loop iteration, BEFORE
+            # run_cycle() -- this is what makes maybe_refresh()'s own
+            # once-a-new-minute cadence check actually see every
+            # iteration, not just some of them.
             try:
-                btc_refresher.maybe_refresh()
+                refresh_result = btc_refresher.maybe_refresh()
             except Exception as exc:  # noqa: BLE001 - a BTC feed problem must never stop Polymarket trading
                 print(f"BTC feed refresh failed (ignored, Polymarket trading continues): {exc}")
+            else:
+                # Logged persistently (not just printed) ONLY for an
+                # actual attempt -- the routine same-minute skip is not
+                # logged, so this never spams the decision log on a
+                # fast poll_interval_seconds. Every field the operator
+                # needs to diagnose a stuck feed live: request time,
+                # newest candle timestamp, candle age, a fresh/stale
+                # label (computed here for display only, from
+                # settings.btc_max_bar_age_seconds -- the SAME
+                # threshold compute_feed_status/assess_btc_market
+                # already enforce; never a second, independent gate),
+                # and the raw provider error when there was one.
+                if refresh_result.attempted:
+                    is_fresh = (
+                        refresh_result.candle_age_seconds is not None
+                        and refresh_result.candle_age_seconds <= settings.btc_max_bar_age_seconds
+                    )
+                    feed_label = "FRESH" if is_fresh else ("STALE" if refresh_result.candle_age_seconds is not None else "UNAVAILABLE")
+                    reason = (
+                        f"BTC feed refresh at {refresh_result.now.isoformat()}: "
+                        + (f"ERROR: {refresh_result.error}" if refresh_result.error else
+                           f"recorded={refresh_result.candles_recorded} candle(s), newest="
+                           f"{refresh_result.newest_candle_time.isoformat() if refresh_result.newest_candle_time else None}, "
+                           f"age={refresh_result.candle_age_seconds}s, {feed_label}")
+                    )
+                    # log_decision() already prints this to the console
+                    # itself (decision_logger defaults to
+                    # also_console=True) -- no separate print needed here.
+                    decision_logger.log_decision(
+                        kind="btc_feed_refresh",
+                        reason=reason,
+                        evidence={
+                            "request_time": refresh_result.now.isoformat(),
+                            "newest_candle_time": (
+                                refresh_result.newest_candle_time.isoformat() if refresh_result.newest_candle_time else None
+                            ),
+                            "candle_age_seconds": refresh_result.candle_age_seconds,
+                            "feed_label": feed_label,
+                            "candles_recorded": refresh_result.candles_recorded,
+                            "provider_error": refresh_result.error,
+                            "provider": btc_source.name,
+                        },
+                    )
 
             report = run_cycle(
                 settings=settings, client=client, strategy=strategy, risk_manager=risk_manager,

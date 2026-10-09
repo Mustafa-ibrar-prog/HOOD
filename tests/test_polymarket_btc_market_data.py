@@ -12,6 +12,7 @@ import pytest
 from src.market.models import PriceBar
 from src.polymarket.btc_market_data import (
     BtcFeedRefresher,
+    BtcFeedRefreshResult,
     BtcPriceHistoryStore,
     BtcPriceHistoryStoreError,
     bootstrap_btc_price_history,
@@ -329,11 +330,14 @@ def test_refresher_does_not_call_the_provider_twice_within_the_same_minute(tmp_p
     refresher = BtcFeedRefresher(store, source)
 
     now = _BASE + timedelta(seconds=10)
+    results = []
     for _ in range(5):  # simulate 5 Polymarket poll cycles within the same minute
-        refresher.maybe_refresh(now=now)
+        results.append(refresher.maybe_refresh(now=now))
         now += timedelta(seconds=2)
 
     assert source.call_count == 1  # cached/reused -- never spammed
+    assert results[0].attempted is True
+    assert all(r.attempted is False for r in results[1:])  # same-minute calls are explicit no-attempt skips
 
 
 def test_refresher_calls_again_once_a_new_minute_arrives(tmp_path):
@@ -341,11 +345,34 @@ def test_refresher_calls_again_once_a_new_minute_arrives(tmp_path):
     source = _FakeDirectSource(_real_candles(5))
     refresher = BtcFeedRefresher(store, source)
 
-    refresher.maybe_refresh(now=_BASE)
-    refresher.maybe_refresh(now=_BASE + timedelta(seconds=30))  # still the same minute
-    refresher.maybe_refresh(now=_BASE + timedelta(minutes=1, seconds=5))  # a new minute
+    first = refresher.maybe_refresh(now=_BASE)
+    second = refresher.maybe_refresh(now=_BASE + timedelta(seconds=30))  # still the same minute
+    third = refresher.maybe_refresh(now=_BASE + timedelta(minutes=1, seconds=5))  # a new minute
 
     assert source.call_count == 2
+    assert first.attempted is True
+    assert second.attempted is False
+    assert third.attempted is True
+
+
+def test_refresher_attempted_result_reports_the_real_newest_candle_time_and_age(tmp_path):
+    """Requirement: every refresh attempt/result must report the
+    newest candle's timestamp and its age relative to the request
+    time -- not just "something was recorded"."""
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    candles = _real_candles(5)  # newest candle's start_time == _BASE + 4*60s
+    source = _FakeDirectSource(candles)
+    refresher = BtcFeedRefresher(store, source)
+
+    now = _BASE + timedelta(minutes=4, seconds=45)  # 45s after the newest candle opened
+    result = refresher.maybe_refresh(now=now)
+
+    assert result.attempted is True
+    assert result.candles_recorded == 5
+    assert result.newest_candle_time == candles[-1].start_time
+    assert result.candle_age_seconds == pytest.approx(45.0)
+    assert result.error is None
+    assert result.now == now
 
 
 def test_refresher_provider_failure_never_raises_and_keeps_existing_data(tmp_path):
@@ -358,9 +385,53 @@ def test_refresher_provider_failure_never_raises_and_keeps_existing_data(tmp_pat
     source.raise_exc = RuntimeError("provider hiccup")
     result = refresher.maybe_refresh(now=_BASE + timedelta(minutes=1, seconds=5))
 
-    assert result == 0  # swallowed, never raised
+    assert result.attempted is True  # a real attempt was made -- never silently indistinguishable from a skip
+    assert result.candles_recorded == 0  # swallowed, never raised
+    assert result.newest_candle_time is None
+    assert result.candle_age_seconds is None
+    assert result.error == "RuntimeError: provider hiccup"  # the exact provider error, never discarded
     after = store.get_bars(interval_seconds=60, now=_BASE + timedelta(seconds=5 * 60 + 5))
     assert after == before  # existing persisted data untouched by the failed attempt
+
+
+def test_refresher_empty_candle_response_is_attempted_with_no_error(tmp_path):
+    """A provider call that succeeds but returns nothing (a genuinely
+    different case from a transport/parse failure) must still be
+    reported as `attempted=True` with `error=None` -- never confused
+    with either a same-minute skip or a provider exception."""
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    source = _FakeDirectSource([])
+    refresher = BtcFeedRefresher(store, source)
+
+    result = refresher.maybe_refresh(now=_BASE)
+
+    assert result.attempted is True
+    assert result.candles_recorded == 0
+    assert result.error is None
+    assert result.newest_candle_time is None
+
+
+def test_refresher_persistence_failure_is_reported_not_raised(tmp_path, monkeypatch):
+    """A failure PERSISTING successfully-fetched candles (e.g. a disk/
+    IO problem) is a genuinely different failure mode from a provider
+    transport error -- must still never raise, and must still be
+    reported with its own error message (not silently indistinguishable
+    from "provider returned nothing")."""
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    candles = _real_candles(5)
+    source = _FakeDirectSource(candles)
+    refresher = BtcFeedRefresher(store, source)
+
+    def _boom(bars):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "record_bars", _boom)
+    result = refresher.maybe_refresh(now=_BASE)
+
+    assert result.attempted is True
+    assert result.candles_recorded == 0
+    assert result.newest_candle_time == candles[-1].start_time  # known even though persistence failed
+    assert "disk full" in result.error
 
 
 def test_refresher_accepts_a_different_provider_implementation(tmp_path):
@@ -379,7 +450,8 @@ def test_refresher_accepts_a_different_provider_implementation(tmp_path):
     store = BtcPriceHistoryStore(tmp_path / "btc.json")
     source = _AnotherFakeSource(_real_candles(5))
     refresher = BtcFeedRefresher(store, source)
-    written = refresher.maybe_refresh(now=_BASE)
+    result = refresher.maybe_refresh(now=_BASE)
 
-    assert written == 5
+    assert isinstance(result, BtcFeedRefreshResult)
+    assert result.candles_recorded == 5
     assert len(store.get_bars(interval_seconds=60, now=_BASE + timedelta(seconds=5 * 60 + 5))) == 5
