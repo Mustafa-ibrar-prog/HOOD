@@ -22,6 +22,7 @@ never to a fixed historical date.
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -678,7 +679,29 @@ def test_live_mode_with_no_market_slug_uses_automatic_btc_discovery(tmp_path, ca
 def test_non_us_venue_is_refused(monkeypatch, tmp_path, capsys):
     """main() itself (not run_manual_test) must refuse to proceed when
     POLYMARKET_VENUE isn't "us" -- this script only ever makes sense
-    against the US venue's manual-override mechanism."""
+    against the US venue's manual-override mechanism.
+
+    Isolated from whatever POLYMARKET_* variables a REAL .env has
+    already loaded into this process's actual os.environ: main() calls
+    PolymarketSettings.from_env() with no explicit env mapping, and
+    that function's own dotenv loader (_load_dotenv_into_environ)
+    mutates os.environ directly rather than going through monkeypatch
+    -- so if an earlier test in this same session ran with a genuine
+    .env present (e.g. a real deployment checkout with
+    POLYMARKET_TRADING_MODE=live/POLYMARKET_VENUE=us/live US
+    credentials), those values persist in the real process environment
+    for the rest of the test session, and monkeypatch.chdir() to an
+    empty tmp_path does NOT undo that (it only stops a FRESH dotenv
+    load from happening here, not already-loaded values). Explicitly
+    clearing every POLYMARKET_* var first makes this test's only
+    inputs the ones it sets itself, regardless of what ran before it
+    or what real .env happens to exist on disk -- this test is about
+    the VENUE refusal gate specifically, never about live-mode
+    credential validation, which has its own dedicated tests in
+    test_polymarket_settings.py."""
+    for key in list(os.environ):
+        if key.startswith("POLYMARKET_"):
+            monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(sys, "argv", [
         "manual_polymarket_us_test.py", "--market-slug", "whatever", "--outcome", "YES",
         "--amount", "5", "--max-price", "0.6",
