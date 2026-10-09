@@ -92,6 +92,29 @@ a blog post, not memory:
     (reconciliation.py), that response is used ONLY for
     SubmissionOutcome — get_fill_status() always re-queries
     orders.retrieve() fresh, never trusting the submission response.
+    CreateOrderParams ALSO has `synchronousExecution: bool` and
+    `maxBlockTime: str` fields (confirmed in the installed SDK's own
+    types.orders.CreateOrderParams) that _build_create_order_params()
+    below does NOT set — meaning order creation is asynchronous by
+    default: orders.create() returns once the order is ACCEPTED for
+    processing, not once it reaches a terminal state. A live incident
+    (order D0EEB7H1AZ7J: submitted, immediately read back via
+    get_fill_status() as "unknown," only later resolved FILLED by a
+    subsequent sweep) is consistent with this: an immediate
+    orders.retrieve() call races the exchange's own async matching/
+    kill decision for a FOK order and can land mid-flight. This is a
+    RECOMMENDATION, not yet applied: setting synchronousExecution=True
+    on the BUY path is a plausible fix for the immediate-UNKNOWN
+    window specifically, but it changes real order-submission behavior
+    and has not been verified live (this sandbox cannot reach
+    polymarket.us) — confirm with orders.preview()/a careful live test
+    before enabling it, exactly per this module's own "unverified"
+    conventions below.
+  - Cancellation: `orders.cancel(order_id, CancelOrderParams)` IS a
+    real, documented endpoint (confirmed in the installed SDK's
+    resources.orders.Orders.cancel — POST /v1/order/{id}/cancel,
+    requiring just `marketSlug`) — see cancel_order() below. NOT part
+    of the automated engine.py/gateway.py path as of this writing.
   - Order status: `Order.state` is a real, closed FIX-protocol-style
     enum (ORDER_STATE_NEW/PENDING_NEW/PARTIALLY_FILLED/FILLED/CANCELED/
     REJECTED/EXPIRED/...) with avgPx/cumQuantity/leavesQuantity fields
@@ -908,6 +931,46 @@ class PolymarketUSClient:
         client = self._client()
         response = self._retry(lambda: client.orders.preview({"request": params}), endpoint="orders.preview")
         return response.get("order") or {}
+
+    def cancel_order(self, exchange_order_id: str, market_slug: str) -> bool:
+        """Cancels a resting order via orders.cancel() — CONFIRMED a
+        real, documented endpoint in the installed polymarket-us SDK
+        (POST /v1/order/{order_id}/cancel, CancelOrderParams requiring
+        just marketSlug), verified directly from
+        polymarket_us.resources.orders.Orders.cancel's own source
+        rather than assumed. NOT part of the automated engine.py/
+        gateway.py path as of this writing — added as a tested,
+        available capability (same "built, not yet wired in" status
+        preview_order() already has above) for a live incident's own
+        market-close question: whether a still-unresolved entry order
+        can be proactively canceled once its market's close_time
+        arrives, rather than left to resolve on its own time (see
+        reconciliation.py's STALE-ENTRY SAFETY NET for how a late fill
+        is handled if this is never called).
+
+        Best-effort and NEVER raises: cancelling an order that has
+        already reached a terminal state (filled/canceled/rejected/
+        expired) is an expected, harmless outcome on most venues, not
+        a bug in the caller — and this system must never treat "the
+        cancel attempt itself failed" as a reason to skip the
+        authoritative fill lookup that always follows it (a genuine
+        fill must still be reconciled regardless of whether a cancel
+        was also attempted). Returns True only on a confirmed
+        successful cancel; False for every other outcome (already
+        terminal, not found, transport failure, ...) — callers that
+        care about the real end state must still call get_fill_status()
+        afterward, exactly as they already do today."""
+        client = self._client()
+        try:
+            client.orders.cancel(exchange_order_id, {"marketSlug": market_slug})
+        except Exception as exc:  # noqa: BLE001 - any failure here (already terminal, not found, transport) is a safe, expected no-op
+            _logger.info(
+                "polymarket_us orders.cancel: order %s on %s could not be canceled (%s: %s) -- "
+                "treating as a no-op; the next fill-status lookup remains authoritative",
+                exchange_order_id, market_slug, type(exc).__name__, exc,
+            )
+            return False
+        return True
 
     # --- Reconciliation (the authoritative fill lookup — see Task 3/5) -------
     def get_fill_status(self, exchange_order_id: str) -> FillResult:

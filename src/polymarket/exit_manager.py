@@ -137,6 +137,25 @@ out, the position is evaluated completely normally — a genuinely bad
 newly-opened position is still caught exactly one poll interval later,
 never permanently shielded.
 
+That one-cycle grace fixed the SAME-cycle case, but a live incident
+showed a second, independent gap it does not touch: a pending entry
+order can sit unresolved for far longer than one cycle — long enough
+that its OWN market closes before the exchange ever gives an
+authoritative fill answer. reconciliation.py's STALE-ENTRY SAFETY NET
+(see its own module docstring) still adopts a genuine late fill like
+this (a real fill is never pretended away) but flags it distinctly as
+stale. The MARKET-CLOSED SKIP below is this module's own half of that
+same fix: a position whose close_time has already passed — stale-
+adopted or not, the check is general — is skipped entirely here,
+deferring 100% to settle_resolved_positions() (already run earlier in
+run_cycle(), before this function). Attempting a fresh SELL into a
+market that is no longer open for trading is never correct, regardless
+of current BTC evidence; this is a position-eligibility PRE-CHECK, the
+same category as the exit_pending_order_id/no-live-bid checks already
+in evaluate_dynamic_exit() — it never alters the evidence cascade
+itself, and an exit ALREADY in flight when the market closes is still
+reconciled (never abandoned) before this skip is even reached.
+
 MASTER SWITCH: settings.dynamic_exit_enabled (POLYMARKET_DYNAMIC_EXIT_ENABLED,
 default False) — while False, check_and_execute_dynamic_exits() is a
 complete no-op: it never even evaluates a position, in PAPER or LIVE
@@ -900,9 +919,34 @@ def check_and_execute_dynamic_exits(
             continue
 
         if current.exit_pending_order_id is not None:
+            # Reconciling an exit ALREADY in flight always runs,
+            # regardless of market close below -- we must still learn
+            # its fate; this is never a NEW exit proposal.
             reconcile_exit_fill(
                 current, client=client, pending_store=pending_store, position_store=position_store,
                 state_store=state_store, decision_logger=decision_logger, now=now,
+            )
+            continue
+
+        # MARKET-CLOSED SKIP (see module docstring's STALE-ENTRY /
+        # MARKET-CLOSE section): a position whose own market has
+        # already closed must never have a NEW exit order evaluated or
+        # submitted here -- settle_resolved_positions() (already run
+        # earlier this same cycle) is the correct, exchange-aware path
+        # for a closed market; attempting to sell into one that's no
+        # longer open for trading is never correct, regardless of what
+        # current BTC evidence says. This is checked AFTER the
+        # in-flight-exit reconcile above, never before it.
+        close_time = current.close_time if current.close_time.tzinfo else current.close_time.replace(tzinfo=timezone.utc)
+        if now >= close_time:
+            decision_logger.log_decision(
+                kind="exit_check_skipped_market_closed",
+                reason=(
+                    f"{current.outcome} on {current.condition_id}: this position's market already "
+                    f"closed ({close_time.isoformat()}) -- deferring entirely to settlement, never "
+                    "proposing a new exit on a closed market"
+                ),
+                evidence={"position": current.to_dict()},
             )
             continue
 

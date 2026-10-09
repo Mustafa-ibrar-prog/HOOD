@@ -105,7 +105,8 @@ class _FakeMarkets:
 
 class _FakeOrders:
     def __init__(self, *, create_response=None, create_exc=None, retrieve_responses=None,
-                 preview_response=None, preview_exc=None, list_response=None, list_exc=None):
+                 preview_response=None, preview_exc=None, list_response=None, list_exc=None,
+                 cancel_exc=None):
         self.create_response = create_response
         self.create_exc = create_exc
         self.retrieve_responses = retrieve_responses or {}
@@ -113,10 +114,18 @@ class _FakeOrders:
         self.preview_exc = preview_exc
         self.list_response = list_response if list_response is not None else {"orders": []}
         self.list_exc = list_exc
+        self.cancel_exc = cancel_exc
         self.create_calls: list = []
         self.preview_calls: list = []
         self.list_calls: list = []
         self.retrieve_calls: list = []
+        self.cancel_calls: list = []
+
+    def cancel(self, order_id, params):
+        self.cancel_calls.append((order_id, params))
+        if self.cancel_exc:
+            raise self.cancel_exc
+        return None
 
     def create(self, params):
         """`create_response` may be a single response (same result every
@@ -1113,6 +1122,40 @@ def test_preview_order_propagates_a_failure(tmp_path):
     order = _order_request()
     with pytest.raises(_AuthenticationError):
         client.preview_order(order)
+
+
+# --- 5c. Cancellation (orders.cancel() -- confirmed real, not wired into the
+# automated engine.py/gateway.py path; see this incident's own report) ------
+
+def test_cancel_order_returns_true_and_calls_the_real_cancel_endpoint():
+    sdk = _FakeSDKClient(orders=_FakeOrders())
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+
+    result = client.cancel_order("ex-1", "btc-updown-15m")
+
+    assert result is True
+    assert sdk.orders.cancel_calls == [("ex-1", {"marketSlug": "btc-updown-15m"})]
+
+
+def test_cancel_order_on_an_already_terminal_order_is_a_safe_no_op():
+    """Canceling an order that already filled/expired/etc. is an
+    expected, harmless outcome -- never raises, never treated as a
+    bug in the caller."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(cancel_exc=_NotFoundError("order already filled")))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+
+    result = client.cancel_order("ex-1", "btc-updown-15m")
+
+    assert result is False  # a safe, logged no-op -- never raises
+
+
+def test_cancel_order_never_raises_on_a_transport_failure():
+    sdk = _FakeSDKClient(orders=_FakeOrders(cancel_exc=_APITimeoutError("timed out")))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+
+    result = client.cancel_order("ex-1", "btc-updown-15m")
+
+    assert result is False
 
 
 # --- 6. Submission response vs. authoritative fill (Task 3) ------------------

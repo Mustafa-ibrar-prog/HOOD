@@ -320,6 +320,104 @@ def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_dynamic_exi
     assert position_store.load() == []  # paper mode: the exit fills immediately
 
 
+def test_stale_pending_entry_past_its_own_market_close_is_adopted_but_never_re_exited_same_cycle(tmp_path):
+    """Full incident replay (reported live): an OLD pending BUY order
+    whose OWN market has ALREADY closed finally resolves FILLED via
+    reconcile_pending_orders()'s sweep -- long after the one-cycle
+    delayed-entry grace alone would have helped (that grace only ever
+    covers ONE cycle; this order sat unresolved far longer, and its
+    market closed in the meantime). The real fill is still reconciled
+    (never pretended away) and the resulting position is flagged
+    `stale_entry_fill_adopted` -- but because its market has already
+    closed, check_and_execute_dynamic_exits() must defer entirely to
+    settlement THIS SAME cycle, never proposing a fresh exit on it."""
+    from tests.test_polymarket_dynamic_exit_replay import _REVERSING_CLOSES, _REVERSING_SEED, _feed
+
+    market = _market(yes_bid=0.50, yes_ask=0.52)  # flat -- no new entry this cycle, keeps the test focused
+    settings = PolymarketSettings.from_env(env={
+        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_DYNAMIC_EXIT_ENABLED": "true",
+    })
+    client = _FakeClient(market)
+    strategy = BtcMomentumStrategy()
+    risk = PolymarketRiskManager(settings)
+    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
+    gateway = PaperPolymarketGateway(settings, logger)
+    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
+    position_store = PolymarketPositionStore(tmp_path / "positions.json")
+    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
+    history = MarketHistory()
+    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    # Materially-reversing BTC evidence -- exactly the kind of evidence
+    # that WOULD otherwise trigger an immediate exit if this position
+    # were evaluated normally. It must never get the chance to.
+    end_t = _feed(btc_price_store, _REVERSING_CLOSES, seed=_REVERSING_SEED)
+    now = end_t + timedelta(seconds=5)
+
+    from src.polymarket.models import OrderRequest, PendingLiveOrder
+    old_market_close = now - timedelta(minutes=5)  # this stale order's OWN market already closed
+    stale_order = OrderRequest(
+        condition_id="btc-updown-15m-stale-2245z", token_id="y", outcome="YES", side="BUY", size_usd=5.0,
+        max_price=0.56, close_time=old_market_close, reason="an old cycle's entry, sat unresolved for a long time",
+    )
+    stale_pending = PendingLiveOrder.new(order=stale_order, expiry_seconds=60, now=now - timedelta(minutes=20))
+    stale_pending = stale_pending.with_status("submitted", exchange_order_id="ex-old-stale")
+    pending_store.add(stale_pending)
+    client.set_fill_result("ex-old-stale", FillResult(
+        order_id="ex-old-stale", status="filled", requested_shares=8.0, filled_shares=8.0, avg_fill_price=0.28,
+    ))
+
+    report = run_cycle(
+        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
+        decision_logger=logger, state_store=state_store, position_store=position_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
+    )
+
+    # The real fill is reconciled correctly -- never pretended away.
+    assert report.reconciled_count == 1
+    positions = position_store.load()
+    assert len(positions) == 1
+    assert positions[0].condition_id == "btc-updown-15m-stale-2245z"
+    assert positions[0].filled_shares == pytest.approx(8.0)
+    assert positions[0].avg_fill_price == pytest.approx(0.28)
+
+    stale_logs = [e for e in logger.read_all() if e.get("kind") == "stale_entry_fill_adopted"]
+    assert len(stale_logs) == 1
+
+    # This SAME cycle's dynamic-exit pass must NOT propose a new exit
+    # on it -- it happens to be caught by the EXISTING one-cycle
+    # delayed-entry grace here too (it was, after all, also "newly
+    # adopted this very call"), which is fine on its own but only ever
+    # lasts one cycle (see that mechanism's own docstring/test) --
+    # settle_resolved_positions() already ran this cycle too but left
+    # it alone (the fake resolution API hasn't reflected the close yet
+    # -- the realistic "resolved by clock, not yet by the API" case).
+    assert report.exits_submitted == 0
+    assert report.settled_count == 0
+    deferred = [e for e in logger.read_all() if e.get("kind") == "exit_check_deferred"]
+    assert len(deferred) == 1
+
+    # THE ACTUAL FIX, proven on a SECOND cycle: the one-cycle grace has
+    # now expired (nothing new was adopted this call), yet the position
+    # must STILL never be evaluated for a fresh exit, because its
+    # market-closed skip applies for as long as the position exists --
+    # not just one cycle. This is exactly the gap the user's own report
+    # flagged: "the bot correctly deferred exit evaluation for one
+    # cycle, but that does NOT solve the underlying stale pending-entry
+    # problem."
+    second_report = run_cycle(
+        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
+        decision_logger=logger, state_store=state_store, position_store=position_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        now=now + timedelta(seconds=10),
+    )
+    assert second_report.exits_submitted == 0
+    assert second_report.settled_count == 0
+    skipped = [e for e in logger.read_all() if e.get("kind") == "exit_check_skipped_market_closed"]
+    assert len(skipped) == 1
+    assert position_store.load() == positions  # still there, completely untouched, both cycles
+    assert position_store.load() == positions  # still there, completely untouched
+
+
 def test_run_cycle_settles_via_resolution_fallback_when_target_was_never_reached(tmp_path):
     """Requirement: keep the existing 15-minute resolution/settlement
     behavior as the fallback whenever a position's profit target is

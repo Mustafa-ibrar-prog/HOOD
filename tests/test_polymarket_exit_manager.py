@@ -432,6 +432,66 @@ def test_master_switch_on_with_no_btc_data_holds(tmp_path):
     assert positions[0].filled_shares == 5.0
 
 
+# --- Full pipeline: market-closed skip (see module docstring) ---------------
+# A live incident: a stale, long-unresolved entry order filled near its
+# own market's close, reopening a position right after an evidence-driven
+# exit had just closed it. Once a position's own market has already
+# closed, a NEW exit must never be evaluated/attempted here at all --
+# settle_resolved_positions() (run earlier in run_cycle(), before this
+# function) is the correct, exchange-aware path for a closed market.
+
+def test_a_position_past_its_market_close_is_never_evaluated_for_a_new_exit(tmp_path):
+    harness = _harness(tmp_path)
+    now = datetime.now(timezone.utc)
+    position = _position(close_time=now - timedelta(minutes=1))  # this position's market already closed
+    harness["position_store"].add_if_absent(position)
+    # Even a loud, clearly exit-worthy order book/signal must never be
+    # consulted -- the market-closed skip happens before either is read.
+    harness["client"].set_order_book("tok-1", _book(bids=(BookLevel(price=0.50, size=100.0),)))
+
+    submitted = check_and_execute_dynamic_exits(**harness, now=now)
+
+    assert submitted == 0
+    assert harness["client"].get_order_book_calls == []  # never even consulted
+    positions = harness["position_store"].load()
+    assert len(positions) == 1  # untouched -- left for settlement, not exited here
+    entries = [e for e in harness["decision_logger"].read_all() if e.get("kind") == "exit_check_skipped_market_closed"]
+    assert len(entries) == 1
+
+
+def test_an_in_flight_exit_past_market_close_is_still_reconciled_not_abandoned(tmp_path):
+    """The market-closed skip must never swallow an exit ALREADY in
+    flight when the market closes -- its fate must still be learned."""
+    harness = _harness(tmp_path)
+    now = datetime.now(timezone.utc)
+    position = _position(close_time=now - timedelta(minutes=1), exit_pending_order_id="paper:already-in-flight")
+    harness["position_store"].add_if_absent(position)
+
+    submitted = check_and_execute_dynamic_exits(**harness, now=now)
+
+    assert submitted == 0
+    # Reconciled (a no-op here since there's no matching pending record
+    # in this paper-mode harness), never skipped as "market closed" --
+    # proven by the absence of the market-closed skip log entry.
+    skipped = [e for e in harness["decision_logger"].read_all() if e.get("kind") == "exit_check_skipped_market_closed"]
+    assert skipped == []
+
+
+def test_a_position_before_its_market_close_is_evaluated_normally(tmp_path):
+    """Sanity check: the skip is specific to close_time <= now, never a
+    blanket change to ordinary, still-open positions."""
+    harness = _harness(tmp_path)
+    position = _position(avg_fill_price=0.36)  # default close_time is well in the future
+    harness["position_store"].add_if_absent(position)
+    harness["client"].set_order_book("tok-1", _book(bids=(BookLevel(price=0.50, size=100.0),)))
+
+    submitted = check_and_execute_dynamic_exits(**harness)
+
+    assert harness["client"].get_order_book_calls == ["tok-1"]  # normally evaluated
+    skipped = [e for e in harness["decision_logger"].read_all() if e.get("kind") == "exit_check_skipped_market_closed"]
+    assert skipped == []
+
+
 # --- Full pipeline: idempotency / duplicate-cycle guard -----------------------
 
 def test_a_position_with_a_pending_exit_is_never_offered_a_second_one(tmp_path):

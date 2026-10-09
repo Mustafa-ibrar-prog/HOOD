@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from src.polymarket import reconciliation
 from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import FillResult, OrderRequest, PendingLiveOrder
@@ -331,3 +333,176 @@ def test_reconcile_pending_orders_is_safe_to_call_with_an_empty_ledger(tmp_path)
         state_store=state_store, decision_logger=decision_logger,
     )
     assert count == 0
+
+
+# --- SELL orders are never reconciled by this (BUY-only) sweep --------------
+# A live incident's own investigation found that reconcile_pending_orders()
+# had no filter on order.side at all -- a live SELL (exit) order that
+# reached the exchange and sat unresolved for even one cycle would ALSO
+# be swept here and run through record_fill() (the BUY-shaped
+# position-creation path), fabricating a bogus "new entry" position out
+# of what was actually an exit fill. exit_manager.py's own
+# reconcile_exit_fill() is the correct, exclusive owner of SELL
+# reconciliation (gated by OpenPosition.exit_pending_order_id, never
+# PendingLiveOrder.fill_reconciled).
+
+def test_reconcile_pending_orders_never_touches_a_sell_order(tmp_path):
+    client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
+    sell_order = _order(condition_id="c-sell", side="SELL", quantity=5)
+    _submitted_pending(pending_store, exchange_order_id="ex-sell", order=sell_order)
+    # Even if the exchange reports this AS a genuine fill, the generic
+    # sweep must never act on it -- a real fill here must come from
+    # exit_manager.reconcile_exit_fill() instead.
+    client.set_fill_result("ex-sell", FillResult(
+        order_id="ex-sell", status="filled", requested_shares=5.0, filled_shares=5.0, avg_fill_price=0.40,
+    ))
+
+    count = reconciliation.reconcile_pending_orders(
+        client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger,
+    )
+
+    assert count == 0  # the SELL order was never even attempted
+    assert client.get_fill_status_calls == []  # never looked up by this sweep
+    assert position_store.load() == []  # no bogus "entry" position fabricated
+    sell_pending = [p for p in pending_store.load() if p.order.side == "SELL"][0]
+    assert sell_pending.fill_reconciled is False  # untouched -- still exit_manager.py's to reconcile
+
+
+def test_reconcile_pending_orders_still_reconciles_a_buy_sitting_alongside_a_sell(tmp_path):
+    client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
+    _submitted_pending(pending_store, exchange_order_id="ex-buy", order=_order(condition_id="c-buy", side="BUY"))
+    _submitted_pending(pending_store, exchange_order_id="ex-sell", order=_order(condition_id="c-sell", side="SELL", quantity=5))
+    client.set_fill_result("ex-buy", FillResult(
+        order_id="ex-buy", status="filled", requested_shares=10.0, filled_shares=10.0, avg_fill_price=0.5,
+    ))
+    client.set_fill_result("ex-sell", FillResult(
+        order_id="ex-sell", status="filled", requested_shares=5.0, filled_shares=5.0, avg_fill_price=0.40,
+    ))
+
+    count = reconciliation.reconcile_pending_orders(
+        client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger,
+    )
+
+    assert count == 1  # only the BUY was attempted
+    assert client.get_fill_status_calls == ["ex-buy"]
+    positions = position_store.load()
+    assert len(positions) == 1
+    assert positions[0].condition_id == "c-buy"
+
+
+# --- Stale-entry safety net (see reconciliation.py's own module docstring) --
+# A live incident: order D0EEB7H1AZ7J submitted, immediately read back
+# "unknown," only adopted FILLED by a later sweep (handled correctly --
+# the one-cycle delayed-entry grace already covers this). Separately, an
+# even OLDER unresolved entry for the same market resolved FILLED near
+# that market's close, reopening a position right after its own
+# evidence-driven exit had just closed it. A genuine fill is NEVER
+# suppressed (requirement), but it must be visibly flagged when it
+# resolves well outside its own decision window.
+
+def test_a_fill_resolved_promptly_is_never_flagged_stale(tmp_path):
+    """The common, healthy case: resolves well within both the pending
+    record's own expiry AND before its market closes -- no
+    stale_entry_fill_adopted log entry at all."""
+    client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
+    now = datetime.now(timezone.utc)
+    order = _order(close_time=now + timedelta(minutes=10))
+    pending = PendingLiveOrder.new(order=order, expiry_seconds=60, now=now)
+    pending = pending.with_status("submitted", exchange_order_id="ex-fresh")
+    pending_store.add(pending)
+    client.set_fill_result("ex-fresh", FillResult(
+        order_id="ex-fresh", status="filled", requested_shares=10.0, filled_shares=10.0, avg_fill_price=0.5,
+    ))
+
+    reconciliation.reconcile_order(
+        pending, client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger, now=now + timedelta(seconds=5),
+    )
+
+    assert len(position_store.load()) == 1  # still adopted, as always
+    stale_entries = [e for e in decision_logger.read_all() if e.get("kind") == "stale_entry_fill_adopted"]
+    assert stale_entries == []
+
+
+def test_a_fill_resolved_after_the_markets_close_time_is_adopted_but_flagged_stale(tmp_path):
+    """The exact D0EEB7H1AZ7J-adjacent scenario: the order's OWN market
+    has already closed by the time an authoritative fill finally
+    arrives. The position IS still created (a real fill is never
+    pretended away) but the adoption is flagged distinctly."""
+    client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
+    now = datetime.now(timezone.utc)
+    order = _order(close_time=now - timedelta(minutes=2))  # this order's market already closed
+    pending = PendingLiveOrder.new(order=order, expiry_seconds=60, now=now - timedelta(minutes=20))
+    pending = pending.with_status("submitted", exchange_order_id="ex-stale-close")
+    pending_store.add(pending)
+    client.set_fill_result("ex-stale-close", FillResult(
+        order_id="ex-stale-close", status="filled", requested_shares=8.0, filled_shares=8.0, avg_fill_price=0.49,
+    ))
+
+    fill = reconciliation.reconcile_order(
+        pending, client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger, now=now,
+    )
+
+    assert fill.is_fill  # the real fill is reconciled correctly, never ignored
+    positions = position_store.load()
+    assert len(positions) == 1
+    assert positions[0].filled_shares == pytest.approx(8.0)
+    assert positions[0].avg_fill_price == pytest.approx(0.49)
+
+    stale_entries = [e for e in decision_logger.read_all() if e.get("kind") == "stale_entry_fill_adopted"]
+    assert len(stale_entries) == 1
+    assert stale_entries[0]["evidence"]["market_closed"] is True
+
+
+def test_a_fill_resolved_past_its_own_expiry_but_before_close_is_also_flagged_stale(tmp_path):
+    """The "old pending entry" scenario: close_time hasn't technically
+    arrived yet, but the order sat unresolved far longer than this
+    system's own expiry window -- also flagged, independent of
+    close_time."""
+    client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
+    now = datetime.now(timezone.utc)
+    order = _order(close_time=now + timedelta(minutes=3))  # still technically open
+    pending = PendingLiveOrder.new(order=order, expiry_seconds=60, now=now - timedelta(minutes=10))  # created long ago
+    pending = pending.with_status("submitted", exchange_order_id="ex-stale-expiry")
+    pending_store.add(pending)
+    client.set_fill_result("ex-stale-expiry", FillResult(
+        order_id="ex-stale-expiry", status="filled", requested_shares=8.0, filled_shares=8.0, avg_fill_price=0.28,
+    ))
+
+    fill = reconciliation.reconcile_order(
+        pending, client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger, now=now,
+    )
+
+    assert fill.is_fill
+    assert len(position_store.load()) == 1  # still adopted -- never pretended away
+
+    stale_entries = [e for e in decision_logger.read_all() if e.get("kind") == "stale_entry_fill_adopted"]
+    assert len(stale_entries) == 1
+    assert stale_entries[0]["evidence"]["market_closed"] is False
+    assert stale_entries[0]["evidence"]["past_expiry"] is True
+
+
+def test_order_status_unknown_log_preserves_the_raw_diagnostic_detail(tmp_path):
+    """A live incident could not determine WHY an order read "unknown"
+    from the stored decision log, because the old version of this log
+    entry discarded fill.raw (the lookup_error or raw exchange state)
+    before writing it. Now preserved verbatim."""
+    client, pending_store, position_store, state_store, decision_logger = _harness(tmp_path)
+    pending = _submitted_pending(pending_store, exchange_order_id="ex-diag")
+    client.set_fill_result("ex-diag", FillResult(
+        order_id="ex-diag", status="unknown", requested_shares=8.0, filled_shares=0.0, avg_fill_price=None,
+        raw={"lookup_error": "NotFoundError: order ex-diag not found"},
+    ))
+
+    reconciliation.reconcile_order(
+        pending, client=client, pending_store=pending_store, position_store=position_store,
+        state_store=state_store, decision_logger=decision_logger,
+    )
+
+    entries = [e for e in decision_logger.read_all() if e.get("kind") == "order_status_unknown"]
+    assert len(entries) == 1
+    assert entries[0]["evidence"]["raw"] == {"lookup_error": "NotFoundError: order ex-diag not found"}
