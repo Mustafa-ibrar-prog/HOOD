@@ -191,7 +191,7 @@ def build_btc_momentum_evidence(
     )
 
 
-def _wrap_btc_signals(evidence: MomentumEvidence, *, at: datetime) -> tuple[Signal, ...]:
+def wrap_btc_signals(evidence: MomentumEvidence, *, at: datetime) -> tuple[Signal, ...]:
     """Wraps MomentumEvidence's own raw INPUT fields (not
     evaluate_momentum's derived fired-signal names) as uniform Signal
     objects — these are the real observed values, each with a real
@@ -205,6 +205,11 @@ def _wrap_btc_signals(evidence: MomentumEvidence, *, at: datetime) -> tuple[Sign
     +3 vs. structure's +1 weight there) — an ORDINAL correspondence to
     an already-shipped, already-justified weighting, not an
     independently invented calibration.
+
+    Public (not module-private) because btc_entry_signal.py's entry-
+    direction assessment reuses this EXACT wrapping for both the
+    bullish- and bearish-framed evidence it builds — never a second,
+    parallel way to turn MomentumEvidence into Signals.
     """
     bullish = evidence.thesis_direction == "bullish"
     opposite = "bearish" if bullish else "bullish"
@@ -400,7 +405,7 @@ def assess_btc_market(
     assessment = evaluate_momentum(evidence)
 
     signal_time = usable_bars[-1].start_time if usable_bars else now
-    btc_signals = _wrap_btc_signals(evidence, at=signal_time)
+    btc_signals = wrap_btc_signals(evidence, at=signal_time)
     microstructure_signals = assess_polymarket_microstructure(order_book, recent_mids, outcome=outcome, now=now)
 
     return BtcMarketAssessment(

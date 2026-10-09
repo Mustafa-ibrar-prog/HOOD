@@ -21,6 +21,20 @@ from src.polymarket.strategy import BtcMomentumStrategy
 _VALID_KEY = "0x" + "a" * 64
 
 
+def _feed_bullish_btc(btc_price_store: BtcPriceHistoryStore) -> datetime:
+    """Feeds real, STRENGTHENING-when-framed-bullish BTC bars (the
+    SAME pinned, verified fixture test_polymarket_dynamic_exit_replay.py
+    uses) -- since engine.run_cycle()'s entry path is now driven by
+    Coinbase BTC evidence (see btc_entry_signal.py), a test that wants
+    a qualifying entry candidate must feed real BTC bars, not seed
+    Polymarket's own mid-price history. Returns the timestamp of the
+    last fed sample -- callers must pass `now=` close to it (see
+    run_cycle's own `now` parameter) so the fed bars read FRESH rather
+    than stale by the time assess_btc_entry_direction checks them."""
+    from tests.test_polymarket_dynamic_exit_replay import _feed, _strengthening_closes
+    return _feed(btc_price_store, _strengthening_closes(), seed=5)
+
+
 def _market(**overrides) -> BinaryMarket:
     now = datetime.now(timezone.utc)
     defaults = dict(
@@ -112,8 +126,10 @@ def test_no_setup_logs_no_trade_and_does_not_enter(tmp_path):
 
 def test_qualifying_setup_enters_a_paper_position(tmp_path):
     market = _market(yes_bid=0.78, yes_ask=0.80)
-    harness = _harness(tmp_path, market=market, recent_mids_seed=[0.50, 0.60, 0.70])
-    report = run_cycle(**harness)
+    harness = _harness(tmp_path, market=market)
+    end_t = _feed_bullish_btc(harness["btc_price_store"])  # real, materially-bullish BTC evidence
+    now = end_t + timedelta(seconds=5)
+    report = run_cycle(**harness, now=now)
     assert report.entered
     positions = harness["position_store"].load()
     assert len(positions) == 1
@@ -127,43 +143,51 @@ def test_qualifying_setup_enters_a_paper_position(tmp_path):
     expected_max_price = round(min(market.yes_ask * (1 + harness["settings"].max_price_slippage_pct), 0.99), 4)
     assert position.avg_fill_price == pytest.approx(expected_max_price)
     assert position.status == "filled"
-    state = harness["state_store"].load(today=datetime.now(timezone.utc).date())
+    state = harness["state_store"].load(today=now.date())  # matches the fixed `now` run_cycle() wrote under
     assert state.trades_opened == 1
     assert state.open_position_count == 1
 
 
 def test_qualifying_setup_skipped_when_outcome_book_has_no_liquidity(tmp_path):
-    """Task 6: even with a clear momentum signal, a trade must be
+    """Task 6: even with a clear bullish BTC signal, a trade must be
     refused when the SPECIFIC outcome's own order book can't actually
     absorb it near our ceiling price."""
     market = _market(yes_bid=0.78, yes_ask=0.80)
-    harness = _harness(tmp_path, market=market, recent_mids_seed=[0.50, 0.60, 0.70], book_liquidity_shares=1.0)
+    harness = _harness(tmp_path, market=market, book_liquidity_shares=1.0)
+    end_t = _feed_bullish_btc(harness["btc_price_store"])
+    now = end_t + timedelta(seconds=5)
     # 1 share at ~0.80 is <$1 notional — well below the $25 default minimum.
-    report = run_cycle(**harness)
+    report = run_cycle(**harness, now=now)
     assert not report.entered
     assert harness["position_store"].load() == []
 
 
 def test_max_open_positions_blocks_a_second_entry(tmp_path):
     market = _market(yes_bid=0.78, yes_ask=0.80)
-    harness = _harness(tmp_path, market=market, recent_mids_seed=[0.50, 0.60, 0.70])
+    harness = _harness(tmp_path, market=market)
+    end_t = _feed_bullish_btc(harness["btc_price_store"])  # real, materially-bullish BTC evidence -- otherwise qualifies
+    now = end_t + timedelta(seconds=5)
     # Pre-seed an already-open position so the risk gate should block a new one.
     # avg_fill_price=0.75 is deliberate: its 20% profit target (0.90) is
     # ABOVE this market's yes_bid=0.78, so the automatic profit-target
     # exit check (exit_manager.py) correctly leaves it untouched —
     # keeping this test isolated to what it actually tests (the
     # max_open_positions gate), not incidentally exercising the exit path.
-    now = datetime.now(timezone.utc)
     harness["position_store"].add_if_absent(OpenPosition(
         condition_id="other", token_id="y", outcome="YES", requested_size_usd=5.0,
         filled_shares=10.0, avg_fill_price=0.75, order_id="paper:seed", client_order_id="seed-1",
         status="filled", opened_at=now, close_time=now + timedelta(minutes=5),
     ))
-    state = harness["state_store"].load()
+    # today=now.date() -- matching the FIXED `now` passed to run_cycle()
+    # below, not state_store.load()'s own default of the real wall-clock
+    # today (DailyPnlStateStore.load() resets to a fresh/empty state on
+    # a date mismatch), so run_cycle()'s own state read actually sees
+    # this seeded count.
+    state = harness["state_store"].load(today=now.date())
     state.open_position_count = 1
     harness["state_store"].save(state)
 
-    report = run_cycle(**harness)
+    report = run_cycle(**harness, now=now)
     assert not report.entered
     assert len(harness["position_store"].load()) == 1  # unchanged — still just the pre-seeded one
 
@@ -486,13 +510,14 @@ def test_run_cycle_reconciles_immediately_with_live_auto_execute(tmp_path):
     position_store = PolymarketPositionStore(tmp_path / "positions.json")
     history = MarketHistory()
     history.observe(market)
-    history.mids = [0.50, 0.60, 0.70]
+    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed_bullish_btc(btc_price_store)  # real, materially-bullish BTC evidence -- the entry trigger now
+    now = end_t + timedelta(seconds=5)
 
     report = run_cycle(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history,
-        btc_price_store=BtcPriceHistoryStore(tmp_path / "btc.json"),
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
     )
     assert report.entered
     positions = position_store.load()

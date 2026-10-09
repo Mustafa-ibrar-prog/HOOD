@@ -40,6 +40,7 @@ from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.strategy import BtcMomentumStrategy
+from tests.test_polymarket_dynamic_exit_replay import _strengthening_closes, _ticks_from_minute_closes
 
 _VALID_KEY = "0x" + "a" * 64
 # Fixed, fictional base for the UNIT tests below (check_entry_retry_guard
@@ -50,6 +51,40 @@ _VALID_KEY = "0x" + "a" * 64
 # risk.py's freshness/cutoff checks -- always use the REAL wall clock
 # internally, never a test-injected `now`.
 _NOW = datetime(2026, 10, 9, 18, 0, tzinfo=timezone.utc)
+
+
+def _feed_bullish_btc_near(btc_price_store, *, now: datetime) -> None:
+    """Feeds the same real, STRENGTHENING-when-framed-bullish BTC
+    price pattern test_polymarket_dynamic_exit_replay.py uses
+    (`_strengthening_closes`/seed=5), SHIFTED so its last tick lands
+    just before `now` -- unlike that module's own tests (which use a
+    fixed historical base time throughout), these scenario tests must
+    keep `now` anchored to the REAL wall clock: LivePolymarketGateway.
+    submit_order() always stamps a new PendingLiveOrder's created_at
+    from the real clock (gateway.py, never a test-injected `now` --
+    see its own call site), so entry_guard.py's cooldown-elapsed
+    arithmetic (`now - pending.created_at`) only means anything when
+    this test's own `now` tracks real time too. Shifting the fixed
+    fixture to end near whatever `now` the test is actually using
+    satisfies BOTH that constraint AND assess_btc_entry_direction's
+    own freshness gate.
+
+    The shift is rounded to a WHOLE number of minutes, deliberately --
+    a sub-minute shift would move every tick off the :00/:15/:30/:45-
+    second marks the fixture was generated on, re-bucketing some ticks
+    across BtcPriceHistoryStore.get_bars()'s own 60s-bucket boundaries
+    (anchored to the Unix epoch, not to this fixture). That changes
+    the resulting RSI/MACD/EMA values right at this fixture's own
+    margin (exactly min_strengthening_signals=2 fired signals) --
+    a real, observed flake (intermittent, real-wall-clock-second-
+    dependent test failures) this avoids entirely by preserving the
+    EXACT bucket alignment the fixture was verified under, regardless
+    of what real second `now` happens to land on."""
+    ticks, end_t = _ticks_from_minute_closes(_strengthening_closes(), seed=5)
+    whole_minutes = (now - end_t - timedelta(seconds=1)) // timedelta(minutes=1)
+    shift = timedelta(minutes=whole_minutes)
+    for price, at in ticks:
+        btc_price_store.record_quote(price, at=at + shift)
 
 
 def _order(**overrides) -> OrderRequest:
@@ -313,7 +348,8 @@ def _market(**overrides) -> BinaryMarket:
     return BinaryMarket(**defaults)
 
 
-def _live_harness(tmp_path: Path, market: BinaryMarket, placer: _FakePlacer, **settings_overrides):
+def _live_harness(tmp_path: Path, market: BinaryMarket, placer: _FakePlacer, *, now: datetime | None = None, **settings_overrides):
+    now = now or datetime.now(timezone.utc)
     env = dict(
         POLYMARKET_LOG_DIR=str(tmp_path), POLYMARKET_TRADING_MODE="live", POLYMARKET_PRIVATE_KEY=_VALID_KEY,
         POLYMARKET_LIVE_TRADING_CONFIRMED="true", POLYMARKET_LIVE_AUTO_EXECUTE="true",
@@ -332,10 +368,20 @@ def _live_harness(tmp_path: Path, market: BinaryMarket, placer: _FakePlacer, **s
     gateway = LivePolymarketGateway(settings, logger, pending_store, order_placer=placer, emergency_stop_store=estop)
     history = MarketHistory()
     history.observe(market)
-    history.mids = [0.50, 0.55, 0.60]  # a clear qualifying YES momentum setup
     btc_price_store_path = tmp_path / "btc.json"
     from src.polymarket.btc_market_data import BtcPriceHistoryStore
     btc_price_store = BtcPriceHistoryStore(btc_price_store_path)
+    # engine.run_cycle()'s entry path is now driven by Coinbase BTC
+    # evidence (see btc_entry_signal.py), not Polymarket mid-price
+    # history -- feed real, materially-bullish BTC bars, shifted to end
+    # near THIS harness's own `now` (see _feed_bullish_btc_near), so
+    # every test below gets a qualifying YES candidate by default,
+    # exactly like the old `history.mids` seed used to provide. A test
+    # that needs a materially DIFFERENT price point (scenario 3) still
+    # mutates `history.mids`/the market's own book for THAT purpose --
+    # unrelated to entry direction now, but still read by
+    # exit_manager's Polymarket microstructure signal.
+    _feed_bullish_btc_near(btc_price_store, now=now)
     return dict(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
@@ -347,7 +393,7 @@ def test_scenario_1_unknown_fill_status_does_not_trigger_an_immediate_duplicate_
     now = datetime.now(timezone.utc)
     market = _market(yes_bid=0.60, yes_ask=0.62)
     placer = _FakePlacer([SubmissionOutcome(ok=True, exchange_order_id="ex-1", raw_status="matched")])
-    harness = _live_harness(tmp_path, market, placer)
+    harness = _live_harness(tmp_path, market, placer, now=now)
     harness["client"].set_fill_result("ex-1", FillResult(
         order_id="ex-1", status="unknown", requested_shares=0.0, filled_shares=0.0, avg_fill_price=None,
     ))
@@ -365,7 +411,7 @@ def test_scenario_2_rejected_does_not_trigger_an_immediate_duplicate_buy(tmp_pat
     now = datetime.now(timezone.utc)
     market = _market(yes_bid=0.60, yes_ask=0.62)
     placer = _FakePlacer([SubmissionOutcome(ok=False, exchange_order_id=None, raw_status=None, error_code="not_enough_balance", error_message="nope")])
-    harness = _live_harness(tmp_path, market, placer)
+    harness = _live_harness(tmp_path, market, placer, now=now)
 
     first = run_cycle(**harness, now=now)
     assert first.entered is False
@@ -386,7 +432,7 @@ def test_scenario_3_a_materially_changed_price_permits_a_later_retry(tmp_path):
         SubmissionOutcome(ok=False, exchange_order_id=None, raw_status=None, error_code="not_enough_balance", error_message="nope"),
         SubmissionOutcome(ok=True, exchange_order_id="ex-2", raw_status="matched"),
     ])
-    harness = _live_harness(tmp_path, market, placer, POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS="600")
+    harness = _live_harness(tmp_path, market, placer, POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS="600", now=now)
     harness["client"].set_fill_result("ex-2", FillResult(
         order_id="ex-2", status="filled", requested_shares=10.0, filled_shares=10.0, avg_fill_price=0.82,
     ))
@@ -412,7 +458,7 @@ def test_scenario_4_a_genuinely_new_market_is_not_blocked_by_the_previous_market
         SubmissionOutcome(ok=False, exchange_order_id=None, raw_status=None, error_code="not_enough_balance", error_message="nope"),
         SubmissionOutcome(ok=True, exchange_order_id="ex-3", raw_status="matched"),
     ])
-    harness = _live_harness(tmp_path, market_a, placer)
+    harness = _live_harness(tmp_path, market_a, placer, now=now)
     harness["client"].set_fill_result("ex-3", FillResult(
         order_id="ex-3", status="filled", requested_shares=10.0, filled_shares=10.0, avg_fill_price=0.62,
     ))
@@ -456,7 +502,7 @@ def test_unknown_then_retry_cycle_blocked_then_original_resolves_filled(tmp_path
     # would ALSO block step 4 for an unrelated reason (no "room" at
     # all), masking whether THIS guard's new duplicate-position check
     # is what's actually doing the work.
-    harness = _live_harness(tmp_path, market, placer, POLYMARKET_MAX_OPEN_POSITIONS="2")
+    harness = _live_harness(tmp_path, market, placer, POLYMARKET_MAX_OPEN_POSITIONS="2", now=now)
     harness["client"].set_fill_result("ex-1", FillResult(
         order_id="ex-1", status="unknown", requested_shares=0.0, filled_shares=0.0, avg_fill_price=None,
     ))
@@ -526,7 +572,7 @@ def test_unknown_then_authoritative_rejected_then_retry_permitted_after_cooldown
         SubmissionOutcome(ok=True, exchange_order_id="ex-1", raw_status="matched"),
         SubmissionOutcome(ok=True, exchange_order_id="ex-2", raw_status="matched"),
     ])
-    harness = _live_harness(tmp_path, market, placer, POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS="60")
+    harness = _live_harness(tmp_path, market, placer, POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS="60", now=now)
     harness["client"].set_fill_result("ex-1", FillResult(
         order_id="ex-1", status="unknown", requested_shares=0.0, filled_shares=0.0, avg_fill_price=None,
     ))
@@ -571,7 +617,7 @@ def test_two_distinct_markets_can_both_occupy_the_max_open_positions_limit(tmp_p
         SubmissionOutcome(ok=True, exchange_order_id="ex-a", raw_status="matched"),
         SubmissionOutcome(ok=True, exchange_order_id="ex-b", raw_status="matched"),
     ])
-    harness = _live_harness(tmp_path, market_a, placer, POLYMARKET_MAX_OPEN_POSITIONS="2")
+    harness = _live_harness(tmp_path, market_a, placer, POLYMARKET_MAX_OPEN_POSITIONS="2", now=now)
     harness["client"].set_fill_result("ex-a", FillResult(
         order_id="ex-a", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.62,
     ))

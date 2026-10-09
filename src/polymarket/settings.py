@@ -337,6 +337,14 @@ class PolymarketSettings:
     # options-side EvaluatorConfig.min_weakening_signals_for_exit,
     # reused rather than independently re-tuned.
     min_weakening_signals_for_exit: int
+    # The ENTRY-side mirror of min_weakening_signals_for_exit above --
+    # see btc_entry_signal.py. Minimum fired-signal count required
+    # before Coinbase BTC evidence (the PRIMARY entry-direction signal)
+    # is treated as materially confirming a bullish or bearish thesis,
+    # rather than a single soft indicator being enough to propose a
+    # trade. Same default (2) and mechanism, reused rather than
+    # independently re-tuned.
+    min_strengthening_signals_for_entry: int
     # Where fed BTC quote samples persist (btc_market_data.BtcPriceHistoryStore)
     # — restart-safe, same file-backed convention as every other store here.
     btc_price_history_file: str
@@ -406,6 +414,8 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_BTC_MAX_BAR_AGE_SECONDS must be > 0")
         if self.min_weakening_signals_for_exit <= 0:
             raise PolymarketConfigError("POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT must be > 0")
+        if self.min_strengthening_signals_for_entry <= 0:
+            raise PolymarketConfigError("POLYMARKET_MIN_STRENGTHENING_SIGNALS_FOR_ENTRY must be > 0")
         if self.venue not in VALID_VENUES:
             raise PolymarketConfigError(
                 f"POLYMARKET_VENUE={self.venue!r} is invalid; must be one of {sorted(VALID_VENUES)}"
@@ -591,6 +601,7 @@ class PolymarketSettings:
             btc_bar_interval_seconds=_get_int(env, "POLYMARKET_BTC_BAR_INTERVAL_SECONDS", 60),
             btc_max_bar_age_seconds=_get_float(env, "POLYMARKET_BTC_MAX_BAR_AGE_SECONDS", 300.0),
             min_weakening_signals_for_exit=_get_int(env, "POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT", 2),
+            min_strengthening_signals_for_entry=_get_int(env, "POLYMARKET_MIN_STRENGTHENING_SIGNALS_FOR_ENTRY", 2),
             btc_price_history_file=_get_str(env, "POLYMARKET_BTC_PRICE_HISTORY_FILE", "logs/polymarket/btc_price_history.json"),
             asset=_get_str(env, "POLYMARKET_ASSET", "bitcoin").lower(),
             market_duration_minutes=_get_int(env, "POLYMARKET_MARKET_DURATION_MINUTES", 15),

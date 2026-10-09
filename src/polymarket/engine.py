@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from src.polymarket import reconciliation
+from src.polymarket.btc_entry_signal import assess_btc_entry_direction, build_entry_candidate
 from src.polymarket.btc_market_data import BtcPriceHistoryStore
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
 from src.polymarket.entry_guard import check_entry_retry_guard
@@ -92,7 +93,7 @@ def run_cycle(
     *,
     settings: PolymarketSettings,
     client: PolymarketClient,
-    strategy: BtcMomentumStrategy,
+    strategy: BtcMomentumStrategy,  # kept for call-site/signature compatibility -- no longer consulted for the live entry decision, see below
     risk_manager: PolymarketRiskManager,
     gateway: ExecutionGateway,
     decision_logger: PolymarketDecisionLogger,
@@ -164,13 +165,91 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    recent_mids = history.observe(market)
+    # history.observe() still runs every cycle -- its own result just no
+    # longer decides entry direction (see below). It remains the ONLY
+    # source of `history.mids`, which exit_manager.py's dynamic-exit
+    # pass reads next cycle for Polymarket's own order-book-momentum
+    # microstructure signal (corroboration/veto there, never a trigger
+    # here either) -- removing this call would silently starve that
+    # unrelated, still-active exit-side signal.
+    history.observe(market)
 
-    candidate = strategy.evaluate(market, recent_mids)
+    # --- COINBASE BTC -> directional entry thesis (see btc_entry_signal.py) --
+    # Polymarket price/order-book data plays NO part in this decision --
+    # a YES mid moving up or down, by itself, can never create or block
+    # an entry; only real Coinbase BTC evidence can. Reuses the EXACT
+    # SAME scoring pipeline exit_manager.py's dynamic-exit decision
+    # already relies on (build_btc_momentum_evidence/evaluate_momentum/
+    # compute_feed_status) -- never a second, competing BTC engine.
+    try:
+        bars = btc_price_store.get_bars(interval_seconds=settings.btc_bar_interval_seconds, now=now)
+    except Exception as exc:  # noqa: BLE001 - a BTC store failure must never crash the bot or fall back to the old Polymarket-only trigger
+        decision_logger.log_decision(
+            kind="btc_feed_read_failed",
+            reason=f"Could not read BTC price history for entry evaluation on {market.condition_id}: {exc}",
+            evidence={"condition_id": market.condition_id, "error_type": type(exc).__name__, "error": str(exc)},
+        )
+        bars = []
+
+    btc_direction = assess_btc_entry_direction(
+        bars, now=now, max_bar_age_seconds=settings.btc_max_bar_age_seconds, feed_source=btc_feed_source,
+        min_strengthening_signals=settings.min_strengthening_signals_for_entry,
+    )
+    feed_status = btc_direction.feed_status
+    # Logged every cycle, for every active market, regardless of what
+    # else happens -- mirrors check_and_execute_dynamic_exits' own
+    # always-on btc_feed_status logging, so a dead/thin feed or a
+    # conflicting read is visible in the decision log, never silent.
+    decision_logger.log_decision(
+        kind="btc_entry_signal",
+        reason=(
+            f"BTC_DIRECTION={btc_direction.direction} BTC_EDGE_POINTS={btc_direction.edge_points:+.0f} "
+            f"BTC_STATE={btc_direction.momentum_state.value if btc_direction.momentum_state else 'n/a'} "
+            f"BTC_FEED_STATUS={feed_status.status} {btc_direction.reason}"
+        ),
+        evidence={
+            "market_slug": market.condition_id, "condition_id": market.condition_id,
+            "btc_direction": btc_direction.direction,
+            "btc_edge_points": btc_direction.edge_points,
+            "btc_momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
+            "fired_signals": list(btc_direction.selected_assessment.btc_assessment.signals) if btc_direction.selected_assessment else [],
+            "bullish_edge_points": btc_direction.bullish_edge_points, "bearish_edge_points": btc_direction.bearish_edge_points,
+            "bullish_state": btc_direction.bullish_assessment.state.value, "bearish_state": btc_direction.bearish_assessment.state.value,
+            "btc_feed_source": feed_status.source,
+            "btc_last_bar_time": feed_status.last_bar_time.isoformat() if feed_status.last_bar_time else None,
+            "btc_bar_age_seconds": feed_status.bar_age_seconds, "btc_feed_status": feed_status.status,
+            "remaining_seconds": market.seconds_to_close,
+        },
+    )
+
+    if btc_direction.direction == "neutral":
+        decision_logger.log_decision(
+            kind="no_trade", reason=btc_direction.reason,
+            evidence={
+                "question": market.question, "rejection_reason": btc_direction.neutral_reason_code,
+                "remaining_seconds": market.seconds_to_close,
+            },
+        )
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
+
+    # --- POLYMARKET -> execution confirmation (direction already decided above) --
+    # Maps bullish->YES / bearish->NO against the CURRENT market's own
+    # two-sided quote -- never a price guess, never the other side.
+    candidate = build_entry_candidate(market, btc_direction, size_usd=settings.max_bet_usd)
     if candidate is None:
         decision_logger.log_decision(
-            kind="no_trade", reason="No qualifying setup this cycle",
-            evidence={"question": market.question, "yes_mid": market.yes_mid, "samples": len(recent_mids)},
+            kind="no_trade",
+            reason=(
+                f"Coinbase BTC evidence is {btc_direction.direction} but {btc_direction.outcome} has no "
+                f"two-sided Polymarket quote yet on {market.condition_id}"
+            ),
+            evidence={
+                "question": market.question, "rejection_reason": "unusable_outcome_quote",
+                "btc_direction": btc_direction.direction, "selected_outcome": btc_direction.outcome,
+            },
         )
         return CycleReport(
             ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,

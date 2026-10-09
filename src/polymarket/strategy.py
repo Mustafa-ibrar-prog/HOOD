@@ -15,6 +15,21 @@ yet, or without enough samples to trust a direction, it proposes
 nothing — same "don't guess on insufficient evidence" posture as
 src/strategy/evidence.py's evaluate_momentum.
 
+SUPERSEDED AS THE LIVE ENTRY TRIGGER: engine.run_cycle() no longer
+calls BtcMomentumStrategy.evaluate() to decide entry direction — a
+Polymarket price move, by itself, must never create an entry (a live
+requirement: this strategy's own basis, a YES-mid move since market
+open, is exactly the thing that could never distinguish "real BTC
+move" from "the crowd re-pricing on no new information"). See
+btc_entry_signal.py: Coinbase BTC evidence, run through the SAME
+scoring pipeline exit_manager.py's dynamic-exit decision already uses,
+is now the primary entry-direction signal; Polymarket's own quote is
+consulted only afterward, for execution confirmation (spread/
+liquidity/price sanity), never for direction. This class and its tests
+are kept — unused by the live path, but still valid, still pure, still
+useful for backtesting or future reference — rather than deleted
+outright.
+
 This is pure logic (no network calls), so it's fully unit-testable
 without Polymarket API access, unlike client.py.
 """

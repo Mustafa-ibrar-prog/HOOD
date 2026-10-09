@@ -282,13 +282,32 @@ def test_run_cycle_does_not_crash_on_exhausted_rate_limit_and_places_no_order(tm
     from src.polymarket.btc_market_data import BtcPriceHistoryStore
     history = MarketHistory()
     history.observe(market)
-    history.mids = [0.50, 0.60, 0.70]
     btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    # engine.run_cycle()'s entry path is now Coinbase-BTC-driven (see
+    # btc_entry_signal.py), not Polymarket mid-price history -- feed
+    # real, materially-bullish BTC bars so a candidate is still
+    # proposed and this test actually reaches the rate-limited
+    # order-book fetch it exists to exercise.
+    from tests.test_polymarket_dynamic_exit_replay import _strengthening_closes, _ticks_from_minute_closes
+    now = datetime.now(timezone.utc)
+    ticks, end_t = _ticks_from_minute_closes(_strengthening_closes(), seed=5)
+    # Shifted by a WHOLE number of minutes (not an arbitrary sub-minute
+    # offset) so every tick stays on the same :00/:15/:30/:45-second
+    # mark it was generated on -- preserving the exact 60s-bucket
+    # alignment BtcPriceHistoryStore.get_bars() uses (anchored to the
+    # Unix epoch), which this fixture's "STRENGTHENING, 2 signals"
+    # result was verified under. A sub-minute shift intermittently
+    # re-buckets ticks across a bar boundary depending on the real
+    # second `now` happens to land on -- a real, observed flake.
+    whole_minutes = (now - end_t - timedelta(seconds=1)) // timedelta(minutes=1)
+    shift = timedelta(minutes=whole_minutes)
+    for price, at in ticks:
+        btc_price_store.record_quote(price, at=at + shift)
 
     report = run_cycle(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
     )
 
     assert report.ran is True  # never crashed
