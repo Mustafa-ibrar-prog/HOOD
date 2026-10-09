@@ -94,6 +94,12 @@ def test_no_order_book_or_trade_direction_code_exists_anywhere_in_src_or_scripts
         REPO_ROOT / "scripts" / "run_polymarket_bot.py",
         REPO_ROOT / "scripts" / "verify_polymarket_setup.py",
         REPO_ROOT / "scripts" / "manual_polymarket_us_test.py",
+        # Same reasoning as the three Polymarket scripts above: these
+        # read Polymarket US's real order book (via PolymarketUSClient.
+        # get_order_book), never Robinhood/HOOD's -- see this test's own
+        # docstring on why src/polymarket/ as a whole is exempt.
+        REPO_ROOT / "scripts" / "dynamic_exit_smoke_test.py",
+        REPO_ROOT / "scripts" / "dynamic_exit_shadow.py",
     }
     exempt_dirs = {REPO_ROOT / "src" / "polymarket"}
     for directory in ("src", "scripts"):

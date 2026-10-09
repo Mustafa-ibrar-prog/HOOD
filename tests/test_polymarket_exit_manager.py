@@ -489,6 +489,125 @@ def test_restart_with_a_pending_exit_is_reconciled_by_a_fresh_process(tmp_path):
     assert fresh_position_store.load() == []
 
 
+# --- Full pipeline, PAPER mode specifically ------------------------------------
+# Every fill-handling test above (full/partial/unknown/cancelled fill, restart
+# reconciliation) uses _live_harness -- LIVE mode's gateway -- because
+# submission and fill determination are genuinely two separate steps there
+# (see gateway.py's module docstring). PaperPolymarketGateway has no such
+# gap: submit_order() returns an immediate, synchronous, ALWAYS-full
+# FillResult, so submit_dynamic_exit() resolves it in the very same call via
+# record_exit_fill() -- nothing to reconcile, nothing to retry. These tests
+# cover that PAPER-specific end-to-end path, which none of the tests above
+# exercise.
+
+def test_paper_mode_full_exit_closes_the_position_and_updates_pnl_via_submit_dynamic_exit(tmp_path):
+    """The missing PAPER-mode case: evaluate_dynamic_exit() -> an eligible
+    decision -> submit_dynamic_exit() -> PaperPolymarketGateway's own
+    synchronous simulated fill -> record_exit_fill() closes the position
+    and records net realized P&L, all inside ONE submit_dynamic_exit()
+    call. Never reaches client.place_order (paper mode never submits to a
+    real exchange) and never calls client.get_fill_status (there is
+    nothing to look up -- the fill was never in question)."""
+    harness = _harness(tmp_path)  # _settings() defaults to paper (POLYMARKET_TRADING_MODE unset)
+    assert harness["settings"].is_paper
+    position = _position(avg_fill_price=0.36, filled_shares=5.0, entry_fee_usd=0.05)
+    harness["position_store"].add_if_absent(position)
+    book = _book(bids=(BookLevel(price=0.50, size=100.0),))
+    harness["client"].set_order_book("tok-1", book)
+    decision = evaluate_dynamic_exit(
+        position, book, _assessment(MomentumState.REVERSING, signal_count=5), profit_target_pct=0.20,
+    )
+    assert decision.eligible is True
+
+    result = submit_dynamic_exit(
+        decision, client=harness["client"], gateway=harness["gateway"], position_store=harness["position_store"],
+        state_store=harness["state_store"], decision_logger=harness["decision_logger"], settings=harness["settings"],
+    )
+
+    assert result.status == "simulated_fill"
+    assert harness["client"].place_order_calls == []  # paper mode never reaches the exchange
+    assert harness["client"].get_fill_status_calls == []  # nothing to reconcile for a synchronous simulation
+    assert harness["position_store"].load() == []  # fully closed
+    state = harness["state_store"].load()
+    expected = (5 * 0.50) - (5 * 0.36) - 0.05  # entry fee only -- the simulated FillResult reports no exit fee
+    assert state.realized_pnl_usd == pytest.approx(expected)
+
+
+def test_paper_mode_partial_fill_is_reconciled_correctly(tmp_path):
+    """PaperPolymarketGateway itself always simulates a FULL fill (see its
+    own docstring) -- it structurally cannot produce a partial fill.
+    record_exit_fill() is mode-agnostic reconciliation logic shared by
+    both the paper and live paths, so this proves it handles a partial
+    fill correctly under a PAPER settings/store environment too, exactly
+    the way test_partial_exit_fill_leaves_the_remaining_quantity_open
+    already proves it for LIVE."""
+    settings = _settings()  # paper, isolated -- never touches the real .env
+    assert settings.is_paper
+    position_store = PolymarketPositionStore(tmp_path / "positions.json")
+    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
+    decision_logger = _logger(tmp_path)
+    position = _position(
+        avg_fill_price=0.36, filled_shares=5.0, entry_fee_usd=0.05, exit_pending_order_id="paper:pending-1",
+    )
+    position_store.add_if_absent(position)
+
+    fill = FillResult(
+        order_id="paper:pending-1", status="partially_filled", requested_shares=5.0, filled_shares=3.0,
+        avg_fill_price=0.50, fee_usd=0.018,
+    )
+    updated = record_exit_fill(
+        fill, position, position_store=position_store, state_store=state_store, decision_logger=decision_logger,
+        now=datetime.now(timezone.utc),
+    )
+
+    assert updated is not None
+    assert updated.filled_shares == pytest.approx(2.0)
+    assert updated.exit_pending_order_id is None  # cleared -- free for a fresh exit decision on the remainder
+    positions = position_store.load()
+    assert len(positions) == 1
+    assert positions[0].filled_shares == pytest.approx(2.0)
+
+
+def test_paper_mode_unknown_status_stays_pending_then_retry_resolves_it(tmp_path):
+    """Same mode-agnostic point as the partial-fill test above, for the
+    "unknown status -> retry" requirement: the first call must leave the
+    position and its exit_pending_order_id completely untouched (never
+    assume filled), and a SECOND call (the retry) with an authoritative
+    result must then resolve it -- under a PAPER settings/store
+    environment, mirroring test_unknown_exit_status_leaves_position_
+    unchanged_and_pending's LIVE coverage."""
+    settings = _settings()
+    assert settings.is_paper
+    position_store = PolymarketPositionStore(tmp_path / "positions.json")
+    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
+    decision_logger = _logger(tmp_path)
+    position = _position(avg_fill_price=0.36, filled_shares=5.0, exit_pending_order_id="paper:pending-2")
+    position_store.add_if_absent(position)
+    now = datetime.now(timezone.utc)
+
+    unknown_fill = FillResult(
+        order_id="paper:pending-2", status="unknown", requested_shares=5.0, filled_shares=0.0, avg_fill_price=None,
+    )
+    first = record_exit_fill(
+        unknown_fill, position, position_store=position_store, state_store=state_store,
+        decision_logger=decision_logger, now=now,
+    )
+    assert first is not None
+    assert first.filled_shares == 5.0
+    assert first.exit_pending_order_id == "paper:pending-2"  # left SET -- never assumed filled
+    assert position_store.load()[0].exit_pending_order_id == "paper:pending-2"
+
+    retry_fill = FillResult(
+        order_id="paper:pending-2", status="filled", requested_shares=5.0, filled_shares=5.0, avg_fill_price=0.44,
+    )
+    second = record_exit_fill(
+        retry_fill, position, position_store=position_store, state_store=state_store,
+        decision_logger=decision_logger, now=now,
+    )
+    assert second is None  # fully closed on the retry
+    assert position_store.load() == []
+
+
 # --- Emergency stop ------------------------------------------------------------
 
 def test_emergency_stop_blocks_an_automatic_exit_from_reaching_the_exchange(tmp_path):
