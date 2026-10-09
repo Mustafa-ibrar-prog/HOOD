@@ -13,7 +13,7 @@ from src.polymarket import reconciliation
 from src.polymarket.btc_entry_signal import assess_btc_entry_direction, build_entry_candidate
 from src.polymarket.btc_market_data import BtcPriceHistoryStore
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
-from src.polymarket.entry_confidence import assess_confidence
+from src.polymarket.entry_confidence import assess_confidence, confidence_bucket, recommended_size_usd
 from src.polymarket.entry_guard import check_entry_retry_guard
 from src.polymarket.exit_manager import check_and_execute_dynamic_exits
 from src.polymarket.gateway import ExecutionGateway
@@ -25,6 +25,15 @@ from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.strategy import BtcMomentumStrategy
+from src.polymarket.trade_learning import (
+    CompletedTradeStore,
+    CompletedTradeStoreError,
+    apply_historical_adjustment,
+    build_setup_key,
+    compute_historical_adjustment,
+    compute_setup_stats,
+    record_completed_trade,
+)
 
 
 @dataclass
@@ -61,6 +70,7 @@ class MarketHistory:
 def settle_resolved_positions(
     *, client: PolymarketClient, position_store: PolymarketPositionStore,
     state_store: DailyPnlStateStore, decision_logger: PolymarketDecisionLogger, now: datetime | None = None,
+    trade_store: CompletedTradeStore | None = None,
 ) -> int:
     now = now or datetime.now(timezone.utc)
     settled = 0
@@ -85,6 +95,12 @@ def settle_resolved_positions(
         state.open_position_count = max(0, state.open_position_count - 1)
         state.last_exit_time = now.isoformat()
         state_store.save(state)
+        # Resolution pays exactly $1/share if won, $0 if lost -- a real,
+        # known exit price, never a guess (see TASK 2's "never fabricate").
+        record_completed_trade(
+            trade_store, position, exit_timestamp=now, exit_price=(1.0 if won else 0.0),
+            exit_reason="SETTLEMENT", fees_usd=0.0, realized_pnl_usd=pnl,
+        )
         position_store.remove(position.condition_id)
         settled += 1
     return settled
@@ -104,6 +120,7 @@ def run_cycle(
     history: MarketHistory,
     btc_price_store: BtcPriceHistoryStore,
     btc_feed_source: str = "manual",
+    trade_store: CompletedTradeStore | None = None,
     now: datetime | None = None,
 ) -> CycleReport:
     now = now or datetime.now(timezone.utc)
@@ -140,6 +157,7 @@ def run_cycle(
 
     settled = settle_resolved_positions(
         client=client, position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
+        trade_store=trade_store,
     )
 
     # Evidence-gated dynamic exit check (see exit_manager.py):
@@ -154,7 +172,7 @@ def run_cycle(
         client=client, settings=settings, gateway=gateway, position_store=position_store,
         pending_store=pending_store, state_store=state_store, decision_logger=decision_logger,
         btc_price_store=btc_price_store, history=history, btc_feed_source=btc_feed_source,
-        skip_client_order_ids=newly_adopted_client_order_ids, now=now,
+        skip_client_order_ids=newly_adopted_client_order_ids, now=now, trade_store=trade_store,
     )
 
     try:
@@ -267,16 +285,87 @@ def run_cycle(
             "decision": "ALLOW" if confidence.approved else "BLOCK",
         },
     )
-    if not confidence.approved:
+    # --- LEARNING -> a SECONDARY, bounded adjustment from this bot's own
+    # completed-trade history (see trade_learning.py, TASK 2). Never
+    # applied when base_confidence is already 0 (neutral/no-trade --
+    # apply_historical_adjustment enforces this itself too, belt and
+    # suspenders), never able to bypass anything below. A no-op
+    # (adjustment stays 0.0) whenever learning is disabled or no
+    # trade_store was configured for this run.
+    historical_adjustment = 0.0
+    final_confidence = confidence.base_confidence
+    historical_sample_count = 0
+    historical_win_rate = None
+    historical_expectancy = None
+    learning_reason = "learning disabled or no completed-trade store configured"
+    if settings.learning_enabled and trade_store is not None and confidence.base_confidence > 0:
+        # Market mid-price as a coarse, available-NOW proxy for "the
+        # price this setup is being entered at" -- the real avg_fill_price
+        # isn't known until after the order book fetch/order submission
+        # below, and setup-matching only needs a $0.05 bucket anyway.
+        reference_entry_price = market.yes_mid if market.yes_mid is not None else 0.0
+        setup_key = build_setup_key(
+            btc_direction=btc_direction.direction,
+            momentum_state=btc_direction.momentum_state.value if btc_direction.momentum_state else None,
+            fired_signal_count=btc_direction.fired_signal_count,
+            entry_fill_price=reference_entry_price, seconds_remaining_at_entry=market.seconds_to_close,
+        )
+        try:
+            completed_trades = trade_store.load()
+        except CompletedTradeStoreError as exc:
+            # Fail SAFE: a corrupted learning store must never crash the
+            # bot or silently use a half-read history -- just skip the
+            # adjustment this cycle; base confidence alone still governs.
+            decision_logger.log_decision(
+                kind="learning_store_corrupted",
+                reason=f"Completed-trade journal unreadable, skipping historical adjustment this cycle: {exc}",
+                evidence={"error": str(exc)},
+            )
+            completed_trades = []
+        stats = compute_setup_stats(completed_trades, setup_key)
+        adjustment_result = compute_historical_adjustment(
+            stats, min_sample_size=settings.learning_min_sample_size,
+            min_adjustment=settings.learning_min_adjustment, max_adjustment=settings.learning_max_adjustment,
+        )
+        historical_adjustment = adjustment_result.adjustment
+        learning_reason = adjustment_result.reason
+        historical_sample_count = stats.sample_count
+        historical_win_rate = stats.win_rate
+        historical_expectancy = stats.expectancy_usd
+        final_confidence = apply_historical_adjustment(confidence.base_confidence, historical_adjustment)
+
+    final_bucket = confidence_bucket(final_confidence)
+    final_size_usd = recommended_size_usd(final_confidence)
+    decision_logger.log_decision(
+        kind="historical_learning",
+        reason=(
+            f"BASE_CONFIDENCE={confidence.base_confidence} HISTORICAL_SAMPLES={historical_sample_count} "
+            f"HISTORICAL_WIN_RATE={f'{historical_win_rate:.0%}' if historical_win_rate is not None else 'n/a'} "
+            f"HISTORICAL_EXPECTANCY={f'${historical_expectancy:+.2f}' if historical_expectancy is not None else 'n/a'} "
+            f"HISTORICAL_ADJUSTMENT={historical_adjustment:+.1f} FINAL_CONFIDENCE={final_confidence} "
+            f"LEARNING_REASON={learning_reason}"
+        ),
+        evidence={
+            "condition_id": market.condition_id,
+            "base_confidence": confidence.base_confidence, "historical_sample_count": historical_sample_count,
+            "historical_win_rate": historical_win_rate, "historical_expectancy": historical_expectancy,
+            "historical_adjustment": historical_adjustment, "final_confidence": final_confidence,
+            "confidence_bucket": final_bucket, "learning_reason": learning_reason,
+        },
+    )
+
+    if final_size_usd <= 0:
         decision_logger.log_decision(
             kind="no_trade",
             reason=(
-                f"BTC_DIRECTION={btc_direction.direction} confidence {confidence.base_confidence} is below "
+                f"BTC_DIRECTION={btc_direction.direction} final confidence {final_confidence} (base "
+                f"{confidence.base_confidence}, historical adjustment {historical_adjustment:+.1f}) is below "
                 f"the minimum entry threshold (50) on {market.condition_id}"
             ),
             evidence={
                 "question": market.question, "rejection_reason": "confidence_below_minimum",
-                "base_confidence": confidence.base_confidence, "remaining_seconds": market.seconds_to_close,
+                "base_confidence": confidence.base_confidence, "final_confidence": final_confidence,
+                "remaining_seconds": market.seconds_to_close,
             },
         )
         return CycleReport(
@@ -287,7 +376,7 @@ def run_cycle(
     # --- POLYMARKET -> execution confirmation (direction already decided above) --
     # Maps bullish->YES / bearish->NO against the CURRENT market's own
     # two-sided quote -- never a price guess, never the other side.
-    candidate = build_entry_candidate(market, btc_direction, size_usd=confidence.recommended_size_usd)
+    candidate = build_entry_candidate(market, btc_direction, size_usd=final_size_usd)
     if candidate is None:
         decision_logger.log_decision(
             kind="no_trade",
@@ -391,28 +480,32 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    # Full Task-1 required field set (see entry_confidence.py) -- the
-    # confidence/sizing fields plus the execution-side facts
-    # (entry_price/spread/liquidity) only known now that the order book
-    # and risk checks above have run. `actual_allowed_size_usd` ==
-    # `candidate.suggested_size_usd` here because risk.check_bet_size's
-    # own gate (size_usd <= settings.max_bet_usd) never shrinks a
-    # confidence-approved size -- it only ever blocks (decision.allowed
-    # is False above) or passes it through unchanged.
+    # Full Task-1/Task-2 required field set (see entry_confidence.py/
+    # trade_learning.py) -- the confidence/sizing/learning fields plus
+    # the execution-side facts (entry_price/spread/liquidity) only
+    # known now that the order book and risk checks above have run.
+    # `actual_allowed_size_usd` == `candidate.suggested_size_usd` here
+    # because risk.check_bet_size's own gate (size_usd <=
+    # settings.max_bet_usd) never shrinks a confidence-approved size --
+    # it only ever blocks (decision.allowed is False above) or passes
+    # it through unchanged.
+    entry_liquidity_usd = order_book.executable_liquidity_usd(side="BUY", max_price=max_price)
     decision_logger.log_decision(
         kind="entry_allowed",
         reason=(
             f"BTC_DIRECTION={btc_direction.direction} BASE_CONFIDENCE={confidence.base_confidence} "
-            f"CONFIDENCE_BUCKET={confidence.bucket} ACTUAL_ALLOWED_SIZE=${candidate.suggested_size_usd:.2f} "
-            f"ENTRY_DECISION=ALLOW"
+            f"FINAL_CONFIDENCE={final_confidence} CONFIDENCE_BUCKET={final_bucket} "
+            f"ACTUAL_ALLOWED_SIZE=${candidate.suggested_size_usd:.2f} ENTRY_DECISION=ALLOW"
         ),
         evidence={
             "condition_id": market.condition_id,
             "btc_direction": btc_direction.direction,
             "base_confidence": confidence.base_confidence,
-            "confidence_bucket": confidence.bucket,
-            "recommended_size_usd": confidence.recommended_size_usd,
+            "final_confidence": final_confidence,
+            "confidence_bucket": final_bucket,
+            "recommended_size_usd": final_size_usd,
             "actual_allowed_size_usd": candidate.suggested_size_usd,
+            "historical_adjustment": historical_adjustment,
             "edge_points": btc_direction.edge_points,
             "momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
             "fired_signal_count": btc_direction.fired_signal_count,
@@ -421,10 +514,37 @@ def run_cycle(
             "selected_outcome": candidate.thesis.outcome,
             "entry_price": candidate.suggested_entry_price,
             "spread": market.yes_spread_pct,
-            "liquidity": order_book.executable_liquidity_usd(side="BUY", max_price=max_price),
+            "liquidity": entry_liquidity_usd,
             "decision": "ALLOW",
         },
     )
+
+    # Snapshot of exactly what this cycle's own entry pipeline computed
+    # — attached to the resulting OpenPosition (see positions.py) so
+    # trade_learning.py can later learn from this EXACT decision, never
+    # a reconstruction/guess after the fact (TASK 2, 2A).
+    entry_context = {
+        "strategy_id": "COINBASE_MOMENTUM",
+        "market_question": market.question,
+        "btc_direction": btc_direction.direction,
+        "btc_edge_points": btc_direction.edge_points,
+        "momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
+        "fired_signal_count": btc_direction.fired_signal_count,
+        "fired_signals": (
+            list(btc_direction.selected_assessment.btc_assessment.signals) if btc_direction.selected_assessment else []
+        ),
+        "btc_price_at_entry": bars[-1].close if bars else None,
+        "coinbase_feed_status": feed_status.status,
+        "polymarket_yes_bid": market.yes_bid,
+        "polymarket_yes_ask": market.yes_ask,
+        "entry_spread": market.yes_spread_pct,
+        "entry_liquidity_usd": entry_liquidity_usd,
+        "seconds_remaining_at_entry": market.seconds_to_close,
+        "base_confidence": confidence.base_confidence,
+        "confidence_bucket": final_bucket,
+        "final_confidence": final_confidence,
+        "historical_adjustment": historical_adjustment,
+    }
 
     order = OrderRequest(
         condition_id=market.condition_id, token_id=token_id, outcome=candidate.thesis.outcome, side="BUY",
@@ -444,6 +564,7 @@ def run_cycle(
         position = reconciliation.record_fill(
             result.fill_result, order, result.fill_result.order_id,
             position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
+            entry_context=entry_context,
         )
         entered = position is not None
     elif result.status == "submitted":
@@ -457,6 +578,7 @@ def run_cycle(
             fill = reconciliation.reconcile_order(
                 pending, client=client, pending_store=pending_store, position_store=position_store,
                 state_store=state_store, decision_logger=decision_logger, now=now,
+                entry_context=entry_context,
             )
             entered = bool(fill and fill.is_fill)
             reconciled += 1

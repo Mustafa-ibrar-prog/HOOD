@@ -356,6 +356,30 @@ class PolymarketSettings:
     # — restart-safe, same file-backed convention as every other store here.
     btc_price_history_file: str
 
+    # --- Self-learning (see trade_learning.py) ------------------------------
+    # Historical performance is a SECONDARY, BOUNDED adjustment to the
+    # PRIMARY Coinbase-driven confidence score (entry_confidence.py) --
+    # never a second strategy, never able to create a direction or
+    # override neutral/stale BTC evidence. See trade_learning.py's
+    # module docstring.
+    learning_enabled: bool
+    # A setup (see trade_learning.build_setup_key) needs at least this
+    # many completed, strategy-attributable trades before its historical
+    # win rate is allowed to move confidence at full strength --
+    # trade_learning.compute_historical_adjustment() shrinks the
+    # adjustment toward 0 below this count, so one or two trades can
+    # never swing behavior (anti-overfitting requirement).
+    learning_min_sample_size: int
+    # The bounded adjustment range applied to base_confidence -- never
+    # wide enough, even at a huge sample size, to turn a NO_TRADE (base
+    # confidence 0, i.e. neutral/insufficient BTC evidence) into an
+    # approved trade, or to swing a strong signal into NO_TRADE outright.
+    learning_min_adjustment: float
+    learning_max_adjustment: float
+    # Where completed trades persist (trade_learning.CompletedTradeStore)
+    # — restart-safe, same file-backed convention as every other store here.
+    completed_trades_file: str
+
     # --- Market selection --------------------------------------------------
     # The underlying this system trades. Only "bitcoin" is implemented
     # (see strategy.py's module docstring on why this stays single-asset).
@@ -423,6 +447,12 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT must be > 0")
         if self.min_strengthening_signals_for_entry <= 0:
             raise PolymarketConfigError("POLYMARKET_MIN_STRENGTHENING_SIGNALS_FOR_ENTRY must be > 0")
+        if self.learning_min_sample_size <= 0:
+            raise PolymarketConfigError("POLYMARKET_LEARNING_MIN_SAMPLE_SIZE must be > 0")
+        if self.learning_min_adjustment > 0:
+            raise PolymarketConfigError("POLYMARKET_LEARNING_MIN_ADJUSTMENT must be <= 0")
+        if self.learning_max_adjustment < 0:
+            raise PolymarketConfigError("POLYMARKET_LEARNING_MAX_ADJUSTMENT must be >= 0")
         if self.venue not in VALID_VENUES:
             raise PolymarketConfigError(
                 f"POLYMARKET_VENUE={self.venue!r} is invalid; must be one of {sorted(VALID_VENUES)}"
@@ -610,6 +640,11 @@ class PolymarketSettings:
             min_weakening_signals_for_exit=_get_int(env, "POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT", 2),
             min_strengthening_signals_for_entry=_get_int(env, "POLYMARKET_MIN_STRENGTHENING_SIGNALS_FOR_ENTRY", 2),
             btc_price_history_file=_get_str(env, "POLYMARKET_BTC_PRICE_HISTORY_FILE", "logs/polymarket/btc_price_history.json"),
+            learning_enabled=_get_bool(env, "POLYMARKET_LEARNING_ENABLED", True),
+            learning_min_sample_size=_get_int(env, "POLYMARKET_LEARNING_MIN_SAMPLE_SIZE", 20),
+            learning_min_adjustment=_get_float(env, "POLYMARKET_LEARNING_MIN_ADJUSTMENT", -10.0),
+            learning_max_adjustment=_get_float(env, "POLYMARKET_LEARNING_MAX_ADJUSTMENT", 10.0),
+            completed_trades_file=_get_str(env, "POLYMARKET_COMPLETED_TRADES_FILE", "logs/polymarket/completed_trades.json"),
             asset=_get_str(env, "POLYMARKET_ASSET", "bitcoin").lower(),
             market_duration_minutes=_get_int(env, "POLYMARKET_MARKET_DURATION_MINUTES", 15),
             entry_cutoff_seconds_before_close=_get_int(env, "POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", 60),

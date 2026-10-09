@@ -94,6 +94,19 @@ class OpenPosition:
     # retry-guard against.
     last_exit_attempt_at: datetime | None = None
     last_exit_attempt_edge_points: float | None = None
+    # Snapshot of whatever this bot's entry pipeline actually computed
+    # AT entry time (BTC direction/edge/signals, confidence, Coinbase
+    # freshness, Polymarket bid/ask/spread/liquidity -- see engine.py's
+    # entry path and trade_learning.py, TASK 2) -- None whenever no
+    # same-cycle entry context exists to attach (e.g. a delayed,
+    # stale-adopted fill discovered in a LATER cycle than it was
+    # submitted -- see reconciliation.py's STALE-ENTRY SAFETY NET).
+    # Free-form JSON-serializable dict rather than dedicated fields so
+    # this module never needs to change shape as trade_learning.py's
+    # own needs evolve; "whatever is actually available, never
+    # fabricated" -- this is read, never guessed, at trade-completion
+    # time.
+    entry_context: dict[str, Any] | None = None
 
     @property
     def filled_size_usd(self) -> float:
@@ -121,6 +134,7 @@ class OpenPosition:
                 datetime.fromisoformat(data["last_exit_attempt_at"]) if data.get("last_exit_attempt_at") else None
             ),
             last_exit_attempt_edge_points=data.get("last_exit_attempt_edge_points"),
+            entry_context=data.get("entry_context"),
         )
 
 

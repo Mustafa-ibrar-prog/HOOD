@@ -197,6 +197,7 @@ from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import OpenPosition, PolymarketPositionStore
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
+from src.polymarket.trade_learning import CompletedTradeStore, record_completed_trade
 from src.strategy.evidence import MomentumState
 
 # Same default as src/position_manager/evaluator.py's
@@ -530,6 +531,9 @@ def record_exit_fill(
     state_store: DailyPnlStateStore,
     decision_logger: PolymarketDecisionLogger,
     now: datetime,
+    trade_store: CompletedTradeStore | None = None,
+    exit_btc_state: str | None = None,
+    exit_btc_evidence_score: float | None = None,
 ) -> OpenPosition | None:
     """The ONLY place an exit FillResult mutates the position ledger —
     the exit-side counterpart to reconciliation.record_fill(). Always
@@ -538,6 +542,11 @@ def record_exit_fill(
     but its identity key), so this is safe to call more than once for
     the same fill: a second call finds the position already
     gone/updated and no-ops.
+
+    `trade_store`/`exit_btc_state`/`exit_btc_evidence_score` (see
+    trade_learning.py, TASK 2): only used on a FULL close, where this
+    is genuinely the end of this trade's lifecycle; None by default so
+    every existing call site stays exactly as it was before TASK 2.
 
     Returns the updated (still-open, partially-closed) OpenPosition, or
     None if the position is now fully closed or there was nothing to
@@ -629,6 +638,11 @@ def record_exit_fill(
     )
 
     if fully_closed:
+        record_completed_trade(
+            trade_store, current, exit_timestamp=now, exit_price=fill.avg_fill_price,
+            exit_reason="DYNAMIC_EXIT", fees_usd=entry_fee_for_closed + exit_fee, realized_pnl_usd=realized_pnl,
+            exit_btc_state=exit_btc_state, exit_btc_evidence_score=exit_btc_evidence_score,
+        )
         position_store.remove(current.condition_id)
         return None
 
@@ -653,6 +667,7 @@ def reconcile_exit_fill(
     state_store: DailyPnlStateStore,
     decision_logger: PolymarketDecisionLogger,
     now: datetime | None = None,
+    trade_store: CompletedTradeStore | None = None,
 ) -> OpenPosition | None:
     """The restart-safety sweep for a position whose exit_pending_order_id
     is already set — the exit-side counterpart to
@@ -679,6 +694,7 @@ def reconcile_exit_fill(
     fill = client.get_fill_status(pending.exchange_order_id)
     return record_exit_fill(
         fill, position, position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
+        trade_store=trade_store,
     )
 
 
@@ -693,6 +709,7 @@ def submit_dynamic_exit(
     settings: PolymarketSettings,
     order_placer: PolymarketOrderPlacer | None = None,
     now: datetime | None = None,
+    trade_store: CompletedTradeStore | None = None,
 ) -> OrderResult:
     """Submits the exit order for an ELIGIBLE decision, marks the
     position's exit_pending_order_id BEFORE anything else can observe
@@ -776,11 +793,14 @@ def submit_dynamic_exit(
             )
             return OrderResult(status="failed", request=order, error=str(exc))
 
+    exit_btc_state = decision.btc_assessment.state.value if decision.btc_assessment else None
+    exit_btc_evidence_score = decision.btc_assessment.evidence_score if decision.btc_assessment else None
     if result.status == "simulated_fill":
         assert result.fill_result is not None
         record_exit_fill(
             result.fill_result, position, position_store=position_store, state_store=state_store,
-            decision_logger=decision_logger, now=now,
+            decision_logger=decision_logger, now=now, trade_store=trade_store,
+            exit_btc_state=exit_btc_state, exit_btc_evidence_score=exit_btc_evidence_score,
         )
     elif result.status == "submitted":
         exchange_order_id = (result.extra or {}).get("exchange_order_id")
@@ -788,7 +808,8 @@ def submit_dynamic_exit(
             fill = client.get_fill_status(exchange_order_id)
             record_exit_fill(
                 fill, position, position_store=position_store, state_store=state_store,
-                decision_logger=decision_logger, now=now,
+                decision_logger=decision_logger, now=now, trade_store=trade_store,
+                exit_btc_state=exit_btc_state, exit_btc_evidence_score=exit_btc_evidence_score,
             )
     elif result.status in ("rejected", "failed"):
         # Terminal, no-fill, no-position-change outcomes with nothing
@@ -832,6 +853,7 @@ def check_and_execute_dynamic_exits(
     btc_feed_source: str = "manual",
     skip_client_order_ids: frozenset[str] = frozenset(),
     now: datetime | None = None,
+    trade_store: CompletedTradeStore | None = None,
 ) -> int:
     """One per-cycle pass over every open position — intended to be
     called from engine.run_cycle() right after settle_resolved_positions()
@@ -924,7 +946,7 @@ def check_and_execute_dynamic_exits(
             # its fate; this is never a NEW exit proposal.
             reconcile_exit_fill(
                 current, client=client, pending_store=pending_store, position_store=position_store,
-                state_store=state_store, decision_logger=decision_logger, now=now,
+                state_store=state_store, decision_logger=decision_logger, now=now, trade_store=trade_store,
             )
             continue
 
@@ -1019,6 +1041,7 @@ def check_and_execute_dynamic_exits(
         submit_dynamic_exit(
             decision, client=client, gateway=gateway, position_store=position_store, state_store=state_store,
             decision_logger=decision_logger, settings=settings, order_placer=order_placer, now=now,
+            trade_store=trade_store,
         )
         submitted += 1
 

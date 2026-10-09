@@ -98,6 +98,7 @@ def record_fill(
     state_store: DailyPnlStateStore,
     decision_logger: PolymarketDecisionLogger,
     now: datetime,
+    entry_context: dict | None = None,
 ) -> OpenPosition | None:
     """The ONLY place a FillResult becomes an OpenPosition. Shared by
     reconcile_order() below (real fills, discovered via a fresh exchange
@@ -107,14 +108,19 @@ def record_fill(
     parallel way to create one). Returns the created OpenPosition, or
     None if `fill` isn't a fill (per FillResult.is_fill) or a position
     for this `client_order_id` already existed (add_if_absent's
-    idempotency guard)."""
+    idempotency guard).
+
+    `entry_context` (see positions.OpenPosition and trade_learning.py,
+    TASK 2) is whatever same-cycle entry evidence the caller actually
+    has available -- None (the default) for every existing call site
+    that doesn't pass it, so this stays fully backward compatible."""
     if not fill.is_fill:
         return None
     position = OpenPosition(
         condition_id=order.condition_id, token_id=order.token_id, outcome=order.outcome,
         requested_size_usd=order.size_usd, filled_shares=fill.filled_shares, avg_fill_price=fill.avg_fill_price,
         order_id=fill.order_id, client_order_id=client_order_id, status=fill.status,
-        opened_at=now, close_time=order.close_time,
+        opened_at=now, close_time=order.close_time, entry_context=entry_context,
     )
     created = position_store.add_if_absent(position)  # the secondary idempotency guard
     if not created:
@@ -144,13 +150,23 @@ def reconcile_order(
     state_store: DailyPnlStateStore,
     decision_logger: PolymarketDecisionLogger,
     now: datetime | None = None,
+    entry_context: dict | None = None,
 ) -> FillResult | None:
     """Idempotent: safe to call for the same `pending` any number of
     times, including across a restart (every check here is against
     persisted state, not in-memory flags). Returns the FillResult it
     found, or None if there was genuinely nothing to reconcile yet
     (no exchange_order_id — the order never reached the exchange — or
-    already reconciled)."""
+    already reconciled).
+
+    `entry_context` (see record_fill/trade_learning.py, TASK 2): only
+    engine.py's SAME-CYCLE submit-then-reconcile call site has this to
+    pass (the entry decision that just happened); reconcile_pending_orders()'s
+    restart-safety sweep (a DIFFERENT, later cycle than the one that
+    submitted the order) never has it and passes None — never
+    fabricated after the fact. Either way, `stale_entry_fill` is
+    always set from what THIS call itself determines, regardless of
+    what the caller passed."""
     now = now or datetime.now(timezone.utc)
 
     if pending.fill_reconciled:
@@ -162,10 +178,12 @@ def reconcile_order(
     fill = client.get_fill_status(pending.exchange_order_id)
 
     if fill.is_fill:
-        _log_if_stale_entry_fill(pending, fill, now=now, decision_logger=decision_logger)
+        is_stale = _log_if_stale_entry_fill(pending, fill, now=now, decision_logger=decision_logger)
+        merged_context = {**(entry_context or {}), "stale_entry_fill": is_stale}
         record_fill(
             fill, pending.order, pending.id,
             position_store=position_store, state_store=state_store, decision_logger=decision_logger, now=now,
+            entry_context=merged_context,
         )
     elif fill.status == "unknown":
         # NOT an authoritative determination -- either the status
@@ -253,11 +271,15 @@ def reconcile_pending_orders(
 
 def _log_if_stale_entry_fill(
     pending: PendingLiveOrder, fill: FillResult, *, now: datetime, decision_logger: PolymarketDecisionLogger,
-) -> None:
+) -> bool:
     """See module docstring's STALE-ENTRY SAFETY NET section. Never
     blocks or alters the fill itself -- record_fill() always still
     runs regardless of what this finds; this only makes a stale
-    adoption visible in the decision log rather than silent."""
+    adoption visible in the decision log rather than silent. Returns
+    True iff this fill was stale -- reconcile_order() uses this to tag
+    the resulting position's entry_context (see trade_learning.py,
+    TASK 2) so a stale-adopted entry is never silently learned from as
+    an ordinary strategy prediction."""
     close_time = pending.order.close_time
     if close_time.tzinfo is None:
         close_time = close_time.replace(tzinfo=timezone.utc)
@@ -271,7 +293,7 @@ def _log_if_stale_entry_fill(
     market_closed = now >= close_time
     past_expiry = now > expires_at
     if not (market_closed or past_expiry):
-        return  # the common, healthy case -- resolved while still current; nothing to flag
+        return False  # the common, healthy case -- resolved while still current; nothing to flag
 
     age_seconds = (now - created_at).total_seconds()
     reasons = []
@@ -296,6 +318,7 @@ def _log_if_stale_entry_fill(
             "fill": _fill_to_dict(fill),
         },
     )
+    return True
 
 
 def _fill_to_dict(fill: FillResult) -> dict:
