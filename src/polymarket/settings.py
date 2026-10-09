@@ -64,6 +64,7 @@ true for anything added here.
 
 from __future__ import annotations
 
+import base64
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -391,6 +392,47 @@ class PolymarketSettings:
                     "POLYMARKET_US_KEY_ID and POLYMARKET_US_SECRET_KEY to be set. "
                     "See .env.polymarket.example."
                 )
+            # Verified directly against the installed polymarket_us==2.3.0
+            # package's real auth.create_auth_headers(): it does
+            # `base64.b64decode(secret_key)`, then requires EXACTLY 32
+            # bytes (or 64, truncated to the first 32) before constructing
+            # a nacl.signing.SigningKey -- anything else raises deep inside
+            # the SDK's signer, on the first real signed request, not at
+            # startup. Checked here instead, at config-construction time,
+            # regardless of paper/live (same "fail closed in every mode"
+            # posture as the international venue's private_key 0x-prefix
+            # check above), so a garbled/truncated secret fails loudly and
+            # immediately rather than unpredictably mid-trade.
+            if self.us_secret_key is not None:
+                try:
+                    decoded_len = len(base64.b64decode(self.us_secret_key, validate=True))
+                except Exception as exc:
+                    raise PolymarketConfigError(
+                        "POLYMARKET_US_SECRET_KEY must be valid base64 -- refusing to proceed "
+                        "with a value that cannot be a valid Ed25519 secret key, rather than "
+                        "let it fail unpredictably later inside the SDK's signer."
+                    ) from exc
+                if decoded_len not in (32, 64):
+                    raise PolymarketConfigError(
+                        f"POLYMARKET_US_SECRET_KEY decodes to {decoded_len} bytes; the installed "
+                        "SDK's signer requires exactly 32 (an Ed25519 seed) or 64 (truncated to "
+                        "the first 32) -- refusing a value that would fail unpredictably later "
+                        "inside the SDK's signer instead."
+                    )
+            # The US venue's base URLs are user-overridable (unlike the
+            # international venue's, which the SDK bundles into one fixed
+            # Environment object -- see module docstring); an unset env
+            # var correctly falls back to DEFAULT_US_API_BASE_URL/
+            # DEFAULT_US_GATEWAY_BASE_URL above, but an env var explicitly
+            # set to blank/whitespace (e.g. a leftover placeholder line in
+            # a .env) would otherwise silently become "" and reach the SDK
+            # client construction unchecked -- fail closed on that here
+            # instead of trusting the SDK (or whatever HTTP library it
+            # uses internally) to handle an empty base URL safely.
+            if not self.us_api_base_url:
+                raise PolymarketConfigError("POLYMARKET_US_API_BASE_URL must not be blank")
+            if not self.us_gateway_base_url:
+                raise PolymarketConfigError("POLYMARKET_US_GATEWAY_BASE_URL must not be blank")
 
     @property
     def is_paper(self) -> bool:

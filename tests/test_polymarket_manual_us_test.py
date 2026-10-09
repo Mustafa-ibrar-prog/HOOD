@@ -59,7 +59,16 @@ def _real_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-_LIVE_CREDS = {"POLYMARKET_US_KEY_ID": "test-key-id", "POLYMARKET_US_SECRET_KEY": "dGVzdC1zZWNyZXQ="}
+# The secret key must decode to exactly 32 (or 64) bytes -- settings.py's
+# fail-closed validation now checks this directly against the installed
+# polymarket_us SDK's real signer requirements (see settings.py's
+# POLYMARKET_US_SECRET_KEY check) -- "aaaa...a" (32 raw bytes) base64-encoded,
+# a fake-but-correctly-shaped key, same convention as test_polymarket_settings.py's
+# _VALID_KEY for the international venue's private_key.
+_LIVE_CREDS = {
+    "POLYMARKET_US_KEY_ID": "test-key-id",
+    "POLYMARKET_US_SECRET_KEY": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
+}
 
 
 def _settings(slug: str, **overrides) -> PolymarketSettings:

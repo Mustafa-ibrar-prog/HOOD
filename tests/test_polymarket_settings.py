@@ -5,6 +5,12 @@ import pytest
 from src.polymarket.settings import PolymarketConfigError, PolymarketSettings
 
 _VALID_KEY = "0x" + "a" * 64
+# base64 of 32 raw bytes -- a fake-but-correctly-shaped Ed25519 seed for
+# the US venue, same convention as _VALID_KEY above (verified against the
+# installed polymarket_us SDK's real auth.create_auth_headers(), which
+# requires exactly 32 or 64 decoded bytes -- see settings.py).
+_VALID_US_SECRET = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE="
+_VALID_US_SECRET_64 = "YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYg=="
 
 
 def _env(**overrides: str) -> dict[str, str]:
@@ -103,6 +109,123 @@ def test_full_api_credential_triple_is_accepted():
     assert settings.api_key == "k"
     assert settings.api_secret == "s"
     assert settings.api_passphrase == "p"
+
+
+# --- Fail-closed credential checks, US venue ----------------------------------
+# Polymarket US has NO wallet/private-key concept at all (see settings.py's
+# module docstring) -- these mirror the international venue's own checks
+# above, one for one, so neither venue's credential story can silently drift
+# weaker than the other's.
+
+@pytest.mark.parametrize("partial", [
+    {"POLYMARKET_US_KEY_ID": "k"},
+    {"POLYMARKET_US_SECRET_KEY": _VALID_US_SECRET},
+])
+def test_partial_us_credential_pair_is_rejected(partial):
+    with pytest.raises(PolymarketConfigError, match="all set or all unset"):
+        PolymarketSettings.from_env(env=_env(POLYMARKET_VENUE="us", **partial))
+
+
+def test_live_us_mode_without_credentials_is_rejected():
+    with pytest.raises(PolymarketConfigError, match="POLYMARKET_US_KEY_ID"):
+        PolymarketSettings.from_env(env=_env(POLYMARKET_VENUE="us", POLYMARKET_TRADING_MODE="live"))
+
+
+def test_live_us_mode_with_credentials_is_accepted():
+    settings = PolymarketSettings.from_env(env=_env(
+        POLYMARKET_VENUE="us", POLYMARKET_TRADING_MODE="live",
+        POLYMARKET_US_KEY_ID="key-1", POLYMARKET_US_SECRET_KEY=_VALID_US_SECRET,
+    ))
+    assert settings.is_live
+    assert settings.us_key_id == "key-1"
+    assert settings.us_secret_key == _VALID_US_SECRET
+
+
+def test_paper_us_mode_does_not_require_credentials():
+    settings = PolymarketSettings.from_env(env=_env(POLYMARKET_VENUE="us", POLYMARKET_TRADING_MODE="paper"))
+    assert settings.us_key_id is None
+    assert settings.us_secret_key is None  # no error -- paper mode never signs anything
+
+
+def test_us_secret_key_must_be_valid_base64():
+    with pytest.raises(PolymarketConfigError, match="base64"):
+        PolymarketSettings.from_env(env=_env(
+            POLYMARKET_VENUE="us", POLYMARKET_US_KEY_ID="k", POLYMARKET_US_SECRET_KEY="not-valid-base64!!!",
+        ))
+
+
+@pytest.mark.parametrize("bad_secret", [
+    "c2hvcnQ=",  # valid base64, decodes to 5 bytes -- not 32 or 64
+    "YQ==",      # valid base64, decodes to 1 byte
+])
+def test_us_secret_key_wrong_decoded_length_is_rejected(bad_secret):
+    with pytest.raises(PolymarketConfigError, match="decodes to"):
+        PolymarketSettings.from_env(env=_env(
+            POLYMARKET_VENUE="us", POLYMARKET_US_KEY_ID="k", POLYMARKET_US_SECRET_KEY=bad_secret,
+        ))
+
+
+@pytest.mark.parametrize("good_secret", [_VALID_US_SECRET, _VALID_US_SECRET_64])
+def test_us_secret_key_correct_decoded_length_is_accepted(good_secret):
+    settings = PolymarketSettings.from_env(env=_env(
+        POLYMARKET_VENUE="us", POLYMARKET_US_KEY_ID="k", POLYMARKET_US_SECRET_KEY=good_secret,
+    ))
+    assert settings.us_secret_key == good_secret
+
+
+@pytest.mark.parametrize("key", ["POLYMARKET_US_API_BASE_URL", "POLYMARKET_US_GATEWAY_BASE_URL"])
+def test_blank_us_base_url_is_rejected(key):
+    """An env var explicitly set to blank (e.g. a leftover placeholder
+    line in a .env) must fail closed, not silently become an empty
+    string that reaches SDK client construction unchecked."""
+    with pytest.raises(PolymarketConfigError, match="must not be blank"):
+        PolymarketSettings.from_env(env=_env(POLYMARKET_VENUE="us", **{key: "   "}))
+
+
+def test_unset_us_base_urls_use_the_real_production_defaults():
+    """Unset (never blanked) is the normal, safe case -- distinct from
+    the blank-string rejection above."""
+    settings = PolymarketSettings.from_env(env=_env())
+    assert settings.us_api_base_url == "https://api.polymarket.us"
+    assert settings.us_gateway_base_url == "https://gateway.polymarket.us"
+
+
+# --- Venue dispatch: no fallback to another venue or to wallet auth ----------
+
+def test_get_polymarket_client_dispatches_us_venue_to_the_us_client():
+    from src.polymarket.client import get_polymarket_client
+    from src.polymarket.us_client import PolymarketUSClient
+
+    settings = PolymarketSettings.from_env(env=_env(
+        POLYMARKET_VENUE="us", POLYMARKET_US_KEY_ID="k", POLYMARKET_US_SECRET_KEY=_VALID_US_SECRET,
+    ))
+    client = get_polymarket_client(settings)
+    assert isinstance(client, PolymarketUSClient)
+
+
+def test_get_polymarket_client_defaults_to_the_international_client():
+    from src.polymarket.client import PolymarketClient, get_polymarket_client
+
+    settings = PolymarketSettings.from_env(env=_env())  # POLYMARKET_VENUE unset
+    client = get_polymarket_client(settings)
+    assert isinstance(client, PolymarketClient)
+
+
+def test_us_venue_dispatch_is_unaffected_by_a_stray_international_private_key():
+    """Proves there is no "fall back to whichever credentials happen to
+    be set" behavior: venue=us dispatches to PolymarketUSClient even
+    when an international-venue private_key is ALSO present (e.g. a
+    leftover from switching venues in the same .env) -- venue selection
+    is driven only by POLYMARKET_VENUE, never by credential presence."""
+    from src.polymarket.client import get_polymarket_client
+    from src.polymarket.us_client import PolymarketUSClient
+
+    settings = PolymarketSettings.from_env(env=_env(
+        POLYMARKET_VENUE="us", POLYMARKET_US_KEY_ID="k", POLYMARKET_US_SECRET_KEY=_VALID_US_SECRET,
+        POLYMARKET_PRIVATE_KEY=_VALID_KEY,
+    ))
+    client = get_polymarket_client(settings)
+    assert isinstance(client, PolymarketUSClient)
 
 
 # --- Automatic profit-target exit settings ------------------------------------

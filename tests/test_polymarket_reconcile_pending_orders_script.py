@@ -22,7 +22,10 @@ from tests.test_polymarket_us_client import _FakeOrders, _FakeSDKClient, _NotFou
 
 def _env(tmp_path, **overrides):
     env = {
-        "POLYMARKET_VENUE": "us", "POLYMARKET_US_KEY_ID": "test-key", "POLYMARKET_US_SECRET_KEY": "dGVzdA==",
+        # Must decode to exactly 32 (or 64) bytes -- see settings.py's
+        # fail-closed POLYMARKET_US_SECRET_KEY check.
+        "POLYMARKET_VENUE": "us", "POLYMARKET_US_KEY_ID": "test-key",
+        "POLYMARKET_US_SECRET_KEY": "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
         "POLYMARKET_PENDING_ORDERS_FILE": str(tmp_path / "pending.json"),
         "POLYMARKET_POSITIONS_FILE": str(tmp_path / "positions.json"),
         "POLYMARKET_DAILY_PNL_FILE": str(tmp_path / "pnl.json"),

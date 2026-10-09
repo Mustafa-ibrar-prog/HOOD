@@ -152,12 +152,15 @@ def _harness(tmp_path: Path, *, settings: PolymarketSettings | None = None):
     )
 
 
-def _live_harness(tmp_path: Path, *, auto_exit_enabled: bool = True, dynamic_exit_enabled: bool = True):
+def _live_harness(
+    tmp_path: Path, *, auto_exit_enabled: bool = True, dynamic_exit_enabled: bool = True, live_auto_execute: bool = False,
+):
     settings = _settings(
         POLYMARKET_TRADING_MODE="live", POLYMARKET_PRIVATE_KEY=_VALID_KEY,
         POLYMARKET_LIVE_TRADING_CONFIRMED="true",
         POLYMARKET_AUTO_EXIT_ENABLED="true" if auto_exit_enabled else "false",
         POLYMARKET_DYNAMIC_EXIT_ENABLED="true" if dynamic_exit_enabled else "false",
+        POLYMARKET_LIVE_AUTO_EXECUTE="true" if live_auto_execute else "false",
     )
     harness = _harness(tmp_path, settings=settings)
     emergency_stop_store = EmergencyStopStore(tmp_path / "estop.json")
@@ -640,6 +643,104 @@ def test_emergency_stop_blocks_an_automatic_exit_from_reaching_the_exchange(tmp_
     assert harness["client"].place_order_calls == []
     positions = harness["position_store"].load()
     assert positions[0].exit_pending_order_id is None  # cleared -- retryable once the stop lifts
+
+
+# --- live_auto_execute / auto_exit_enabled interaction -------------------------
+# Traced directly from gateway.py/exit_manager.py's source (not just the
+# docstrings): LivePolymarketGateway.submit_order() checks settings.
+# live_auto_execute FIRST, for EVERY order it submits, entry or exit alike.
+# auto_exit_enabled is a SEPARATE flag submit_dynamic_exit() itself checks,
+# but only AFTER gateway.submit_order() has already returned --  and only
+# if that result was "awaiting_approval". Consequence: if live_auto_execute
+# is True, every order (including an exit) submits immediately and
+# auto_exit_enabled is never even consulted. The reverse is representable
+# (entries manual, exits automatic, via auto_exit_enabled=True with
+# live_auto_execute=False -- already exercised by every _live_harness-based
+# fill test above, whose default is exactly that combination), but there is
+# NO configuration that makes entries automatic while keeping exits manual.
+
+def test_live_auto_execute_true_submits_the_exit_immediately_even_with_auto_exit_enabled_false(tmp_path):
+    """The one genuinely surprising case: auto_exit_enabled=False does NOT
+    force manual confirmation on an exit when live_auto_execute=True --
+    that flag is checked first and wins, for every order."""
+    harness = _live_harness(tmp_path, auto_exit_enabled=False, live_auto_execute=True)
+    assert harness["settings"].live_auto_execute is True
+    assert harness["settings"].auto_exit_enabled is False
+    position = _position(avg_fill_price=0.36, filled_shares=5.0)
+    harness["position_store"].add_if_absent(position)
+    book = _book(bids=(BookLevel(price=0.50, size=100.0),))
+    harness["client"].set_order_book("tok-1", book)
+    harness["client"].set_place_outcome(SubmissionOutcome(ok=True, exchange_order_id="exit-auto-1", raw_status="matched"))
+    harness["client"].set_fill_result("exit-auto-1", FillResult(
+        order_id="exit-auto-1", status="filled", requested_shares=5.0, filled_shares=5.0, avg_fill_price=0.50,
+    ))
+    decision = evaluate_dynamic_exit(
+        position, book, _assessment(MomentumState.REVERSING, signal_count=5), profit_target_pct=0.20,
+    )
+    assert decision.eligible is True
+
+    result = submit_dynamic_exit(
+        decision, client=harness["client"], gateway=harness["gateway"], position_store=harness["position_store"],
+        state_store=harness["state_store"], decision_logger=harness["decision_logger"], settings=harness["settings"],
+        order_placer=harness["client"],
+    )
+
+    assert result.status == "submitted"  # never stopped at awaiting_approval, despite auto_exit_enabled=False
+    assert len(harness["client"].place_order_calls) == 1  # reached the exchange immediately
+    assert harness["position_store"].load() == []  # reconciled synchronously
+
+
+def test_awaiting_approval_exit_is_pushed_through_only_by_an_explicit_confirm_and_place_call(tmp_path):
+    """The "B: manual confirmation" lifecycle (live_auto_execute=False,
+    auto_exit_enabled=False): submit_dynamic_exit() stops the exit at
+    awaiting_approval -- nothing reaches the exchange yet -- and only a
+    SEPARATE, explicit gateway.confirm_and_place() call (what
+    scripts/confirm_pending_order.py and scripts/confirm_polymarket_order.py
+    do, generically, for either side -- see gateway.py's module docstring)
+    pushes it through, after which the normal reconcile_exit_fill() sweep
+    closes the position exactly as it would for an entry."""
+    harness = _live_harness(tmp_path, auto_exit_enabled=False, live_auto_execute=False)
+    assert harness["settings"].live_auto_execute is False
+    assert harness["settings"].auto_exit_enabled is False
+    position = _position(avg_fill_price=0.36, filled_shares=5.0)
+    harness["position_store"].add_if_absent(position)
+    book = _book(bids=(BookLevel(price=0.50, size=100.0),))
+    harness["client"].set_order_book("tok-1", book)
+    decision = evaluate_dynamic_exit(
+        position, book, _assessment(MomentumState.REVERSING, signal_count=5), profit_target_pct=0.20,
+    )
+    assert decision.eligible is True
+
+    result = submit_dynamic_exit(
+        decision, client=harness["client"], gateway=harness["gateway"], position_store=harness["position_store"],
+        state_store=harness["state_store"], decision_logger=harness["decision_logger"], settings=harness["settings"],
+        order_placer=harness["client"],
+    )
+    assert result.status == "awaiting_approval"
+    assert harness["client"].place_order_calls == []  # nothing reached the exchange yet
+    pending_order_id = result.extra["pending_order_id"]
+    pending_position = harness["position_store"].get(position.client_order_id)
+    assert pending_position.exit_pending_order_id == pending_order_id
+
+    harness["client"].set_place_outcome(SubmissionOutcome(ok=True, exchange_order_id="exit-manual-1", raw_status="matched"))
+    harness["client"].set_fill_result("exit-manual-1", FillResult(
+        order_id="exit-manual-1", status="filled", requested_shares=5.0, filled_shares=5.0, avg_fill_price=0.50,
+    ))
+
+    # The human confirmation step.
+    confirmed = harness["gateway"].confirm_and_place(
+        pending_order_id, harness["client"], approved_by="human:test-operator",
+    )
+    assert confirmed.status == "submitted"
+    assert len(harness["client"].place_order_calls) == 1  # reached the exchange only now, on explicit approval
+
+    reconciled = reconcile_exit_fill(
+        pending_position, client=harness["client"], pending_store=harness["pending_store"],
+        position_store=harness["position_store"], state_store=harness["state_store"],
+        decision_logger=harness["decision_logger"],
+    )
+    assert reconciled is None  # fully closed
+    assert harness["position_store"].load() == []
 
 
 # --- Fee-aware NET realized P&L (record_exit_fill, unit-level, unchanged) ----
