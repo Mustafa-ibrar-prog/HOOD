@@ -189,11 +189,13 @@ def test_get_execution_gateway_returns_paper_after_phase42(tmp_path):
 
 
 def test_env_file_untouched_by_phase42():
-    env_path = REPO_ROOT / ".env"
-    if env_path.is_file():
-        content = env_path.read_text()
-        assert "TRADING_MODE=paper" in content
-        assert "LIVE_TRADING_CONFIRMED=false" in content
+    """Checks the repo-tracked .env.example template, not a real .env --
+    a developer's real .env is their own live config and isn't something
+    "this phase" controls or should ever be asserted against."""
+    env_path = REPO_ROOT / ".env.example"
+    content = env_path.read_text()
+    assert "TRADING_MODE=paper" in content
+    assert "LIVE_TRADING_CONFIRMED=false" in content
 
 
 def test_no_credential_shaped_string_literal_in_any_phase42_file():

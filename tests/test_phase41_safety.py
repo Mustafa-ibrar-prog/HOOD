@@ -242,11 +242,13 @@ def test_paper_status_values_still_disjoint_from_production_system_state_values(
 
 
 def test_env_file_untouched_by_this_phase():
-    env_path = REPO_ROOT / ".env"
-    if env_path.is_file():
-        content = env_path.read_text()
-        assert "TRADING_MODE=paper" in content
-        assert "LIVE_TRADING_CONFIRMED=false" in content
+    """Checks the repo-tracked .env.example template, not a real .env --
+    a developer's real .env is their own live config and isn't something
+    "this phase" controls or should ever be asserted against."""
+    env_path = REPO_ROOT / ".env.example"
+    content = env_path.read_text()
+    assert "TRADING_MODE=paper" in content
+    assert "LIVE_TRADING_CONFIRMED=false" in content
 
 
 def test_no_credential_shaped_string_literal_in_any_phase41_file():

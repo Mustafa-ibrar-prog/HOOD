@@ -50,9 +50,15 @@ def compute_forecast_error(forecast: Sequence[float | None], realized: Sequence[
     mean_error = mean(errors)
     mae = mean([abs(e) for e in errors])
     rmse = mean([e * e for e in errors]) ** 0.5
-    if mean_error > bias_threshold:
+    # >= / <= (not strict >/<): mean_error lands exactly on the threshold
+    # for round-number fixtures (e.g. forecast double realized), and
+    # whether summation puts it a hair above or exactly on bias_threshold
+    # depends on Python's sum() implementation (3.12+ uses compensated
+    # summation and lands exactly on it; 3.11 and earlier overshoot by
+    # ~1e-17) -- the classification must not depend on that.
+    if mean_error >= bias_threshold:
         bias = "OVERESTIMATES"
-    elif mean_error < -bias_threshold:
+    elif mean_error <= -bias_threshold:
         bias = "UNDERESTIMATES"
     else:
         bias = "UNBIASED"
