@@ -501,6 +501,38 @@ def test_live_existing_pending_order_blocks_the_preflight(tmp_path, capsys):
     assert sdk.orders.create_calls == []
 
 
+def test_expired_pending_order_does_not_block_the_preflight(tmp_path, capsys):
+    """An awaiting_approval record whose expires_at has already passed
+    is historical, not a live conflict -- it must NOT block a new
+    attempt, and must be normalized to a terminal "expired" status in
+    the ledger (never silently dropped) via the existing
+    PolymarketPendingOrderStore.list_awaiting_approval/expire_stale
+    reconciliation transition."""
+    slug = "manual-test-live-expired-pending"
+    sdk = _happy_sdk(slug)
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+    prior_order = OrderRequest(
+        condition_id="some-other-market", token_id="some-other-market", outcome="YES", side="BUY",
+        size_usd=5.0, max_price=0.55, close_time=_real_now() + timedelta(minutes=5), reason="prior test",
+    )
+    expired_pending = PendingLiveOrder.new(order=prior_order, expiry_seconds=-600)  # expired 10 minutes ago
+    stores["pending_store"].add(expired_pending)
+
+    rc = _run(settings, client, stores, confirm_live=False)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "PENDING ORDERS: 0" in out
+    assert "READY FOR FIRST $5 LIVE TEST: YES" in out
+    assert sdk.orders.create_calls == []  # preflight only -- nothing submitted either way
+    ledger_entry = stores["pending_store"].get(expired_pending.id)
+    assert ledger_entry.status == "expired"  # normalized, not deleted
+
+
 def test_low_priced_contract_with_a_tiny_absolute_spread_now_passes_the_preflight(tmp_path, capsys):
     """The real live scenario that motivated risk.py's check_spread()
     redesign: best_bid=0.06 best_ask=0.07 is only a 1-cent ABSOLUTE

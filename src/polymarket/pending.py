@@ -6,7 +6,7 @@ pending order be forgotten and re-proposed)."""
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.polymarket.models import PendingLiveOrder
@@ -56,7 +56,21 @@ class PolymarketPendingOrderStore:
                 return
         raise PolymarketPendingOrderStoreError(f"No pending order {pending.id!r} to update — it was never added")
 
-    def list_awaiting_approval(self) -> list[PendingLiveOrder]:
+    def list_awaiting_approval(self, now: datetime | None = None) -> list[PendingLiveOrder]:
+        """The single, actionable definition of "a pending order that
+        still needs a human decision": status == "awaiting_approval" AND
+        not yet expired. A record that's still marked awaiting_approval
+        but whose expires_at has passed is NOT actionable -- it's
+        history, left behind because nothing happened to swept it yet.
+
+        Normalizes any such stale record to the terminal "expired"
+        status FIRST, via the existing expire_stale() state transition
+        (persisted to the ledger, never silently dropped), so a caller
+        asking "is there anything I need to act on" never has to
+        separately reason about expiry itself, and the ledger reflects
+        reality on every call, not just after an explicit sweep."""
+        now = now or datetime.now(timezone.utc)
+        self.expire_stale(now)
         return [o for o in self.load() if o.status == "awaiting_approval"]
 
     def expire_stale(self, now: datetime) -> list[PendingLiveOrder]:

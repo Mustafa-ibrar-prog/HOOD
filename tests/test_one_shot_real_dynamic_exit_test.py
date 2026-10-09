@@ -180,6 +180,42 @@ def test_refuses_when_a_pending_order_is_already_awaiting_approval(tmp_path, mon
     assert sdk.orders.create_calls == []
 
 
+def test_expired_pending_order_does_not_block_a_new_entry(tmp_path, monkeypatch, capsys):
+    """An awaiting_approval record whose expires_at has already passed
+    is historical, not a live conflict (the real bug this test
+    guards): the one-shot preflight must proceed, and the stale record
+    must be normalized to a terminal "expired" status in the ledger
+    (never silently dropped)."""
+    from src.polymarket.models import OrderRequest, PendingLiveOrder
+
+    slug = "one-shot-expired-pending"
+    _patch_coinbase_fake_candles(monkeypatch)
+    sdk = _sdk_with_entry_fill(slug)
+    settings = _settings(slug)
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+    order = OrderRequest(
+        condition_id="some-other-market", token_id="some-other-market", outcome="YES", side="BUY", size_usd=5.0,
+        max_price=0.65, close_time=_real_now() + timedelta(minutes=5), reason="other",
+    )
+    expired_pending = PendingLiveOrder.new(order=order, expiry_seconds=-600)  # expired 10 minutes ago
+    stores["pending_store"].add(expired_pending)
+
+    rc = one_shot.run_one_shot_test(
+        settings=settings, client=client, outcome="YES", amount=5.0, max_price=0.65, confirm_live=True,
+        decision_logger=stores["decision_logger"], state_store=stores["state_store"],
+        position_store=stores["position_store"], pending_store=stores["pending_store"],
+        emergency_stop_store=stores["emergency_stop_store"],
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "already awaiting approval" not in out
+    assert "ENTRY CONFIRMED FILLED" in out
+    ledger_entry = stores["pending_store"].get(expired_pending.id)
+    assert ledger_entry.status == "expired"  # normalized, not deleted
+
+
 # --- Preflight-only: nothing submitted ----------------------------------------
 
 def test_preflight_only_run_submits_nothing(tmp_path, monkeypatch, capsys):

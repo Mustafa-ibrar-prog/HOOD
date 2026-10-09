@@ -173,7 +173,12 @@ def run_one_shot_test(
     if position_store.load():
         print("REFUSING: an open position already exists -- this is a one-position test, not an averaging tool.")
         return 1
-    if [p for p in pending_store.load() if p.status == "awaiting_approval"]:
+    # Actionable only -- status == "awaiting_approval" AND not yet
+    # expired; an expired-but-unswept historical record is never a live
+    # conflict (see PolymarketPendingOrderStore.list_awaiting_approval,
+    # which also normalizes it to a terminal "expired" status here, via
+    # the existing expire_stale() reconciliation transition).
+    if pending_store.list_awaiting_approval(now):
         print("REFUSING: a pending order is already awaiting approval -- resolve it first.")
         return 1
 

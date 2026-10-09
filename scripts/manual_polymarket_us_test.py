@@ -233,7 +233,10 @@ def run_manual_test(
     # --- LIVE MODE: consolidated preflight, then an explicit second step ------
     stopped = emergency_stop_store.is_stopped()
     open_positions = position_store.load()
-    conflicting_pending = [p for p in pending_store.load() if p.status == "awaiting_approval"]
+    # Actionable only -- status == "awaiting_approval" AND not yet
+    # expired; an expired-but-unswept record is history, not a live
+    # conflict (see PolymarketPendingOrderStore.list_awaiting_approval).
+    conflicting_pending = pending_store.list_awaiting_approval(now)
     live_confirmed = settings.live_trading_confirmed  # settings.is_live is already true here
 
     entry_cutoff_ok = _risk_result(decision, "ENTRY_CUTOFF").passed
