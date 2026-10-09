@@ -101,6 +101,7 @@ def test_no_order_book_or_trade_direction_code_exists_anywhere_in_src_or_scripts
         REPO_ROOT / "scripts" / "dynamic_exit_smoke_test.py",
         REPO_ROOT / "scripts" / "dynamic_exit_shadow.py",
         REPO_ROOT / "scripts" / "one_shot_real_dynamic_exit_test.py",
+        REPO_ROOT / "scripts" / "diagnose_market_book_lookup.py",
     }
     exempt_dirs = {REPO_ROOT / "src" / "polymarket"}
     for directory in ("src", "scripts"):

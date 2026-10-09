@@ -678,6 +678,43 @@ def test_automatic_discovery_extracts_the_nested_market_slug_never_synthesizes_i
     assert markets.retrieve_by_slug_calls == []  # never even calls markets.retrieve_by_slug() in this path
 
 
+def test_automatic_discovery_then_a_separate_explicit_book_call_use_the_same_real_slug(tmp_path):
+    """Regression for the exact call sequence scripts/manual_polymarket_us_test.py
+    and scripts/one_shot_real_dynamic_exit_test.py both make: automatic
+    discovery (find_active_btc_market(), which itself calls get_order_book()
+    ONCE internally, swallowed, just to populate BinaryMarket.yes_bid/
+    yes_ask), followed by a SEPARATE, explicit client.get_order_book(
+    market.token_id_yes) call -- the one whose real NotFoundError this
+    test guards against ever being caused by a slug MISMATCH between the
+    two calls. Both must resolve to the exact same real nested market
+    slug, read verbatim from event["markets"][0]["slug"], never the event
+    slug and never a synthesized value."""
+    event_slug = "btc-updown-15m-2026-10-09-0645z"
+    window_start = datetime(2026, 10, 9, 6, 45, tzinfo=timezone.utc)
+    window_end = datetime(2026, 10, 9, 7, 0, tzinfo=timezone.utc)
+    real_nested_market_slug = "cpc-btc-updown-15m-2026-10-09-0645z"
+    event = _event(slug=event_slug, start=window_start, end=window_end, market_slug=real_nested_market_slug)
+    book = _book_response([_book_level("0.54", 100)], [_book_level("0.55", 100)])
+    markets = _FakeMarkets(books={real_nested_market_slug: book})
+    sdk = _FakeSDKClient(markets=markets, events=_FakeEvents({event_slug: {"event": event}}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)  # no override -- automatic discovery
+
+    market = client.find_active_btc_market(now=datetime(2026, 10, 9, 6, 46, 34, tzinfo=timezone.utc))
+    assert market.token_id_yes == real_nested_market_slug
+
+    # The separate, explicit call -- exactly what run_manual_test()/
+    # run_one_shot_test() do right after discovery.
+    order_book = client.get_order_book(market.token_id_yes)
+
+    assert order_book.best_bid == 0.54
+    assert order_book.best_ask == 0.55
+    # Called markets.book() exactly twice with the IDENTICAL real nested
+    # slug: once inside find_active_btc_market() itself (swallowed), once
+    # from this test's own separate call -- never the event slug, never
+    # two DIFFERENT values.
+    assert markets.book_calls == [real_nested_market_slug, real_nested_market_slug]
+
+
 # --- 3. Outcome identifiers ----------------------------------------------------
 
 def test_outcome_identifiers_are_the_same_slug_for_both_sides(tmp_path):
