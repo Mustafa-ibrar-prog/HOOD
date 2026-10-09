@@ -46,7 +46,7 @@ btc_market_data.py — there is no live BTC feed wired in by default),
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Sequence
 
@@ -62,10 +62,29 @@ from src.market.indicators import (
     rsi,
 )
 from src.market.models import PriceBar
+from src.polymarket.btc_market_data import BtcFeedStatus, compute_feed_status
 from src.polymarket.models import OrderBookSnapshot, Signal
 from src.strategy.evidence import MomentumAssessment, MomentumEvidence, MomentumState, evaluate_momentum
 
 _OUTCOME_TO_DIRECTION = {"YES": "bullish", "NO": "bearish"}
+
+# The DEFAULT warm-up requirement (macd_slow=26 + macd_signal=9) with
+# build_btc_momentum_evidence's own default periods -- exported so a
+# caller that needs this number BEFORE any bars exist (bootstrap_btc_price_history,
+# run_polymarket_bot.py) can request "enough for a real assessment"
+# without duplicating the arithmetic. build_btc_momentum_evidence
+# itself never reads this constant -- it always computes the same
+# figure fresh from whatever macd_slow/macd_signal it was actually
+# called with, so overriding those periods there still works correctly
+# even though this constant wouldn't reflect the override.
+DEFAULT_MIN_BARS_FOR_INDICATORS = 35
+
+# The default staleness threshold, kept in sync with (and normally
+# overridden by) settings.btc_max_bar_age_seconds -- see that field's
+# own docstring in settings.py for the full reasoning. This module-level
+# default exists only so assess_btc_market() has a sane value when
+# called without threading settings through (e.g. in tests).
+DEFAULT_MAX_BAR_AGE_SECONDS = 300.0
 
 
 def thesis_direction_for_outcome(outcome: str) -> str:
@@ -311,12 +330,29 @@ class BtcMarketAssessment:
     """The "one structured BTC market assessment" — state plus a
     numerical evidence score plus every individual signal that
     produced it, BTC and Polymarket microstructure alike, uniformly
-    represented. See module docstring for the combination rule."""
+    represented. See module docstring for the combination rule.
+
+    `feed_status` is the answer to "was the BTC data behind `state`
+    actually fresh" — see btc_market_data.compute_feed_status. A
+    STALE or UNAVAILABLE status means `state` is guaranteed to be
+    INSUFFICIENT_DATA (the bars were never even handed to
+    build_btc_momentum_evidence — see assess_btc_market below); this
+    field exists so exit_manager.py can log exactly WHY (dead feed vs.
+    genuinely insufficient history) rather than just the end result."""
 
     state: MomentumState
     evidence_score: int  # weakening_score - strengthening_score from the BTC evaluate_momentum() call; positive = net weakening/reversing
     btc_assessment: MomentumAssessment  # the raw evaluate_momentum() output (weakening_score/strengthening_score/fired signal names)
     signals: tuple[Signal, ...]  # every Signal, BTC + Polymarket microstructure
+    # Defaults to a synthetic "FRESH, unknown source" status so tests
+    # that construct a BtcMarketAssessment directly (to isolate the
+    # evaluate_dynamic_exit cascade from this module's own bar-aggregation/
+    # staleness logic -- see tests/test_polymarket_exit_manager.py's
+    # _assessment() helper) don't need to care about it. assess_btc_market()
+    # ALWAYS passes a real, computed one explicitly.
+    feed_status: BtcFeedStatus = field(default_factory=lambda: BtcFeedStatus(
+        source=None, last_bar_time=None, bar_age_seconds=None, status="FRESH",
+    ))
 
     @property
     def signal_count(self) -> int:
@@ -330,19 +366,40 @@ def assess_btc_market(
     *,
     outcome: str,
     now: datetime | None = None,
+    max_bar_age_seconds: float = DEFAULT_MAX_BAR_AGE_SECONDS,
+    feed_source: str = "manual",
     **evidence_kwargs,
 ) -> BtcMarketAssessment:
     """The single entry point check_and_execute_dynamic_exits() (see
-    exit_manager.py) calls once per open position per cycle. `now` is
-    only used for timestamping the Polymarket microstructure signals
-    and the BTC-signal wrapper (use the latest bar's own start_time
-    when bars are present, so the assessment doesn't silently claim to
-    be "as of now" when its real BTC evidence is actually older)."""
+    exit_manager.py) calls once per open position per cycle.
+
+    STALE-FEED SAFETY: before anything else, this checks whether the
+    NEWEST available bar (if any) is within `max_bar_age_seconds` of
+    `now` (see btc_market_data.compute_feed_status). If it is not —
+    the feed is STALE (bars exist but stopped updating) or UNAVAILABLE
+    (no bars at all) — `bars` is NEVER handed to
+    build_btc_momentum_evidence(); an empty sequence is used instead,
+    guaranteeing `state == INSUFFICIENT_DATA` exactly as if nothing had
+    ever been fed. This is what makes a feed that goes silent AFTER
+    building real history behave identically to a feed that was never
+    wired up at all, rather than freezing on whatever evidence it last
+    saw (see btc_market_data.py's and settings.py's module docstrings
+    for why this matters).
+
+    `now` is also used for timestamping the Polymarket microstructure
+    signals and the BTC-signal wrapper (use the latest USABLE bar's
+    own start_time when one exists, so the assessment doesn't silently
+    claim to be "as of now" when its real BTC evidence is actually
+    older)."""
+    now = now or datetime.now(timezone.utc)
+    feed_status = compute_feed_status(list(bars), max_bar_age_seconds=max_bar_age_seconds, source=feed_source, now=now)
+    usable_bars = bars if feed_status.status == "FRESH" else []
+
     thesis_direction = thesis_direction_for_outcome(outcome)
-    evidence = build_btc_momentum_evidence(bars, thesis_direction=thesis_direction, **evidence_kwargs)
+    evidence = build_btc_momentum_evidence(usable_bars, thesis_direction=thesis_direction, **evidence_kwargs)
     assessment = evaluate_momentum(evidence)
 
-    signal_time = bars[-1].start_time if bars else (now or datetime.now(timezone.utc))
+    signal_time = usable_bars[-1].start_time if usable_bars else now
     btc_signals = _wrap_btc_signals(evidence, at=signal_time)
     microstructure_signals = assess_polymarket_microstructure(order_book, recent_mids, outcome=outcome, now=now)
 
@@ -351,4 +408,5 @@ def assess_btc_market(
         evidence_score=assessment.weakening_score - assessment.strengthening_score,
         btc_assessment=assessment,
         signals=btc_signals + microstructure_signals,
+        feed_status=feed_status,
     )

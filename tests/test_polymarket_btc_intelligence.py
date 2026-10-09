@@ -217,3 +217,59 @@ def test_assessment_embeds_the_raw_btc_assessment_for_full_detail():
     assessment = assess_btc_market(bars, book, [], outcome="YES", now=_BASE)
     assert assessment.btc_assessment.state == assessment.state
     assert assessment.signal_count == len(assessment.btc_assessment.signals)
+
+
+# --- Stale-feed safety: assess_btc_market()'s max_bar_age_seconds gate -------
+
+def test_fresh_bars_within_threshold_use_real_evidence():
+    bars = _bars([100.0 + i * 0.3 for i in range(40)])
+    now = bars[-1].start_time + timedelta(seconds=30)  # well within a 300s threshold
+    book = _book()
+    assessment = assess_btc_market(bars, book, [], outcome="YES", now=now, max_bar_age_seconds=300)
+    assert assessment.feed_status.status == "FRESH"
+    assert assessment.state != MomentumState.INSUFFICIENT_DATA
+
+
+def test_stale_bars_force_insufficient_data_despite_plenty_of_history():
+    """A feed that built real history and then went silent must behave
+    IDENTICALLY to a feed that was never fed at all -- never keep
+    deciding from old data forever."""
+    bars = _bars([100.0 + i * 0.3 for i in range(40)])  # 40 bars -- otherwise easily enough for a real read
+    now = bars[-1].start_time + timedelta(seconds=301)  # just past a 300s threshold
+    book = _book()
+    assessment = assess_btc_market(bars, book, [], outcome="YES", now=now, max_bar_age_seconds=300)
+    assert assessment.feed_status.status == "STALE"
+    assert assessment.state == MomentumState.INSUFFICIENT_DATA
+
+
+def test_no_bars_at_all_is_unavailable_not_stale():
+    now = _BASE
+    assessment = assess_btc_market([], _book(), [], outcome="YES", now=now, max_bar_age_seconds=300)
+    assert assessment.feed_status.status == "UNAVAILABLE"
+    assert assessment.state == MomentumState.INSUFFICIENT_DATA
+
+
+def test_feed_status_source_label_is_threaded_through():
+    bars = _bars([100.0 + i * 0.3 for i in range(40)])
+    now = bars[-1].start_time + timedelta(seconds=30)
+    assessment = assess_btc_market(bars, _book(), [], outcome="YES", now=now, feed_source="coinbase")
+    assert assessment.feed_status.source == "coinbase"
+
+
+def test_same_stale_rule_applies_after_a_simulated_restart():
+    """Restart-safety at the assessment level: the SAME bars, read by
+    a fresh call (standing in for a brand-new process after a
+    restart), are judged purely by real elapsed time vs. the bar's own
+    timestamp -- never by anything cached in memory. A restart does
+    not "refresh" staleness; only new, real data does."""
+    bars = _bars([100.0 + i * 0.3 for i in range(40)])
+    fresh_now = bars[-1].start_time + timedelta(seconds=10)
+    stale_now = bars[-1].start_time + timedelta(hours=2)  # the "restart" happens long after the feed died
+    book = _book()
+
+    fresh_assessment = assess_btc_market(bars, book, [], outcome="YES", now=fresh_now, max_bar_age_seconds=300)
+    restarted_assessment = assess_btc_market(bars, book, [], outcome="YES", now=stale_now, max_bar_age_seconds=300)
+
+    assert fresh_assessment.feed_status.status == "FRESH"
+    assert restarted_assessment.feed_status.status == "STALE"
+    assert restarted_assessment.state == MomentumState.INSUFFICIENT_DATA

@@ -237,6 +237,20 @@ class PolymarketSettings:
     # structure within a 15-minute market, coarse enough that a handful
     # of fed quotes per minute is enough to form a real bar.
     btc_bar_interval_seconds: int
+    # The maximum age (seconds) of the NEWEST available BTC bar before
+    # it is treated as equivalent to "no data at all" — a dead feed
+    # must become INSUFFICIENT_DATA, never keep producing a confident
+    # read from arbitrarily old data (see btc_intelligence.assess_btc_market
+    # / btc_market_data.compute_feed_status). Default 300s (5 minutes):
+    # with 1-minute candles refreshed on every new-minute boundary
+    # (BtcFeedRefresher), a healthy feed's newest bar is normally
+    # 60-120s old by the time it's read, accounting for refresh timing
+    # and processing; 300s gives a generous ~2.5-5x margin above that
+    # normal case (so ordinary jitter/a slow API response never
+    # triggers a false STALE read) while still catching a genuinely
+    # dead feed with most of a 15-minute market's life still left to
+    # react to it, rather than only noticing at the very end.
+    btc_max_bar_age_seconds: float
     # Minimum corroborating weakening/reversing signals required before
     # an early (below-target) exit is recommended — see
     # exit_manager.DynamicExitConfig. Same default (2) as the proven
@@ -306,6 +320,8 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_PROFIT_TARGET_PCT must be > 0")
         if self.btc_bar_interval_seconds <= 0:
             raise PolymarketConfigError("POLYMARKET_BTC_BAR_INTERVAL_SECONDS must be > 0")
+        if self.btc_max_bar_age_seconds <= 0:
+            raise PolymarketConfigError("POLYMARKET_BTC_MAX_BAR_AGE_SECONDS must be > 0")
         if self.min_weakening_signals_for_exit <= 0:
             raise PolymarketConfigError("POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT must be > 0")
         if self.venue not in VALID_VENUES:
@@ -426,6 +442,7 @@ class PolymarketSettings:
             auto_exit_enabled=_get_bool(env, "POLYMARKET_AUTO_EXIT_ENABLED", False),
             dynamic_exit_enabled=_get_bool(env, "POLYMARKET_DYNAMIC_EXIT_ENABLED", False),
             btc_bar_interval_seconds=_get_int(env, "POLYMARKET_BTC_BAR_INTERVAL_SECONDS", 60),
+            btc_max_bar_age_seconds=_get_float(env, "POLYMARKET_BTC_MAX_BAR_AGE_SECONDS", 300.0),
             min_weakening_signals_for_exit=_get_int(env, "POLYMARKET_MIN_WEAKENING_SIGNALS_FOR_EXIT", 2),
             btc_price_history_file=_get_str(env, "POLYMARKET_BTC_PRICE_HISTORY_FILE", "logs/polymarket/btc_price_history.json"),
             asset=_get_str(env, "POLYMARKET_ASSET", "bitcoin").lower(),

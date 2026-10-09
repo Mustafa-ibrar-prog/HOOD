@@ -48,6 +48,31 @@ INJECTABLE SEAM, not a live poller:
     cascade HOLDs, deferring to the existing profit-target-as-soft-signal
     and settlement-fallback paths. This is intentional, not a bug: a
     system with no real evidence yet must do nothing, not guess.
+
+UPDATE — a real, unattended, non-MCP path now exists too:
+DirectBtcQuoteSource (below) is a SEPARATE, provider-agnostic seam for
+a BTC-USD candle source any plain Python process CAN call directly —
+no agent, no MCP, works identically on Windows/Linux/Mac. The first
+real implementation (CoinbaseBtcQuoteSource, btc_coinbase_source.py)
+uses Coinbase Exchange's public, unauthenticated candles endpoint.
+bootstrap_btc_price_history() and BtcFeedRefresher (below) are the
+orchestration around it: fetch real, provider-given 1-minute candles
+with their exact timestamps and real OHLCV (including real volume —
+unlike get_crypto_quotes, a direct candle provider actually has
+volume; see record_bars()), store them, and refresh on a new-minute
+cadence independent of Polymarket's own poll loop. The OLD
+BtcQuoteSource/record_quote()/feed_btc_quote.py path is UNCHANGED and
+still works standalone — this is additive, not a replacement, so a
+second/alternate provider (or the manual bridge) can always be plugged
+in without touching anything else in this package.
+
+A feed that goes silent after building real history is a DIFFERENT
+failure mode from "never fed at all," and is just as dangerous if
+unhandled: without a staleness check, old-but-real bars would keep
+being reported as current evidence forever. See compute_feed_status()
+below and btc_intelligence.assess_btc_market()'s own max_bar_age_seconds
+gate — a bar older than that is treated as equivalent to "no bar,"
+forcing INSUFFICIENT_DATA exactly like a feed that was never fed.
 """
 
 from __future__ import annotations
@@ -72,6 +97,33 @@ class BtcQuoteSource(Protocol):
     no production implementation of this exists yet."""
 
     def get_crypto_quotes(self, symbols: list[str]) -> dict[str, Any]: ...
+
+
+class DirectBtcQuoteSource(Protocol):
+    """Provider-agnostic interface for an unattended, DIRECTLY-callable
+    BTC-USD 1-minute-candle source — no agent, no MCP, no Python SDK
+    binding required; just an ordinary network call a plain process can
+    make on any OS. CoinbaseBtcQuoteSource (btc_coinbase_source.py) is
+    the first implementation; a different provider (Binance, Kraken,
+    ...) plugs in by implementing this exact same narrow signature —
+    nothing else in this package (bootstrap_btc_price_history,
+    BtcFeedRefresher, btc_intelligence.py, exit_manager.py) needs to
+    change or even know which one is in use.
+    """
+
+    name: str  # short, human-readable label (e.g. "coinbase") for BTC_FEED_SOURCE logging
+
+    def get_recent_candles(self, *, limit: int) -> list[PriceBar]:
+        """Returns up to `limit` of the most recent available 1-minute
+        candles, OLDEST FIRST, with real open/high/low/close/volume and
+        the provider's own exact timestamps — never interpolated
+        (PriceBar.interpolated is always False from a real provider),
+        never fabricated. Implementations should raise on a genuine
+        transport/parse failure rather than returning a guessed or
+        empty-but-successful result — callers (bootstrap/refresh) treat
+        any exception as "temporarily unavailable" and degrade safely,
+        never as "confirmed no data."""
+        ...
 
 
 def extract_mark_price(quotes_response: dict[str, Any], symbol: str) -> float | None:
@@ -104,6 +156,67 @@ class BtcQuoteSample:
         return cls(price=float(data["price"]), observed_at=datetime.fromisoformat(data["observed_at"]))
 
 
+_FEED_STATUS_FRESH = "FRESH"
+_FEED_STATUS_STALE = "STALE"
+_FEED_STATUS_UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class BtcFeedStatus:
+    """The answer to "can the BTC evidence engine trust its own most
+    recent data point right now" — computed fresh every cycle from
+    REAL wall-clock time vs. the real bar's own timestamp, so this is
+    correct across a restart with zero extra work (a stale bar is
+    still exactly as stale after a restart — see compute_feed_status).
+    Logged verbatim (BTC_FEED_SOURCE/BTC_LAST_BAR_TIME/
+    BTC_BAR_AGE_SECONDS/BTC_FEED_STATUS) by exit_manager.py every cycle."""
+
+    source: str | None  # None iff status == UNAVAILABLE (no bar at all to attribute)
+    last_bar_time: datetime | None
+    bar_age_seconds: float | None
+    status: str  # one of _FEED_STATUS_FRESH / _FEED_STATUS_STALE / _FEED_STATUS_UNAVAILABLE
+
+
+def compute_feed_status(
+    bars: list[PriceBar], *, max_bar_age_seconds: float, source: str = "manual", now: datetime | None = None,
+) -> BtcFeedStatus:
+    """UNAVAILABLE when there are no usable bars at all (never fed, or
+    a provider outage with nothing yet persisted) — the SAME terminal
+    state a missing feed has always produced. STALE when bars exist but
+    the newest one is older than `max_bar_age_seconds` — a feed that
+    WAS working and then went silent, which a bare "do we have any
+    bars" check would miss forever (see module docstring). Only FRESH
+    bars are ever usable evidence — see
+    btc_intelligence.assess_btc_market()."""
+    now = now or datetime.now(timezone.utc)
+    if not bars:
+        return BtcFeedStatus(source=None, last_bar_time=None, bar_age_seconds=None, status=_FEED_STATUS_UNAVAILABLE)
+    last_bar = bars[-1]
+    age = (now - _as_utc(last_bar.start_time)).total_seconds()
+    status = _FEED_STATUS_FRESH if age <= max_bar_age_seconds else _FEED_STATUS_STALE
+    return BtcFeedStatus(source=source, last_bar_time=last_bar.start_time, bar_age_seconds=age, status=status)
+
+
+def _bar_to_dict(bar: PriceBar) -> dict[str, Any]:
+    return {
+        "start_time": bar.start_time.isoformat(), "open": bar.open, "high": bar.high, "low": bar.low,
+        "close": bar.close, "volume": bar.volume, "interpolated": bar.interpolated,
+    }
+
+
+def _bar_from_dict(data: dict[str, Any]) -> PriceBar:
+    return PriceBar(
+        start_time=datetime.fromisoformat(data["start_time"]), open=float(data["open"]), high=float(data["high"]),
+        low=float(data["low"]), close=float(data["close"]),
+        # Deliberately NOT coerced to int: PriceBar.volume is typed int
+        # for the options/equities convention (whole shares), which
+        # dataclasses never enforce at runtime -- BTC volume is
+        # genuinely fractional, and rounding/truncating it would be
+        # exactly the kind of fabrication this feature must never do.
+        volume=data["volume"], interpolated=bool(data.get("interpolated", False)),
+    )
+
+
 class BtcPriceHistoryStore:
     """File-persisted rolling buffer of raw BTC quote samples, same
     fail-closed convention as every other store in this package
@@ -122,6 +235,12 @@ class BtcPriceHistoryStore:
     def __init__(self, path: Path, *, retention_seconds: float = 6 * 3600):
         self._path = path
         self._retention_seconds = retention_seconds
+        # A sibling file, never the same file as the raw-quote-sample
+        # ledger above -- keeps the OLD format (a bare JSON list of
+        # samples) byte-for-byte unchanged for anything still using
+        # record_quote()/feed_btc_quote.py, while real provider candles
+        # (record_bars) get their own, independent, richer storage.
+        self._bars_path = path.parent / f"{path.stem}.bars{path.suffix}"
 
     def load(self) -> list[BtcQuoteSample]:
         if not self._path.is_file():
@@ -155,37 +274,94 @@ class BtcPriceHistoryStore:
         self.save(samples)
         return sample
 
+    def load_real_bars(self) -> list[PriceBar]:
+        if not self._bars_path.is_file():
+            return []
+        raw = self._bars_path.read_text()
+        if not raw.strip():
+            return []
+        try:
+            return [_bar_from_dict(row) for row in json.loads(raw)]
+        except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise BtcPriceHistoryStoreError(f"BTC real-candle history file is corrupted or unreadable: {exc}") from exc
+
+    def save_real_bars(self, bars: list[PriceBar]) -> None:
+        self._bars_path.parent.mkdir(parents=True, exist_ok=True)
+        self._bars_path.write_text(json.dumps([_bar_to_dict(b) for b in bars], indent=2, sort_keys=True))
+
+    def record_bars(self, bars: list[PriceBar]) -> int:
+        """Upserts REAL, provider-given candles (exact OHLCV, exact
+        timestamps — never derived from quote samples) keyed by
+        start_time. get_bars() always prefers a real candle over
+        anything reconstructed from raw quote samples for the SAME
+        bucket. Idempotent: calling this again with overlapping
+        candles just replaces them — safe on every bootstrap/refresh
+        regardless of how much the fetched window overlaps what's
+        already stored.
+
+        Same retention policy as raw samples, keyed off the newest
+        timestamp in THIS batch (so a bootstrap/refresh call always
+        prunes relative to data it just confirmed is current, never
+        relative to a possibly-stale `now` the caller forgot to pass).
+
+        Returns the number of candles written (len(bars)) — `bars`
+        empty is a legitimate "provider returned nothing new" result,
+        not an error."""
+        if not bars:
+            return 0
+        existing = {b.start_time: b for b in self.load_real_bars()}
+        for bar in bars:
+            existing[bar.start_time] = bar
+        newest = max(_as_utc(b.start_time) for b in bars)
+        cutoff = newest - timedelta(seconds=self._retention_seconds)
+        merged = sorted((b for b in existing.values() if _as_utc(b.start_time) >= cutoff), key=lambda b: b.start_time)
+        self.save_real_bars(merged)
+        return len(bars)
+
     def get_bars(self, *, interval_seconds: int = 60, now: datetime | None = None) -> list[PriceBar]:
         """Aggregates the persisted raw samples into real OHLC bars,
-        oldest first. Only FULLY CLOSED buckets are returned (a bucket
-        whose end time is <= `now`) — the bucket still in progress is
-        never included, so the same point in time never produces a
-        "final" bar that later changes shape as more samples land in
-        it. volume is always 0 (get_crypto_quotes has no volume field —
-        see module docstring; never fabricated).
+        oldest first, PREFERRING a real, provider-given candle
+        (record_bars) over one reconstructed from raw quote samples
+        whenever both exist for the same bucket — richer, more
+        accurate data always wins; the two are never blended for a
+        single bucket. Only FULLY CLOSED buckets are returned (a
+        bucket whose end time is <= `now`) — the bucket still in
+        progress is never included, so the same point in time never
+        produces a "final" bar that later changes shape as more data
+        lands in it. A quote-reconstructed bar's volume is always 0
+        (get_crypto_quotes has no volume field — never fabricated); a
+        real candle's volume is whatever the provider actually reported.
 
-        Returns [] (never raises) when there are no samples yet —
+        Returns [] (never raises) when there is no data at all yet —
         exactly the "not enough data" case build_btc_momentum_evidence()
         must turn into INSUFFICIENT_DATA, not a guess.
         """
         if interval_seconds <= 0:
             raise ValueError("interval_seconds must be > 0")
         now = now or datetime.now(timezone.utc)
-        samples = self.load()
-        if not samples:
-            return []
-
-        buckets: dict[int, list[BtcQuoteSample]] = {}
         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        current_bucket = int((now - epoch).total_seconds() // interval_seconds)
+
+        real_by_bucket: dict[int, PriceBar] = {}
+        for bar in self.load_real_bars():
+            bucket_index = int((_as_utc(bar.start_time) - epoch).total_seconds() // interval_seconds)
+            real_by_bucket[bucket_index] = bar
+
+        samples = self.load()
+        buckets: dict[int, list[BtcQuoteSample]] = {}
         for sample in samples:
             bucket_index = int((_as_utc(sample.observed_at) - epoch).total_seconds() // interval_seconds)
+            if bucket_index in real_by_bucket:
+                continue  # a real candle already covers this bucket -- never blend partial quote data into it
             buckets.setdefault(bucket_index, []).append(sample)
 
-        current_bucket = int((now - epoch).total_seconds() // interval_seconds)
         bars: list[PriceBar] = []
-        for bucket_index in sorted(buckets):
+        for bucket_index in sorted(set(real_by_bucket) | set(buckets)):
             if bucket_index >= current_bucket:
                 continue  # still in progress -- never return a half-formed bar
+            if bucket_index in real_by_bucket:
+                bars.append(real_by_bucket[bucket_index])
+                continue
             bucket_samples = sorted(buckets[bucket_index], key=lambda s: s.observed_at)
             prices = [s.price for s in bucket_samples]
             bar_start = epoch + timedelta(seconds=bucket_index * interval_seconds)
@@ -198,3 +374,76 @@ class BtcPriceHistoryStore:
 
 def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def bootstrap_btc_price_history(store: BtcPriceHistoryStore, source: DirectBtcQuoteSource, *, min_bars: int) -> int:
+    """Run ONCE at bot startup (see scripts/run_polymarket_bot.py) —
+    fetches enough recent 1-minute candles to cover at least `min_bars`
+    CLOSED bars (a small buffer beyond `min_bars` absorbs the one
+    in-progress bucket get_bars() always excludes) and records them
+    with their REAL, provider-given OHLCV and exact timestamps — never
+    interpolated, never fabricated.
+
+    Idempotent and safe to call on every startup regardless of whether
+    the store already has history: record_bars() upserts by timestamp,
+    so a restart with fresh persisted data just re-fetches a small,
+    mostly-overlapping window and changes nothing; a restart with
+    STALE persisted data gets a real chance to catch back up to fresh.
+
+    Never raises: a provider failure here must not prevent the bot
+    from starting at all — see requirement that a temporarily
+    unavailable BTC provider never crashes normal Polymarket operation.
+    Returns 0 (and leaves the store untouched) on any such failure.
+    """
+    try:
+        candles = source.get_recent_candles(limit=min_bars + 5)
+    except Exception:  # noqa: BLE001 - any provider/transport/parse failure -> no bootstrap data, never a crash
+        return 0
+    if not candles:
+        return 0
+    return store.record_bars(candles)
+
+
+class BtcFeedRefresher:
+    """Keeps BTC price history warm across the bot's own poll loop
+    WITHOUT hammering the direct provider: only actually calls it once
+    a NEW 1-minute bucket has become available since the last attempt
+    — independent of, and typically much less frequent than,
+    POLYMARKET_POLL_INTERVAL_SECONDS (which this never reads or
+    touches — Polymarket's own polling cadence is completely
+    unaffected by this class existing at all).
+
+    In-memory only (same spirit as engine.MarketHistory) — a restart
+    just re-bootstraps instead (see bootstrap_btc_price_history), which
+    is cheap, idempotent, and already handles the "lost all in-memory
+    state" case correctly.
+    """
+
+    def __init__(self, store: BtcPriceHistoryStore, source: DirectBtcQuoteSource):
+        self._store = store
+        self._source = source
+        self._last_refresh_minute: datetime | None = None
+
+    def maybe_refresh(self, *, now: datetime | None = None) -> int:
+        """No-ops (returns 0, makes no network call) unless a new
+        1-minute boundary has passed since the last call that actually
+        reached the provider — this is the "cache/reuse data within
+        the current candle, refresh when a new minute becomes
+        available" requirement, enforced here rather than left to the
+        caller to get right. Never raises: a provider hiccup is logged
+        nowhere special and simply skipped — the NEXT minute's attempt
+        tries again on its own; see compute_feed_status() for how a
+        prolonged outage is actually detected and acted on (this class
+        is purely about call cadence, not safety)."""
+        now = now or datetime.now(timezone.utc)
+        current_minute = now.replace(second=0, microsecond=0)
+        if self._last_refresh_minute is not None and current_minute <= self._last_refresh_minute:
+            return 0  # already attempted this minute -- reuse what's persisted, no new call
+        self._last_refresh_minute = current_minute
+        try:
+            candles = self._source.get_recent_candles(limit=5)  # a small, cheap catch-up window
+        except Exception:  # noqa: BLE001 - provider hiccup -- never crash, never fabricate; just skip this refresh
+            return 0
+        if not candles:
+            return 0
+        return self._store.record_bars(candles)

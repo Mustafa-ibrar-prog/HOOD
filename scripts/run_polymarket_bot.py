@@ -37,7 +37,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.execution.emergency_stop import EmergencyStopStore  # noqa: E402
-from src.polymarket.btc_market_data import BtcPriceHistoryStore  # noqa: E402
+from src.polymarket.btc_coinbase_source import CoinbaseBtcQuoteSource  # noqa: E402
+from src.polymarket.btc_intelligence import DEFAULT_MIN_BARS_FOR_INDICATORS  # noqa: E402
+from src.polymarket.btc_market_data import BtcFeedRefresher, BtcPriceHistoryStore, bootstrap_btc_price_history  # noqa: E402
 from src.polymarket.client import get_polymarket_client  # noqa: E402
 from src.polymarket.engine import MarketHistory, run_cycle  # noqa: E402
 from src.polymarket.gateway import get_execution_gateway  # noqa: E402
@@ -69,13 +71,22 @@ def main() -> int:
     # gateway.py's PaperPolymarketGateway — it never calls place_order).
     pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file))
     history = MarketHistory()
-    # Dynamic-exit BTC evidence (see exit_manager.py/btc_market_data.py):
-    # stays empty (INSUFFICIENT_DATA -> HOLD) unless something -- an
-    # agent calling scripts/feed_btc_quote.py after reading
-    # get_crypto_quotes -- actually feeds it. A no-op dependency to
-    # construct either way: check_and_execute_dynamic_exits() itself is
-    # a complete no-op while settings.dynamic_exit_enabled is False.
+    # Dynamic-exit BTC evidence (see exit_manager.py/btc_market_data.py).
+    # check_and_execute_dynamic_exits() itself is a complete no-op while
+    # settings.dynamic_exit_enabled is False (the default) -- everything
+    # below runs regardless, so real history is already warm by the time
+    # anyone turns that flag on. CoinbaseBtcQuoteSource is a DIRECT,
+    # unattended HTTPS source (no agent/MCP) -- construction alone makes
+    # no network call; bootstrap/refresh below are what actually call it,
+    # and both fail safe (never raise, never crash this bot) on any
+    # provider outage -- see btc_market_data.py's module docstring.
     btc_price_store = BtcPriceHistoryStore(Path(settings.btc_price_history_file))
+    btc_source = CoinbaseBtcQuoteSource()
+    btc_bootstrapped = bootstrap_btc_price_history(
+        btc_price_store, btc_source, min_bars=DEFAULT_MIN_BARS_FOR_INDICATORS,
+    )
+    print(f"BTC price history bootstrap: {btc_bootstrapped} candle(s) recorded from {btc_source.name}")
+    btc_refresher = BtcFeedRefresher(btc_price_store, btc_source)
 
     order_placer = client if settings.is_live else None
     emergency_stop_store = EmergencyStopStore(Path(settings.emergency_stop_file))
@@ -97,11 +108,22 @@ def main() -> int:
     cycles = 0
     try:
         while True:
+            # Isolated from the Polymarket cycle below on purpose (see
+            # requirement that a BTC-provider outage never affects
+            # normal Polymarket functionality): maybe_refresh() never
+            # raises on its own, but this belt-and-suspenders guard
+            # also protects against a failure in record_bars() itself
+            # (e.g. a disk/IO problem) ever reaching the trading loop.
+            try:
+                btc_refresher.maybe_refresh()
+            except Exception as exc:  # noqa: BLE001 - a BTC feed problem must never stop Polymarket trading
+                print(f"BTC feed refresh failed (ignored, Polymarket trading continues): {exc}")
+
             report = run_cycle(
                 settings=settings, client=client, strategy=strategy, risk_manager=risk_manager,
                 gateway=gateway, decision_logger=decision_logger, state_store=state_store,
                 position_store=position_store, pending_store=pending_store, history=history,
-                btc_price_store=btc_price_store,
+                btc_price_store=btc_price_store, btc_feed_source=btc_source.name,
             )
             cycles += 1
             print(

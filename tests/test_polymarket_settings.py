@@ -135,6 +135,24 @@ def test_non_positive_profit_target_pct_rejected(value):
         PolymarketSettings.from_env(env=_env(POLYMARKET_PROFIT_TARGET_PCT=value))
 
 
+# --- BTC feed staleness setting ------------------------------------------------
+
+def test_btc_max_bar_age_seconds_defaults_to_five_minutes():
+    settings = PolymarketSettings.from_env(env={})
+    assert settings.btc_max_bar_age_seconds == pytest.approx(300.0)
+
+
+def test_btc_max_bar_age_seconds_is_configurable():
+    settings = PolymarketSettings.from_env(env=_env(POLYMARKET_BTC_MAX_BAR_AGE_SECONDS="120"))
+    assert settings.btc_max_bar_age_seconds == pytest.approx(120.0)
+
+
+@pytest.mark.parametrize("value", ["0", "-10"])
+def test_non_positive_btc_max_bar_age_seconds_rejected(value):
+    with pytest.raises(PolymarketConfigError):
+        PolymarketSettings.from_env(env=_env(POLYMARKET_BTC_MAX_BAR_AGE_SECONDS=value))
+
+
 def test_api_triple_alone_does_not_satisfy_live_mode_private_key_requirement():
     """Verified against SecureClient.create()'s real signature (see
     client.py's module docstring): private_key is required even when

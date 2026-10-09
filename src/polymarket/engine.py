@@ -100,6 +100,7 @@ def run_cycle(
     pending_store: PolymarketPendingOrderStore,
     history: MarketHistory,
     btc_price_store: BtcPriceHistoryStore,
+    btc_feed_source: str = "manual",
     now: datetime | None = None,
 ) -> CycleReport:
     now = now or datetime.now(timezone.utc)
@@ -131,7 +132,7 @@ def run_cycle(
     exits_submitted = check_and_execute_dynamic_exits(
         client=client, settings=settings, gateway=gateway, position_store=position_store,
         pending_store=pending_store, state_store=state_store, decision_logger=decision_logger,
-        btc_price_store=btc_price_store, history=history, now=now,
+        btc_price_store=btc_price_store, history=history, btc_feed_source=btc_feed_source, now=now,
     )
 
     try:

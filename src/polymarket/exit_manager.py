@@ -539,6 +539,7 @@ def check_and_execute_dynamic_exits(
     btc_price_store: Any,
     history: Any = None,
     config: DynamicExitConfig | None = None,
+    btc_feed_source: str = "manual",
     now: datetime | None = None,
 ) -> int:
     """One per-cycle pass over every open position — intended to be
@@ -562,10 +563,26 @@ def check_and_execute_dynamic_exits(
          `.mids` to avoid importing engine.MarketHistory here and
          creating a circular import; untyped/None is also accepted and
          degrades to no Polymarket-momentum signal, never a crash);
-      3. assess_btc_market() builds the one structured assessment, and
-         evaluate_dynamic_exit() decides eligibility against it;
+      3. assess_btc_market() builds the one structured assessment —
+         rejecting the fetched bars as evidence (forcing
+         INSUFFICIENT_DATA) if the newest one is older than
+         settings.btc_max_bar_age_seconds (a dead feed must never keep
+         deciding from stale data — see btc_market_data.py's module
+         docstring) — and evaluate_dynamic_exit() decides eligibility
+         against it;
       4. an eligible position gets exactly one exit order submitted via
          submit_dynamic_exit().
+
+    Every cycle, for every open position, logs BTC_FEED_SOURCE/
+    BTC_LAST_BAR_TIME/BTC_BAR_AGE_SECONDS/BTC_FEED_STATUS/
+    BTC_EVIDENCE_STATE regardless of what else happens — a dead feed
+    must be visible in the decision log, not silent.
+
+    `btc_feed_source` is a plain label (e.g. "coinbase") for that log
+    line, set by whatever constructed the DirectBtcQuoteSource actually
+    feeding btc_price_store (see scripts/run_polymarket_bot.py) —
+    "manual" (the default) when only the interim feed_btc_quote.py
+    bridge is in use.
 
     Returns the number of exit orders submitted this call (0 is the
     overwhelmingly common case: most cycles, no position exits)."""
@@ -602,12 +619,53 @@ def check_and_execute_dynamic_exits(
             )
             continue
 
-        bars = btc_price_store.get_bars(interval_seconds=settings.btc_bar_interval_seconds, now=now)
+        # Isolated from the order-book fetch above on purpose
+        # (requirement: a BTC-feed failure must never affect normal
+        # Polymarket functionality, and must never crash this bot) —
+        # a corrupted real-bar file or any other btc_price_store
+        # failure degrades to "no BTC bars this cycle" (bars=[]),
+        # which assess_btc_market() already turns into
+        # UNAVAILABLE/INSUFFICIENT_DATA correctly; it is never treated
+        # as a reason to skip the position's order-book-based checks
+        # entirely, the way an order-book fetch failure is.
+        try:
+            bars = btc_price_store.get_bars(interval_seconds=settings.btc_bar_interval_seconds, now=now)
+        except Exception as exc:  # noqa: BLE001 - a BTC store failure must never crash the bot or block Polymarket logic
+            decision_logger.log_decision(
+                kind="btc_feed_read_failed",
+                reason=f"Could not read BTC price history for {current.condition_id}: {exc}",
+                evidence={"position": current.to_dict()},
+            )
+            bars = []
         recent_mids = (
             history.mids if history is not None and getattr(history, "condition_id", None) == current.condition_id
             else []
         )
-        btc_assessment = assess_btc_market(bars, order_book, recent_mids, outcome=current.outcome, now=now)
+        btc_assessment = assess_btc_market(
+            bars, order_book, recent_mids, outcome=current.outcome, now=now,
+            max_bar_age_seconds=settings.btc_max_bar_age_seconds, feed_source=btc_feed_source,
+        )
+
+        # Requirement: a dead BTC feed must be visible, not silent.
+        # Logged every cycle, for every open position, regardless of
+        # whether anything else happens this cycle.
+        feed_status = btc_assessment.feed_status
+        decision_logger.log_decision(
+            kind="btc_feed_status",
+            reason=(
+                f"BTC_FEED_SOURCE={feed_status.source} BTC_LAST_BAR_TIME={feed_status.last_bar_time} "
+                f"BTC_BAR_AGE_SECONDS={feed_status.bar_age_seconds} BTC_FEED_STATUS={feed_status.status} "
+                f"BTC_EVIDENCE_STATE={btc_assessment.state.value}"
+            ),
+            evidence={
+                "condition_id": current.condition_id,
+                "BTC_FEED_SOURCE": feed_status.source,
+                "BTC_LAST_BAR_TIME": feed_status.last_bar_time.isoformat() if feed_status.last_bar_time else None,
+                "BTC_BAR_AGE_SECONDS": feed_status.bar_age_seconds,
+                "BTC_FEED_STATUS": feed_status.status,
+                "BTC_EVIDENCE_STATE": btc_assessment.state.value,
+            },
+        )
 
         decision = evaluate_dynamic_exit(
             current, order_book, btc_assessment, profit_target_pct=settings.profit_target_pct, config=config,
