@@ -1,25 +1,31 @@
 """Tests for the evidence-gated dynamic exit system (exit_manager.py).
 
 Two layers are tested separately, on purpose:
-  - The CASCADE (evaluate_dynamic_exit) is tested against directly-
-    constructed BtcMarketAssessment objects (via `_assessment()` below)
-    -- its job is "given a BTC state and profit level, what's the
-    decision," independent of how that state was derived from real
-    bars (that translation is btc_intelligence.py's job, already
-    covered by tests/test_polymarket_btc_intelligence.py).
+  - The CASCADE (evaluate_dynamic_exit / compute_edge_assessment) is
+    tested against directly-constructed BtcMarketAssessment objects
+    (via `_assessment()` below) -- its job is "given a bundle of
+    signals and a profit level, what's the decision," independent of
+    how those signals were derived from real bars (that translation is
+    btc_intelligence.py's job, covered by
+    tests/test_polymarket_btc_intelligence.py; the full, realistic
+    bars-to-decision replay scenarios the v2 redesign was built around
+    live in tests/test_polymarket_dynamic_exit_evidence_model.py).
   - The FULL PIPELINE (check_and_execute_dynamic_exits, end to end,
     with a live order book / position store / paper or live gateway)
     is tested with real OrderBookSnapshots and a minimal fake client,
     mirroring test_polymarket_reconciliation.py's style.
 
-Covers every scenario this system was redesigned around: the exact
-user-specified decision table (target+strengthening->hold,
-target+weakening->exit, target+reversing->exit, below-target+strong
-reversal->exit, above-target+strengthening->hold,
-insufficient-data->hold); liquidity/no-bid/already-pending guards;
-idempotency; partial/full fills; unknown status; restart-safety;
-emergency stop; fee-aware net P&L; and the dynamic_exit_enabled master
-switch.
+v2 (continuous evidence/expected-value model, see exit_manager.py's
+module docstring): P&L never independently triggers an exit here --
+_assessment()'s default signal synthesis (below) still lets every
+pre-existing non-cascade-specific test (fill reconciliation,
+idempotency, emergency stop, live_auto_execute) construct an
+"obviously eligible" or "obviously not eligible" decision without
+hand-building Signal tuples itself. The cascade-specific tests in this
+file cover the mechanics (hard safety, liquidity/no-bid/already-
+pending guards, the supporting/opposing majority rule); the 8
+user-specified P&L-vs-evidence replay scenarios live in the dedicated
+file named above.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from src.polymarket.btc_intelligence import BtcMarketAssessment
 from src.polymarket.exit_manager import (
     DynamicExitConfig,
     check_and_execute_dynamic_exits,
+    compute_edge_assessment,
     compute_target_price,
     evaluate_dynamic_exit,
     record_exit_fill,
@@ -42,7 +49,7 @@ from src.polymarket.exit_manager import (
 )
 from src.polymarket.gateway import LivePolymarketGateway, PaperPolymarketGateway
 from src.polymarket.logger import PolymarketDecisionLogger
-from src.polymarket.models import BookLevel, FillResult, OrderBookSnapshot, SubmissionOutcome
+from src.polymarket.models import BookLevel, FillResult, OrderBookSnapshot, Signal, SubmissionOutcome
 from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import OpenPosition, PolymarketPositionStore
 from src.polymarket.settings import PolymarketSettings
@@ -127,14 +134,57 @@ def _logger(tmp_path: Path) -> PolymarketDecisionLogger:
     return PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
 
 
-def _assessment(state: MomentumState, *, signal_count: int = 3) -> BtcMarketAssessment:
-    """Directly constructs a BtcMarketAssessment with a given state and
-    a given number of fired signals -- isolates the CASCADE's own
-    logic from how that state is derived from real bars (see module
-    docstring)."""
+def _assessment(
+    state: MomentumState, *, signal_count: int = 3, evidence_score: int | None = None,
+    microstructure_signals: tuple[Signal, ...] = (),
+) -> BtcMarketAssessment:
+    """Directly constructs a BtcMarketAssessment -- isolates the
+    CASCADE's own logic from how that state is derived from real bars
+    (see module docstring).
+
+    `signal_count` sets the number of NAMED fired conditions on the
+    nested MomentumAssessment (btc_assessment.btc_assessment.signals)
+    -- the exact quantity compute_edge_assessment()'s
+    btc_fired_signal_count reads, and what
+    config.min_weakening_signals_for_exit gates on (see
+    exit_manager.py -- this is the SAME quantity/threshold the pre-v2
+    cascade used).
+
+    `evidence_score` sets the top-level weakening-minus-strengthening
+    score (btc_points = -evidence_score). When omitted, a value
+    consistent with `state` is used: positive (weakening-dominant, so
+    btc_points is negative/opposing) for WEAKENING/REVERSING, negative
+    (so btc_points is positive/supporting) for STRENGTHENING, 0 for
+    STABLE/INSUFFICIENT_DATA -- so tests that only care about the
+    state don't have to compute a raw score by hand.
+
+    `microstructure_signals` are Polymarket-sourced Signal objects
+    (source prefixed "polymarket_") for testing the corroboration/
+    veto mechanism specifically -- compute_edge_assessment() ignores
+    any signal whose source isn't "polymarket_"-prefixed (see its own
+    docstring on why raw per-indicator BTC signals are never read this
+    way)."""
     fired = tuple(f"signal_{i}" for i in range(signal_count))
-    momentum = MomentumAssessment(state=state, weakening_score=0, strengthening_score=0, signals=fired)
-    return BtcMarketAssessment(state=state, evidence_score=0, btc_assessment=momentum, signals=())
+    if evidence_score is None:
+        evidence_score = _default_evidence_score_for_state(state)
+    momentum = MomentumAssessment(
+        state=state, weakening_score=max(evidence_score, 0), strengthening_score=max(-evidence_score, 0), signals=fired,
+    )
+    return BtcMarketAssessment(state=state, evidence_score=evidence_score, btc_assessment=momentum, signals=microstructure_signals)
+
+
+def _default_evidence_score_for_state(state: MomentumState) -> int:
+    if state is MomentumState.REVERSING:
+        return 6
+    if state is MomentumState.WEAKENING:
+        return 3
+    if state is MomentumState.STRENGTHENING:
+        return -3
+    return 0  # STABLE / INSUFFICIENT_DATA
+
+
+def _microstructure_signal(source: str, *, direction: str, confidence: float) -> Signal:
+    return Signal(source=source, timestamp=datetime.now(timezone.utc), value=1.0, direction=direction, confidence=confidence)
 
 
 def _harness(tmp_path: Path, *, settings: PolymarketSettings | None = None):
@@ -179,7 +229,15 @@ def test_compute_target_price_matches_the_real_2230z_position():
     assert compute_target_price(0.36, 0.20) == pytest.approx(0.432)
 
 
-# --- evaluate_dynamic_exit: the exact user-specified decision table ----------
+# --- evaluate_dynamic_exit: v2 continuous evidence/expected-value model -----
+# The pre-v2 decision table (target+strengthening->hold, target+weakening->
+# exit, unprofitable-never-exits-on-reversal-alone, etc.) tested P&L-gated
+# behavior this redesign deliberately removed -- see exit_manager.py's
+# module docstring. These tests cover the SAME mechanics (hard safety,
+# corroboration-count/majority rule) under the new model; the user's 8
+# explicit P&L-vs-evidence replay scenarios, built from realistic BTC bars
+# through the real assess_btc_market() pipeline, live in
+# tests/test_polymarket_dynamic_exit_evidence_model.py.
 
 def test_insufficient_data_holds_regardless_of_profit():
     position = _position(avg_fill_price=0.36)
@@ -191,29 +249,9 @@ def test_insufficient_data_holds_regardless_of_profit():
     assert "insufficient" in decision.reason.lower()
 
 
-def test_target_reached_plus_strengthening_holds():
-    """+20% profit + strong continuation evidence -> HOLD."""
-    position = _position(avg_fill_price=0.36)  # target 0.432
-    book = _book(bids=(BookLevel(price=0.44, size=100.0),))  # ~22% gain, past target
-    decision = evaluate_dynamic_exit(
-        position, book, _assessment(MomentumState.STRENGTHENING), profit_target_pct=0.20,
-    )
-    assert decision.eligible is False
-    assert "strengthening" in decision.reason.lower()
-
-
-def test_target_reached_plus_weakening_exits():
-    """+20% profit + weakening momentum -> EXIT."""
-    position = _position(avg_fill_price=0.36)
-    book = _book(bids=(BookLevel(price=0.44, size=100.0),))
-    decision = evaluate_dynamic_exit(
-        position, book, _assessment(MomentumState.WEAKENING, signal_count=3), profit_target_pct=0.20,
-    )
-    assert decision.eligible is True
-
-
-def test_target_reached_plus_reversing_exits():
-    """+20% profit + reversal evidence -> EXIT."""
+def test_strongly_opposing_evidence_exits_even_when_profitable():
+    """+20% profit + strongly deteriorating evidence -> EXIT. Profit
+    alone never protects a position whose edge has gone negative."""
     position = _position(avg_fill_price=0.36)
     book = _book(bids=(BookLevel(price=0.44, size=100.0),))
     decision = evaluate_dynamic_exit(
@@ -222,33 +260,49 @@ def test_target_reached_plus_reversing_exits():
     assert decision.eligible is True
 
 
-def test_below_target_plus_strong_reversal_exits():
-    """+10% profit + strong reversal -> EXIT, even though the soft
-    20% target was never reached."""
-    position = _position(avg_fill_price=0.36)  # target 0.432; 10% gain = 0.396
-    book = _book(bids=(BookLevel(price=0.396, size=100.0),))
-    decision = evaluate_dynamic_exit(
-        position, book, _assessment(MomentumState.REVERSING, signal_count=5), profit_target_pct=0.20,
-    )
-    assert decision.eligible is True
-    assert decision.gross_pnl_pct == pytest.approx(0.10, abs=1e-6)
-
-
-def test_above_target_plus_strengthening_holds():
-    """+35% profit + strong continuation -> HOLD."""
+def test_strongly_supporting_evidence_holds_even_well_past_target():
+    """+35% profit + strongly supporting evidence -> HOLD. A soft
+    profit target reached is never, by itself, a reason to exit."""
     position = _position(avg_fill_price=0.36)  # 35% gain = 0.486
     book = _book(bids=(BookLevel(price=0.486, size=100.0),))
     decision = evaluate_dynamic_exit(
         position, book, _assessment(MomentumState.STRENGTHENING), profit_target_pct=0.20,
     )
     assert decision.eligible is False
+    assert "p&l is context" in decision.reason.lower()
 
 
-def test_below_target_weakening_without_enough_signals_holds():
-    """A barely-WEAKENING read (fewer than min_weakening_signals_for_exit)
-    below target must NOT trigger an early exit -- a single soft
-    signal is never enough (mirrors evaluate_momentum's own guarantee)."""
-    position = _position(avg_fill_price=0.36)  # below target
+def test_unprofitable_position_exits_on_strong_opposing_evidence():
+    """A position currently at a loss, with strongly deteriorating
+    evidence, must still EXIT -- cutting further loss on real evidence
+    is exactly the expected-value behavior this redesign adds. (Mirrors
+    the user's replay scenario 2 with synthetic signals; see the
+    dedicated replay-scenario file for the realistic-bars version.)"""
+    position = _position(avg_fill_price=0.50)  # currently a loss at the book below
+    book = _book(bids=(BookLevel(price=0.40, size=100.0),))
+    decision = evaluate_dynamic_exit(
+        position, book, _assessment(MomentumState.REVERSING, signal_count=5), profit_target_pct=0.20,
+    )
+    assert decision.eligible is True
+
+
+def test_unprofitable_position_holds_on_strong_supporting_evidence():
+    """A position deeply underwater, with strongly supporting evidence,
+    must HOLD -- the loss is context, not a trigger (replay scenario 1
+    with synthetic signals)."""
+    position = _position(avg_fill_price=0.50)
+    book = _book(bids=(BookLevel(price=0.25, size=100.0),))  # -50%
+    decision = evaluate_dynamic_exit(
+        position, book, _assessment(MomentumState.STRENGTHENING, signal_count=5), profit_target_pct=0.20,
+    )
+    assert decision.eligible is False
+
+
+def test_weakening_without_enough_opposing_signals_holds():
+    """Fewer opposing signals than min_weakening_signals_for_exit must
+    NOT trigger an early exit -- a single soft signal is never enough
+    (mirrors evaluate_momentum's own guarantee)."""
+    position = _position(avg_fill_price=0.36)
     book = _book(bids=(BookLevel(price=0.37, size=100.0),))
     decision = evaluate_dynamic_exit(
         position, book, _assessment(MomentumState.WEAKENING, signal_count=1),
@@ -257,15 +311,62 @@ def test_below_target_weakening_without_enough_signals_holds():
     assert decision.eligible is False
 
 
-def test_unprofitable_position_never_exits_on_reversal_alone():
-    """Scope: this redesign only ever exits a PROFITABLE position
-    early on evidence. A position currently at a loss must HOLD
-    (deferring to settlement) even with strong reversal evidence --
-    no new stop-loss concept was requested or added."""
-    position = _position(avg_fill_price=0.50)  # currently a loss at the book below
+def test_stable_btc_evidence_holds():
+    """STABLE (weakening roughly balances strengthening, i.e.
+    genuinely conflicting/ambiguous BTC evidence) must HOLD -- the
+    materiality gate requires WEAKENING/REVERSING specifically, so
+    ambiguous evidence never guesses a direction (replay scenario 6;
+    see tests/test_polymarket_dynamic_exit_evidence_model.py for the
+    realistic-bars version of this exact scenario)."""
+    position = _position(avg_fill_price=0.36)
     book = _book(bids=(BookLevel(price=0.40, size=100.0),))
-    decision = evaluate_dynamic_exit(
+    decision = evaluate_dynamic_exit(position, book, _assessment(MomentumState.STABLE), profit_target_pct=0.20)
+    assert decision.eligible is False
+
+
+def test_polymarket_microstructure_vetoes_an_otherwise_material_btc_exit():
+    """The v2 redesign's whole point for microstructure: a materially
+    WEAKENING/REVERSING BTC read (which alone WOULD exit) must be
+    HELD when Polymarket's own order-book flow clearly contradicts it
+    -- real continued buying pressure despite softening technicals is
+    exactly the kind of corroborating-evidence check this was built
+    for. See EdgeAssessment's docstring for why this is a veto on an
+    already-material BTC read, not an independent trigger."""
+    position = _position(avg_fill_price=0.36)
+    book = _book(bids=(BookLevel(price=0.40, size=100.0),))
+
+    without_microstructure = evaluate_dynamic_exit(
         position, book, _assessment(MomentumState.REVERSING, signal_count=5), profit_target_pct=0.20,
+    )
+    assert without_microstructure.eligible is True
+
+    contradicting_microstructure = (
+        _microstructure_signal("polymarket_order_book_imbalance", direction="bullish", confidence=0.6),
+        _microstructure_signal("polymarket_price_momentum", direction="bullish", confidence=0.5),
+    )
+    vetoed = evaluate_dynamic_exit(
+        position, book, _assessment(MomentumState.REVERSING, signal_count=5, microstructure_signals=contradicting_microstructure),
+        profit_target_pct=0.20,
+    )
+    assert vetoed.eligible is False
+    assert "order-book flow contradicts" in vetoed.reason.lower()
+
+
+def test_polymarket_microstructure_never_triggers_an_exit_on_its_own():
+    """Strongly bearish microstructure signals alone, with BTC
+    evidence STRENGTHENING, must never exit -- microstructure is
+    corroboration/veto on an already-material BTC read, never an
+    independent trigger (see EdgeAssessment's docstring)."""
+    position = _position(avg_fill_price=0.36)
+    book = _book(bids=(BookLevel(price=0.40, size=100.0),))
+    opposing_microstructure = (
+        _microstructure_signal("polymarket_order_book_imbalance", direction="bearish", confidence=0.6),
+        _microstructure_signal("polymarket_price_momentum", direction="bearish", confidence=0.5),
+        _microstructure_signal("polymarket_trade_flow", direction="bearish", confidence=0.3),
+    )
+    decision = evaluate_dynamic_exit(
+        position, book, _assessment(MomentumState.STRENGTHENING, microstructure_signals=opposing_microstructure),
+        profit_target_pct=0.20,
     )
     assert decision.eligible is False
 

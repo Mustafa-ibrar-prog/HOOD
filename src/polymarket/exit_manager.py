@@ -7,25 +7,68 @@ alters settlement, risk.py's entry checks, max_bet/max_daily_loss/
 max_spread/liquidity thresholds, entry_cutoff, or the existing BUY
 path in any way.
 
-REDESIGN NOTE: reaching +profit_target_pct is deliberately NOT an
-unconditional sell trigger. The decision is made by
-evaluate_dynamic_exit(), which reuses src/strategy/evidence.py's
-evaluate_momentum()/MomentumState engine (via btc_intelligence.py) —
-the SAME evidence-driven cascade shape as the options position-monitor
-(src/position_manager/evaluator.py):
-  - INSUFFICIENT_DATA (not enough real BTC evidence fed in yet — see
-    btc_market_data.py) -> HOLD. Never guessed.
-  - Profitable (any amount, not just at/above target) + BTC evidence
-    WEAKENING/REVERSING with enough corroborating signals -> EXIT now,
-    rather than waiting for the soft target or a full reversal.
-  - Soft target reached + BTC evidence STRENGTHENING -> HOLD (let a
-    confirmed winner run past the target).
-  - Soft target reached, evidence not confirming further continuation
-    -> EXIT (lock in the gain).
-  - Otherwise -> HOLD.
-compute_target_price() itself is unchanged — only HOW its output is
-used changed, from "this alone is sufficient to sell" to "this is one
-input the cascade above weighs against BTC evidence."
+EXPECTED-VALUE REDESIGN (v2): P&L does NOT independently trigger an
+exit. The old version gated the decision on gross_pnl_pct (profitable
++ weakening -> exit; target reached -> exit unless strengthening); a
+position sitting exactly at -50% and one sitting at +50% could reach
+opposite conclusions purely because of that gate, even when the real
+BTC evidence was identical. That is backwards: a losing position whose
+underlying evidence is still genuinely strong should be HELD (the loss
+is already priced in and the edge hasn't gone away), and a profitable
+position whose evidence has materially deteriorated should be EXITED
+(the edge is gone; the current gain is beside the point).
+
+evaluate_dynamic_exit() now decides purely from compute_edge_assessment()
+(below), which combines TWO evidence sources but deliberately does
+NOT blend them into one undifferentiated score:
+
+  - BTC momentum (RSI, MACD histogram, EMA fast/slow, higher-highs/
+    lower-highs structure, breakout continuation, failed breakout,
+    reversal) stays the AUTHORITATIVE, continuous signal: btc_points
+    is evaluate_momentum's own weakening_score - strengthening_score
+    (negated), reusing its exact, already-calibrated per-condition
+    point weights and its "a single soft signal is never enough"
+    materiality filter (the WEAKENING_THRESHOLD/REVERSING_THRESHOLD a
+    MomentumState is already built from). An earlier version of this
+    redesign instead re-derived a signal-by-signal direction straight
+    from each raw indicator (e.g. "RSI above or below 50") and let
+    every signal vote equally regardless of whether evaluate_momentum
+    itself considered it material — that reintroduced exactly the
+    single-weak-signal false-exit problem this module exists to
+    prevent (an RSI reading of 49 is not "the thesis has reversed"),
+    caught by this module's own replay tests
+    (tests/test_polymarket_dynamic_exit_replay.py). So the BTC side
+    reuses evaluate_momentum's verdict directly rather than re-scoring
+    its inputs from scratch.
+  - Polymarket's own order-book microstructure (imbalance, spread,
+    price momentum, trade flow — see
+    btc_intelligence.assess_polymarket_microstructure) is used as
+    CORROBORATION/VETO on an already-material BTC read, never as an
+    independent trigger — exactly the role btc_intelligence.py's own
+    module docstring already assigns it ("BTC evidence... stays
+    authoritative; Polymarket's own odds are a DERIVATIVE of that
+    thesis... not treated as an independent vote on it"); this
+    redesign is what finally makes that documented intent actually
+    affect the exit decision, rather than only being logged.
+
+The cascade, in order:
+  1. INSUFFICIENT_DATA (not enough real BTC evidence fed in yet, or a
+     stale/dead feed — see btc_market_data.py) -> HOLD. Never guessed.
+     This is a hard safety rule, independent of the edge score below.
+  2. Otherwise, compute the EdgeAssessment. EXIT only when BTC
+     evidence has materially turned against the thesis (btc_points
+     negative, state is WEAKENING/REVERSING, fired-signal count
+     clears config.min_weakening_signals_for_exit — the exact
+     mechanism the pre-v2 cascade already used, just no longer gated
+     by P&L/target) AND Polymarket's order-book flow does not clearly
+     contradict that read. Otherwise -> HOLD — including the
+     ambiguous case (BTC evidence itself net favorable or merely
+     STABLE), which deliberately defaults to holding rather than
+     guessing a direction.
+  3. gross_pnl_pct, target_price, and seconds remaining are still
+     computed and carried on ExitDecision/logged — CONTEXT for a human
+     or LLM reviewing the decision, never a branch condition.
+compute_target_price() itself is unchanged.
 
 TWO DIFFERENT STEPS, NOT A CONTRADICTION — decision vs. recording:
   - WHETHER to exit now folds in the GROSS move (profit_target_pct
@@ -87,7 +130,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from src.polymarket.btc_intelligence import BtcMarketAssessment, assess_btc_market
+from src.polymarket.btc_intelligence import BtcMarketAssessment, assess_btc_market, thesis_direction_for_outcome
 from src.polymarket.gateway import ExecutionGateway, LivePolymarketGateway, LiveTradingDisabledError, PolymarketOrderPlacer
 from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import FillResult, OrderBookSnapshot, OrderRequest, OrderResult
@@ -127,9 +170,106 @@ def compute_target_price(avg_fill_price: float, profit_target_pct: float) -> flo
 class DynamicExitConfig:
     """Tunable thresholds for the evidence-gated exit cascade —
     modeled directly on EvaluatorConfig (src/position_manager/
-    evaluator.py)."""
+    evaluator.py).
+
+    min_weakening_signals_for_exit: the minimum number of
+    evaluate_momentum's own NAMED fired conditions (its
+    MomentumAssessment.signals — "trend_flip", "reversal_signal", and
+    so on) required before evaluate_dynamic_exit will treat a
+    WEAKENING/REVERSING BTC read as material enough to exit on. Same
+    name/default/value/mechanism as the pre-v2 cascade (and as the
+    options side's own EvaluatorConfig.min_weakening_signals_for_exit)
+    — reused verbatim, not re-tuned; only the P&L/profit-target gating
+    around it was removed."""
 
     min_weakening_signals_for_exit: int = DEFAULT_MIN_WEAKENING_SIGNALS_FOR_EXIT
+
+
+@dataclass(frozen=True)
+class EdgeAssessment:
+    """The continuous read of whether the latest real evidence —
+    BTC momentum AND Polymarket microstructure — currently supports or
+    opposes the position's own thesis direction
+    (thesis_direction_for_outcome(position.outcome)).
+
+    This is the expected-value core of v2's exit decision: it answers
+    "does the evidence still favor this position winning," entirely
+    independent of entry price, current P&L, or any soft profit
+    target — see evaluate_dynamic_exit and the module docstring.
+
+    Two evidence sources, kept deliberately SEPARATE rather than
+    blended into one score, because they are not comparable units and
+    not equally reliable:
+
+    btc_points = -btc_assessment.evidence_score (evaluate_momentum's
+    own weakening_score - strengthening_score, negated so positive
+    means net SUPPORTING and negative means net OPPOSING). This reuses
+    evaluate_momentum's exact, already-calibrated per-condition point
+    weights (trend_flip=2, reversal_signal=3, momentum_exhaustion=2,
+    ...) and its "a single soft signal is never enough" materiality
+    filter (WEAKENING_THRESHOLD/REVERSING_THRESHOLD) — nothing here
+    re-derives or re-weights that scoring. btc_fired_signal_count is
+    evaluate_momentum's own count of NAMED fired conditions (its
+    MomentumAssessment.signals), the SAME quantity the pre-v2 cascade
+    gated on.
+
+    microstructure_net/_supporting/_opposing are a confidence-weighted
+    signed tally of ONLY the Polymarket order-book signals
+    (btc_intelligence.assess_polymarket_microstructure's imbalance/
+    spread/price-momentum/trade-flow — identified by their
+    "polymarket_" source prefix), using their own already-assigned
+    confidence (0.3-0.6) as-is. BTC evidence is deliberately
+    authoritative for DIRECTION (see btc_intelligence.py's own module
+    docstring: "Polymarket's own odds are a DERIVATIVE of that
+    thesis... not treated as an independent vote on it") — raw
+    per-indicator BTC signals (a bare rsi>50 crossing, say) are noisy
+    enough on their own that letting them vote directly, signal-for-
+    signal, alongside Polymarket's order-book reads produced exactly
+    the kind of single-weak-signal false exit this redesign is
+    supposed to prevent (caught by this module's own replay tests).
+    Microstructure's role here is corroboration/veto on an
+    already-material BTC read (see evaluate_dynamic_exit), not an
+    independent trigger — the real use case this was built for is
+    noticing persistent order-book buying pressure that contradicts a
+    marginal BTC weakening read, not manufacturing an exit from thin
+    order-book noise alone."""
+
+    thesis_direction: str
+    btc_points: float
+    btc_fired_signal_count: int
+    microstructure_net: float
+    microstructure_supporting: tuple[str, ...]
+    microstructure_opposing: tuple[str, ...]
+
+
+def compute_edge_assessment(btc_assessment: BtcMarketAssessment, *, thesis_direction: str) -> EdgeAssessment:
+    """See EdgeAssessment's own docstring for the full reasoning behind
+    keeping BTC-momentum and Polymarket-microstructure evidence
+    separate rather than blended into one score."""
+    opposite = "bearish" if thesis_direction == "bullish" else "bullish"
+    micro_net = 0.0
+    micro_supporting: list[str] = []
+    micro_opposing: list[str] = []
+    for signal in btc_assessment.signals:
+        if not signal.source.startswith("polymarket_"):
+            continue
+        if signal.direction == thesis_direction:
+            micro_net += signal.confidence
+            micro_supporting.append(signal.source)
+        elif signal.direction == opposite:
+            micro_net -= signal.confidence
+            micro_opposing.append(signal.source)
+        # "neutral" (e.g. the bid/ask spread signal) contributes to
+        # neither tally -- an uninformative reading is never evidence
+        # either way.
+    return EdgeAssessment(
+        thesis_direction=thesis_direction,
+        btc_points=-btc_assessment.evidence_score,
+        btc_fired_signal_count=len(btc_assessment.btc_assessment.signals),
+        microstructure_net=round(micro_net, 6),
+        microstructure_supporting=tuple(micro_supporting),
+        microstructure_opposing=tuple(micro_opposing),
+    )
 
 
 @dataclass(frozen=True)
@@ -143,15 +283,21 @@ class ExitDecision:
     `btc_assessment` is always attached (even when not eligible) so
     the full evidence trail — every Signal, source/timestamp/value/
     direction/confidence — is available to whatever explains the
-    decision (see btc_intelligence.py)."""
+    decision (see btc_intelligence.py).
+
+    `gross_pnl_pct` and `target_price` are CONTEXT ONLY in v2 — see
+    the module docstring's EXPECTED-VALUE REDESIGN section. They are
+    always computed and logged (useful for a human or LLM reviewing
+    the decision, and for scripts that print them), but
+    evaluate_dynamic_exit never branches on either."""
 
     position: OpenPosition
     eligible: bool
     reason: str
-    target_price: float  # the soft profit-target reference price (compute_target_price)
+    target_price: float  # context only -- the soft profit-target reference price (compute_target_price)
     best_bid: float | None  # the REAL live best bid -- also the price a submitted exit order would use
     executable_shares_at_target: float
-    gross_pnl_pct: float | None
+    gross_pnl_pct: float | None  # context only -- never a branch condition, see module docstring
     btc_assessment: BtcMarketAssessment | None
 
 
@@ -163,18 +309,23 @@ def evaluate_dynamic_exit(
     profit_target_pct: float,
     config: DynamicExitConfig | None = None,
 ) -> ExitDecision:
-    """Pure decision logic — see module docstring for the full
-    cascade. Checklist, in order:
+    """Pure decision logic — see module docstring's EXPECTED-VALUE
+    REDESIGN section for the full reasoning. Checklist, in order:
       1. no exit already pending for this position (idempotency guard);
       2. a real live bid must exist at all (can't sell into nothing);
-      3. INSUFFICIENT_DATA BTC evidence -> HOLD, never guess;
-      4. profitable + WEAKENING/REVERSING with enough corroborating
-         signals -> exit now, regardless of whether the soft target
-         was reached;
-      5. soft target reached + STRENGTHENING -> HOLD (let it run);
-         soft target reached otherwise -> exit;
-      6. otherwise -> HOLD;
-      7. (only once exit is decided) enough REAL executable bid
+      3. INSUFFICIENT_DATA BTC evidence -> HOLD, never guess (hard
+         safety, independent of everything below);
+      4. compute_edge_assessment() against the position's own thesis
+         direction -- EXIT only when BTC evidence has MATERIALLY
+         turned against the thesis (btc_points negative, state is
+         WEAKENING/REVERSING, and the fired-signal count clears
+         config.min_weakening_signals_for_exit -- the exact mechanism
+         the pre-v2 cascade used, just no longer gated by P&L/target),
+         AND Polymarket's own order-book microstructure does not
+         clearly contradict that read; otherwise HOLD. gross_pnl_pct/
+         target_price are computed for context/logging only and never
+         participate in this decision;
+      5. (only once exit is decided) enough REAL executable bid
          liquidity, AT OR ABOVE the current best bid, to sell the
          position's entire filled_shares.
     Any failure returns `eligible=False` with a human-readable reason;
@@ -198,57 +349,58 @@ def evaluate_dynamic_exit(
             gross_pnl_pct=None, btc_assessment=btc_assessment,
         )
 
+    # CONTEXT ONLY from here on -- see EdgeAssessment/module docstring.
+    # Never used in the branching below.
     gross_pnl_pct = (best_bid - position.avg_fill_price) / position.avg_fill_price
     state = btc_assessment.state
-    signal_count = len(btc_assessment.btc_assessment.signals)
 
-    def _decision(eligible: bool, reason: str) -> ExitDecision:
+    def _decision(eligible: bool, reason: str, executable: float = 0.0) -> ExitDecision:
         return ExitDecision(
             position=position, eligible=eligible, reason=reason, target_price=target_price, best_bid=best_bid,
-            executable_shares_at_target=0.0, gross_pnl_pct=gross_pnl_pct, btc_assessment=btc_assessment,
+            executable_shares_at_target=executable, gross_pnl_pct=gross_pnl_pct, btc_assessment=btc_assessment,
         )
 
-    # --- 1. Insufficient evidence: fail safe, never guess ------------------
+    # --- Hard safety: insufficient/stale BTC evidence -> HOLD, never guess -
     if state is MomentumState.INSUFFICIENT_DATA:
         return _decision(False, "Insufficient BTC market evidence this cycle -- holding rather than guessing")
 
-    should_exit = False
-    exit_reason = ""
+    # --- Continuous evidence/expected-value edge ----------------------------
+    thesis_direction = thesis_direction_for_outcome(position.outcome)
+    edge = compute_edge_assessment(btc_assessment, thesis_direction=thesis_direction)
 
-    # --- 2. Profitable, evidence-driven early exit --------------------------
-    # Acts on WEAKENING/REVERSING with enough corroborating signals
-    # regardless of whether the soft target was hit -- a reversal can
-    # justify locking in a small profit well below the target.
-    if gross_pnl_pct > 0 and state in (MomentumState.WEAKENING, MomentumState.REVERSING):
-        if signal_count >= config.min_weakening_signals_for_exit:
-            should_exit = True
-            fired = ", ".join(btc_assessment.btc_assessment.signals)
-            exit_reason = (
-                f"Profitable ({gross_pnl_pct:.1%}) but BTC evidence shows the move has "
-                f"{state.value.lower()} ({fired}); exiting now rather than waiting for the soft "
-                "target or a full reversal"
-            )
+    btc_opposes_materially = (
+        edge.btc_points < 0
+        and state in (MomentumState.WEAKENING, MomentumState.REVERSING)
+        and edge.btc_fired_signal_count >= config.min_weakening_signals_for_exit
+    )
+    microstructure_contradicts = (
+        edge.microstructure_net > 0
+        and len(edge.microstructure_supporting) > len(edge.microstructure_opposing)
+    )
+    exit_worthy = btc_opposes_materially and not microstructure_contradicts
 
-    # --- 3. Soft profit target reached --------------------------------------
-    if not should_exit and gross_pnl_pct >= profit_target_pct:
-        if state is MomentumState.STRENGTHENING:
+    if not exit_worthy:
+        if btc_opposes_materially:  # only reachable when microstructure vetoed it
             return _decision(
                 False,
-                f"Soft profit target ({profit_target_pct:.0%}) reached but BTC evidence is STRENGTHENING "
-                f"({', '.join(btc_assessment.btc_assessment.signals)}); holding rather than capping the winner",
+                f"BTC evidence opposes the thesis ({state.value.lower()}, btc_points={edge.btc_points:+.0f}) but "
+                f"Polymarket order-book flow contradicts it (microstructure_net={edge.microstructure_net:+.2f}, "
+                f"{', '.join(edge.microstructure_supporting)}); holding regardless of pnl={gross_pnl_pct:+.1%}",
             )
-        should_exit = True
-        exit_reason = (
-            f"Soft profit target ({profit_target_pct:.0%}) reached; BTC evidence is {state.value.lower()}, "
-            "not confirming further continuation -- locking in the gain"
-        )
-
-    if not should_exit:
         return _decision(
-            False, f"No exit condition met (pnl={gross_pnl_pct:.1%}, BTC evidence {state.value.lower()})",
+            False,
+            f"BTC evidence still favors or is neutral on the thesis ({state.value.lower()}, "
+            f"btc_points={edge.btc_points:+.0f}); holding regardless of pnl={gross_pnl_pct:+.1%} -- "
+            "P&L is context, not a trigger",
         )
 
-    # --- 4. Liquidity check against the REAL price the order would use -----
+    exit_reason = (
+        f"BTC evidence has materially turned against the thesis ({state.value.lower()}, "
+        f"btc_points={edge.btc_points:+.0f}, {edge.btc_fired_signal_count} fired signal(s)); exiting now "
+        f"regardless of pnl={gross_pnl_pct:+.1%}"
+    )
+
+    # --- Liquidity check against the REAL price the order would use --------
     available = order_book.executable_shares(side="SELL", min_price=best_bid)
     if available < position.filled_shares:
         return _decision(

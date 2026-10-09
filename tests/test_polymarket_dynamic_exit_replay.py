@@ -301,9 +301,16 @@ def test_scenario_3_target_reached_strengthening_holds(tmp_path):
     assert positions[0].filled_shares == 5.0
 
 
-# --- 4. +20%, STABLE -> the documented soft-target rule (EXIT) ---------------
+# --- 4. +20%, STABLE -> HOLD (v2: reaching the target is context only) -----
+# Pre-v2 this scenario documented "target reached + NOT STRENGTHENING ->
+# exit" -- the exact rigid P&L/target gate the v2 redesign removed (see
+# exit_manager.py's EXPECTED-VALUE REDESIGN module docstring section and
+# tests/test_polymarket_dynamic_exit_evidence_model.py's replay scenario
+# 6, which covers this identical STABLE/ambiguous-evidence case). Under
+# v2 the materiality gate requires WEAKENING/REVERSING specifically;
+# STABLE evidence holds regardless of whether the soft target was hit.
 
-def test_scenario_4_target_reached_stable_follows_soft_target_rule(tmp_path):
+def test_scenario_4_target_reached_stable_holds(tmp_path):
     harness = _paper_harness(tmp_path)
     position = _position()
     harness["position_store"].add_if_absent(position)
@@ -313,15 +320,13 @@ def test_scenario_4_target_reached_stable_follows_soft_target_rule(tmp_path):
     bars, book, assessment = _assess(harness["btc_price_store"], harness["client"], position, now=end_t + timedelta(seconds=5))
     assert assessment.state == MomentumState.STABLE
 
-    # Documented rule: target reached + NOT STRENGTHENING -> exit (lock
-    # in the gain -- STABLE does not confirm further continuation).
     decision = evaluate_dynamic_exit(position, book, assessment, profit_target_pct=0.20)
-    assert decision.eligible is True
-    assert "not confirming further continuation" in decision.reason
+    assert decision.eligible is False
+    assert "p&l is context" in decision.reason.lower()
 
     submitted = check_and_execute_dynamic_exits(**harness, now=end_t + timedelta(seconds=5))
-    assert submitted == 1
-    assert harness["position_store"].load() == []  # paper mode fills fully, immediately
+    assert submitted == 0
+    assert harness["position_store"].load()[0].filled_shares == 5.0  # untouched -- target reached is not a trigger
 
 
 # --- 5. +20%, WEAKENING with >=2 signals -> EXIT ------------------------------
