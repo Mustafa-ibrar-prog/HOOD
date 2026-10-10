@@ -275,11 +275,11 @@ def _event(*, slug, start: datetime, end: datetime, title="BTC Up or Down 15m",
     }
 
 
-def _order_response(state, *, quantity=10, cum=0, avg_px=None, order_id="ord-1") -> dict:
+def _order_response(state, *, quantity=10, cum=0, avg_px=None, order_id="ord-1", intent="ORDER_INTENT_BUY_LONG") -> dict:
     return {"order": {
         "id": order_id, "marketSlug": "btc-updown-15m", "side": "ORDER_SIDE_BUY", "type": "ORDER_TYPE_LIMIT",
         "price": _amount("0.55"), "quantity": quantity, "cumQuantity": cum, "leavesQuantity": quantity - cum,
-        "tif": "TIME_IN_FORCE_FILL_OR_KILL", "goodTillTime": None, "intent": "ORDER_INTENT_BUY_LONG",
+        "tif": "TIME_IN_FORCE_FILL_OR_KILL", "goodTillTime": None, "intent": intent,
         "marketMetadata": {}, "state": state, "avgPx": _amount(avg_px) if avg_px is not None else None,
         "cashOrderQty": None, "insertTime": "", "createTime": "", "commissionNotionalTotalCollected": None,
         "commissionsBasisPoints": "", "makerCommissionsBasisPoints": "",
@@ -947,6 +947,72 @@ def test_fok_buy_short_order_construction_for_no_outcome(tmp_path):
     assert sdk.orders.create_calls[0]["intent"] == "ORDER_INTENT_BUY_SHORT"
 
 
+# --- 5a. BUY_SHORT/SELL_SHORT price conversion -- the critical pricing-bug
+# fix: this venue has exactly ONE order book, priced entirely on the YES
+# axis. A NO order's price must be converted via `1 - price` before it is
+# ever sent -- never the raw, unconverted NO-terms number. ------------------
+
+def test_buy_short_converts_the_no_ceiling_to_the_corresponding_yes_floor(tmp_path):
+    """The governing worked example: YES bid 0.27 -> NO implied ask 0.73
+    -- but the API price parameter must carry the YES-side convention
+    (0.27), never the raw 0.73 NO-terms number."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "ord-no-1", "executions": []}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    # max_price is ALWAYS in the outcome's own terms -- for NO, 0.73 is
+    # "the most I'll pay for NO" (see single_book.to_no_perspective()).
+    order = _order_request(outcome="NO", size_usd=7.30, max_price=0.73, order_type="FOK")
+    client.place_order(order)
+    params = sdk.orders.create_calls[0]
+    assert params["intent"] == "ORDER_INTENT_BUY_SHORT"
+    assert params["price"] == {"value": "0.27", "currency": "USD"}  # 1 - 0.73, NEVER the raw 0.73
+
+
+def test_buy_long_never_converts_its_price(tmp_path):
+    """YES needs no conversion at all -- its own terms ARE the single
+    book's YES axis."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "ord-yes-1", "executions": []}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(outcome="YES", size_usd=7.20, max_price=0.72, order_type="FOK")
+    client.place_order(order)
+    assert sdk.orders.create_calls[0]["price"] == {"value": "0.72", "currency": "USD"}
+
+
+def test_sell_short_also_converts_its_price_to_the_yes_axis(tmp_path):
+    """Closing a NO position (SELL_SHORT) needs the SAME conversion as
+    opening one -- a position's own NO-terms exit price (e.g.
+    take_profit.py's target) must never be sent to the exchange raw."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "exit-no-1", "executions": []}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(side="SELL", outcome="NO", max_price=0.80, quantity=5)
+    client.place_order(order)
+    params = sdk.orders.create_calls[0]
+    assert params["intent"] == "ORDER_INTENT_SELL_SHORT"
+    assert params["price"] == {"value": "0.20", "currency": "USD"}  # 1 - 0.80
+
+
+def test_preview_no_order_also_carries_the_converted_price(tmp_path):
+    """preview_order() must reflect EXACTLY what place_order() would
+    send -- including the NO price conversion -- never two independent
+    constructions that could silently diverge."""
+    preview_detail = {"id": "preview-no", "price": _amount("0.27"), "quantity": 10}
+    sdk = _FakeSDKClient(orders=_FakeOrders(preview_response={"order": preview_detail}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(outcome="NO", size_usd=7.30, max_price=0.73, order_type="FOK")
+    client.preview_order(order)
+    assert sdk.orders.preview_calls[0]["request"]["price"] == {"value": "0.27", "currency": "USD"}
+
+
+def test_quantity_for_a_no_buy_still_uses_the_unconverted_outcome_own_price(tmp_path):
+    """quantity sizing (size_usd / max_price) must stay in the outcome's
+    OWN cost-per-contract terms -- only the FINAL submitted price field
+    is axis-converted, never the sizing math."""
+    sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "ord-no-2", "executions": []}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    order = _order_request(outcome="NO", size_usd=7.30, max_price=0.73, order_type="FOK")
+    client.place_order(order)
+    assert sdk.orders.create_calls[0]["quantity"] == 10  # floor(7.30 / 0.73), NOT floor(7.30 / 0.27)
+
+
 def test_fak_order_maps_to_immediate_or_cancel(tmp_path):
     sdk = _FakeSDKClient(orders=_FakeOrders(create_response={"id": "ord-3", "executions": []}))
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
@@ -1075,6 +1141,67 @@ def test_get_fill_status_fee_usd_is_none_when_not_reported(tmp_path):
     client = PolymarketUSClient(_settings(), sdk_client=sdk)
     fill = client.get_fill_status(order_id)
     assert fill.fee_usd is None
+
+
+# --- 5c. get_fill_status's avgPx axis conversion for a NO (BUY_SHORT/
+# SELL_SHORT) fill -- the exchange always reports avgPx on its single
+# YES axis, regardless of intent; this system's own avg_fill_price must
+# be the NO-terms complement, never the raw YES-axis number. --------------
+
+def test_get_fill_status_converts_avg_px_for_a_buy_short_fill(tmp_path):
+    order_id = "ord-no-fill-1"
+    # The exchange reports avgPx=0.27 (the YES axis level that was
+    # crossed) -- this system's own avg_fill_price for this NO position
+    # must be 0.73 (1 - 0.27), never the raw 0.27.
+    response = _order_response(
+        "ORDER_STATE_FILLED", quantity=10, cum=10, avg_px="0.27", order_id=order_id,
+        intent="ORDER_INTENT_BUY_SHORT",
+    )
+    sdk = _FakeSDKClient(orders=_FakeOrders(retrieve_responses={order_id: response}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    fill = client.get_fill_status(order_id)
+    assert fill.status == "filled"
+    assert fill.avg_fill_price == pytest.approx(0.73)
+
+
+def test_get_fill_status_converts_avg_px_for_a_sell_short_fill(tmp_path):
+    order_id = "ord-no-fill-2"
+    response = _order_response(
+        "ORDER_STATE_FILLED", quantity=5, cum=5, avg_px="0.20", order_id=order_id,
+        intent="ORDER_INTENT_SELL_SHORT",
+    )
+    sdk = _FakeSDKClient(orders=_FakeOrders(retrieve_responses={order_id: response}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    fill = client.get_fill_status(order_id)
+    assert fill.avg_fill_price == pytest.approx(0.80)  # 1 - 0.20
+
+
+def test_get_fill_status_never_converts_a_buy_long_fill(tmp_path):
+    order_id = "ord-yes-fill-1"
+    response = _order_response(
+        "ORDER_STATE_FILLED", quantity=10, cum=10, avg_px="0.72", order_id=order_id,
+        intent="ORDER_INTENT_BUY_LONG",
+    )
+    sdk = _FakeSDKClient(orders=_FakeOrders(retrieve_responses={order_id: response}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    fill = client.get_fill_status(order_id)
+    assert fill.avg_fill_price == pytest.approx(0.72)  # unconverted
+
+
+def test_get_fill_status_fails_closed_on_a_missing_or_unrecognized_intent(tmp_path):
+    """Never guess which axis a fill's avgPx is on -- an order response
+    missing its own intent (or carrying one this system doesn't
+    recognize) must fail closed to "unknown," never silently stored as
+    either outcome's cost basis."""
+    order_id = "ord-no-intent"
+    response = _order_response("ORDER_STATE_FILLED", quantity=5, cum=5, avg_px="0.50", order_id=order_id)
+    del response["order"]["intent"]
+    sdk = _FakeSDKClient(orders=_FakeOrders(retrieve_responses={order_id: response}))
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    fill = client.get_fill_status(order_id)
+    assert fill.status == "unknown"
+    assert fill.filled_shares == 0.0
+    assert fill.avg_fill_price is None
 
 
 # --- 5b. Order preview (orders.preview() -- never places anything) ----------

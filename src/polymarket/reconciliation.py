@@ -121,6 +121,7 @@ def record_fill(
         requested_size_usd=order.size_usd, filled_shares=fill.filled_shares, avg_fill_price=fill.avg_fill_price,
         order_id=fill.order_id, client_order_id=client_order_id, status=fill.status,
         opened_at=now, close_time=order.close_time, entry_context=entry_context,
+        single_book_market=order.single_book_market,
     )
     created = position_store.add_if_absent(position)  # the secondary idempotency guard
     if not created:

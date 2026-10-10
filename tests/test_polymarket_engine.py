@@ -623,3 +623,227 @@ def test_run_cycle_reconciles_immediately_with_live_auto_execute(tmp_path):
     positions = position_store.load()
     assert len(positions) == 1
     assert positions[0].order_id == "ex-live-1"
+
+
+# --- Single-order-book venue (Polymarket US) end to end --------------------
+# The critical pricing-bug fix: this venue has exactly ONE real order
+# book (token_id_yes == token_id_no == the same market slug). engine.py
+# must fetch it ONCE per cycle and derive NO's own view via
+# single_book.to_no_perspective() -- never fetch "NO's own book" a
+# second time (that would return the exact same data and misread it as
+# two independent prices -- the original bug report: identical
+# YES_ASK/NO_ASK readings in the logs).
+
+from src.polymarket.single_book import to_no_perspective  # noqa: E402
+
+
+def _single_book_market(**overrides) -> BinaryMarket:
+    now = datetime.now(timezone.utc)
+    defaults = dict(
+        condition_id="sb-c1", question="Will BTC be up?", token_id_yes="slug-1", token_id_no="slug-1",
+        close_time=now + timedelta(seconds=200), fetched_at=now, yes_bid=0.60, yes_ask=0.62,
+    )
+    defaults.update(overrides)
+    return BinaryMarket(**defaults)
+
+
+class _FakeSingleBookClient:
+    """Serves exactly ONE real OrderBookSnapshot regardless of which
+    (identical) token_id is asked for -- counts calls so a test can
+    prove engine.py never fetches it twice per cycle."""
+
+    def __init__(self, market: BinaryMarket | None, book: OrderBookSnapshot):
+        self._market = market
+        self._book = book
+        self._fill_results: dict[str, FillResult] = {}
+        self.get_order_book_calls: list[str] = []
+
+    def find_active_btc_market(self, *, now=None) -> BinaryMarket:
+        if self._market is None:
+            raise NoActiveMarketError("no market open right now")
+        return self._market
+
+    def get_resolution(self, condition_id: str) -> str | None:
+        return None
+
+    def get_order_book(self, token_id: str) -> OrderBookSnapshot:
+        self.get_order_book_calls.append(token_id)
+        return self._book
+
+    def set_fill_result(self, exchange_order_id: str, fill: FillResult) -> None:
+        self._fill_results[exchange_order_id] = fill
+
+    def get_fill_status(self, exchange_order_id: str) -> FillResult:
+        return self._fill_results[exchange_order_id]
+
+
+def _single_book_harness(tmp_path: Path, market: BinaryMarket | None, book: OrderBookSnapshot):
+    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
+    client = _FakeSingleBookClient(market, book)
+    strategy = BtcMomentumStrategy()
+    risk = PolymarketRiskManager(settings)
+    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
+    gateway = PaperPolymarketGateway(settings, logger)
+    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
+    position_store = PolymarketPositionStore(tmp_path / "positions.json")
+    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
+    history = MarketHistory()
+    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    return dict(
+        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
+        decision_logger=logger, state_store=state_store, position_store=position_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+    )
+
+
+def test_single_book_market_fetches_the_real_book_exactly_once_per_cycle(tmp_path):
+    market = _single_book_market()
+    book = OrderBookSnapshot(
+        token_id="slug-1", bids=(BookLevel(price=0.50, size=1000.0),),
+        asks=(BookLevel(price=0.50, size=1000.0),), fetched_at=datetime.now(timezone.utc),
+    )  # mid 0.50 -- deliberately non-qualifying, so no submission side effects matter here
+    harness = _single_book_harness(tmp_path, market, book)
+    run_cycle(**harness)
+    assert harness["client"].get_order_book_calls == ["slug-1"]  # exactly once, never a redundant second fetch
+
+
+def test_single_book_market_yes_midpoint_070_enters_yes_at_the_real_ask(tmp_path):
+    market = _single_book_market()
+    book = OrderBookSnapshot(
+        token_id="slug-1", bids=(BookLevel(price=0.65, size=1000.0),),
+        asks=(BookLevel(price=0.75, size=1000.0),), fetched_at=datetime.now(timezone.utc),
+    )  # mid 0.70 -- the governing worked example
+    harness = _single_book_harness(tmp_path, market, book)
+    report = run_cycle(**harness)
+    assert report.entered is True
+    positions = harness["position_store"].load()
+    assert len(positions) == 1
+    position = positions[0]
+    assert position.outcome == "YES"
+    assert position.single_book_market is True
+    expected_max_price = round(min(0.75 * (1 + harness["settings"].max_price_slippage_pct), 0.99), 4)
+    assert position.avg_fill_price == pytest.approx(expected_max_price)
+
+
+def test_single_book_market_no_midpoint_070_enters_no_at_the_real_short_price(tmp_path):
+    market = _single_book_market()
+    book = OrderBookSnapshot(
+        token_id="slug-1", bids=(BookLevel(price=0.25, size=1000.0),),
+        asks=(BookLevel(price=0.35, size=1000.0),), fetched_at=datetime.now(timezone.utc),
+    )  # yes mid 0.30 -> no implied probability 0.70
+    harness = _single_book_harness(tmp_path, market, book)
+    report = run_cycle(**harness)
+    assert report.entered is True
+    positions = harness["position_store"].load()
+    assert len(positions) == 1
+    position = positions[0]
+    assert position.outcome == "NO"
+    assert position.single_book_market is True
+    # The real NO executable price is 1 - yes_bid (0.75), NEVER the
+    # yes_mid (0.30) and never the raw yes_ask (0.35).
+    no_real_ask = round(1 - 0.25, 4)
+    expected_max_price = round(min(no_real_ask * (1 + harness["settings"].max_price_slippage_pct), 0.99), 4)
+    assert position.avg_fill_price == pytest.approx(expected_max_price)
+
+
+def test_single_book_market_the_original_bug_report_reading_now_resolves_cleanly(tmp_path):
+    """The exact symptom from the bug report: identical YES_ASK/NO_ASK
+    readings (0.88/0.88) in the logs, because the SAME book was being
+    fetched twice and misread as two independent prices. With the fix,
+    there is only ever ONE real reading (yes mid 0.88) -- NO's own
+    implied probability is correctly 0.12, nowhere near qualifying, so
+    this cleanly enters YES instead of the old false "both >= 0.70,
+    conflicting" no-trade."""
+    market = _single_book_market()
+    book = OrderBookSnapshot(
+        token_id="slug-1", bids=(BookLevel(price=0.88, size=1000.0),),
+        asks=(BookLevel(price=0.88, size=1000.0),), fetched_at=datetime.now(timezone.utc),
+    )
+    harness = _single_book_harness(tmp_path, market, book)
+    report = run_cycle(**harness)
+    assert report.entered is True
+    positions = harness["position_store"].load()
+    assert len(positions) == 1
+    assert positions[0].outcome == "YES"
+
+
+def test_single_book_market_no_position_exit_check_uses_the_inverted_book(tmp_path):
+    """A pre-existing NO position on a single-book venue must have its
+    take-profit exit evaluated against single_book.to_no_perspective()'s
+    derived bid (1 - the raw book's best_ask), never the raw book's own
+    best_bid directly. MAX_OPEN_POSITIONS=1 (with state already at the
+    cap) isolates this from the fact that the SAME book, read as a
+    fresh candidate, would ALSO independently qualify NO for a brand
+    new entry -- this test is about the EXIT check specifically, not
+    entry/exit interaction in the same cycle."""
+    market = _single_book_market()
+    # Raw book: bid 0.20 / ask 0.22 -- the NO position's own exit price
+    # is 1 - 0.22 = 0.78, which clears its +5% target (0.73 * 1.05 =
+    # 0.7665). Reading the raw book's own best_bid (0.20) directly
+    # would (wrongly) never reach that target at all.
+    book = OrderBookSnapshot(
+        token_id="slug-1", bids=(BookLevel(price=0.20, size=1000.0),),
+        asks=(BookLevel(price=0.22, size=1000.0),), fetched_at=datetime.now(timezone.utc),
+    )
+    harness = _single_book_harness(tmp_path, market, book)
+    harness["settings"] = PolymarketSettings.from_env(
+        env={"POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_MAX_OPEN_POSITIONS": "1"},
+    )
+    now = datetime.now(timezone.utc)
+    harness["position_store"].add_if_absent(OpenPosition(
+        condition_id="sb-existing", token_id="slug-1", outcome="NO", requested_size_usd=20.0,
+        filled_shares=27.0, avg_fill_price=0.73, order_id="paper:seed", client_order_id="seed-no-1",
+        status="filled", opened_at=now - timedelta(minutes=5), close_time=now + timedelta(minutes=10),
+        single_book_market=True,
+    ))
+    state = harness["state_store"].load(today=now.date())
+    state.open_position_count = 1
+    harness["state_store"].save(state)
+    report = run_cycle(**harness, now=now)
+    assert report.exits_submitted == 1
+    assert not report.entered  # no fresh entry snuck in despite the same book also qualifying NO
+    assert harness["position_store"].load() == []  # paper mode: the exit fills immediately
+
+
+def test_single_book_market_no_position_without_the_flag_reads_the_raw_book_unconverted(tmp_path):
+    """Regression guard for the flag itself: a NO position with
+    single_book_market=False (e.g. one opened on international
+    Polymarket, which genuinely has a separate NO book) must NOT be
+    run through to_no_perspective() -- confirmed here by using the
+    SAME raw book as the test above, where the conversion would have
+    fired but the direct reading must not."""
+    market = _single_book_market()
+    book = OrderBookSnapshot(
+        token_id="slug-1", bids=(BookLevel(price=0.20, size=1000.0),),
+        asks=(BookLevel(price=0.22, size=1000.0),), fetched_at=datetime.now(timezone.utc),
+    )
+    harness = _single_book_harness(tmp_path, market, book)
+    harness["settings"] = PolymarketSettings.from_env(
+        env={"POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_MAX_OPEN_POSITIONS": "1"},
+    )
+    now = datetime.now(timezone.utc)
+    harness["position_store"].add_if_absent(OpenPosition(
+        condition_id="sb-existing-2", token_id="slug-1", outcome="NO", requested_size_usd=20.0,
+        filled_shares=27.0, avg_fill_price=0.73, order_id="paper:seed", client_order_id="seed-no-2",
+        status="filled", opened_at=now - timedelta(minutes=5), close_time=now + timedelta(minutes=10),
+        single_book_market=False,
+    ))
+    state = harness["state_store"].load(today=now.date())
+    state.open_position_count = 1
+    harness["state_store"].save(state)
+    report = run_cycle(**harness, now=now)
+    assert report.exits_submitted == 0  # raw best_bid (0.20) never reaches the 0.7665 target
+    assert not report.entered  # MAX_OPEN_POSITIONS=1, already at the cap -- no fresh entry either
+    assert len(harness["position_store"].load()) == 1
+
+
+def test_single_book_market_sanity_check_against_to_no_perspective_directly(tmp_path):
+    """Cross-check: the exit-check's own math must match
+    single_book.to_no_perspective() exactly, not a hand-rolled
+    equivalent -- this is the one place take_profit.py's own book-
+    inversion step is exercised end to end."""
+    book = OrderBookSnapshot(
+        token_id="slug-1", bids=(BookLevel(price=0.20, size=1000.0),),
+        asks=(BookLevel(price=0.22, size=1000.0),), fetched_at=datetime.now(timezone.utc),
+    )
+    assert to_no_perspective(book).best_bid == pytest.approx(0.78)

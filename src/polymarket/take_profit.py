@@ -32,7 +32,12 @@ stop-loss):
      the only automatic exit this strategy ever takes.
 
 P&L is used ONLY to compute target_price from the position's own real
-fill price -- it is never consulted as an independent signal."""
+fill price -- it is never consulted as an independent signal.
+
+On a single-order-book venue (Polymarket US -- see single_book.py), a
+NO position's "current executable bid" is derived from that venue's
+one real book via single_book.to_no_perspective(), never read
+directly off it -- see check_and_execute_take_profits() below."""
 
 from __future__ import annotations
 
@@ -48,6 +53,7 @@ from src.polymarket.models import OrderBookSnapshot, OrderRequest, OrderResult
 from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import OpenPosition, PolymarketPositionStore
 from src.polymarket.settings import PolymarketSettings
+from src.polymarket.single_book import to_no_perspective
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.trade_learning import CompletedTradeStore
 
@@ -289,6 +295,19 @@ def check_and_execute_take_profits(
                 evidence={"position": current.to_dict()},
             )
             continue
+
+        # On a single-order-book venue (Polymarket US -- see
+        # single_book.py), current.token_id is the SAME single book
+        # regardless of outcome, priced on the YES axis. A NO position's
+        # own "current executable bid" (what closing it right now would
+        # realize) is never that raw book's own best_bid -- it is the
+        # NO-perspective derivation's best_bid (1 - the raw book's
+        # best_ask -- see to_no_perspective's docstring). On a
+        # genuinely two-book venue (international Polymarket), or for a
+        # YES position on either venue, the raw book already IS this
+        # outcome's own real book -- no conversion.
+        if current.outcome == "NO" and current.single_book_market:
+            order_book = to_no_perspective(order_book)
 
         decision = evaluate_take_profit(current, executable_bid=order_book.best_bid)
 

@@ -97,6 +97,7 @@ from src.polymarket.logger import PolymarketDecisionLogger  # noqa: E402
 from src.polymarket.models import OrderRequest  # noqa: E402
 from src.polymarket.pending import PolymarketPendingOrderStore  # noqa: E402
 from src.polymarket.positions import PolymarketPositionStore  # noqa: E402
+from src.polymarket.single_book import is_single_book_market, to_no_perspective  # noqa: E402
 from src.polymarket.risk import PolymarketRiskManager, RiskDecision  # noqa: E402
 from src.polymarket.settings import PolymarketSettings  # noqa: E402
 from src.polymarket.state import DailyPnlStateStore  # noqa: E402
@@ -164,11 +165,21 @@ def run_manual_test(
     token_id = market.token_id_for(outcome)
     print(f"EVENT SLUG: {market.condition_id}")
     print(f"TRADEABLE MARKET SLUG: {token_id}")
+    # On a single-order-book venue (Polymarket US -- token_id_yes ==
+    # token_id_no), there is only ONE real book to fetch; a NO outcome's
+    # own view of it is DERIVED (single_book.to_no_perspective()), never
+    # fetched a second time under a different name (see engine.py's own
+    # module docstring and this round's bug report -- identical
+    # YES/NO readings were always one real book read twice).
+    single_book_market = is_single_book_market(market)
     try:
         order_book = client.get_order_book(token_id)
+        if outcome == "NO" and single_book_market:
+            order_book = to_no_perspective(order_book)
     except Exception as exc:  # noqa: BLE001 - this script's whole job is to surface exactly this kind of failure
         print(f"REFUSING: could not retrieve the order book: {type(exc).__name__}: {exc}")
         return 1
+    print(f"Single-order-book venue: {single_book_market}")
     print(f"Order book ({outcome}): best_bid={order_book.best_bid} best_ask={order_book.best_ask}")
     liquidity = order_book.executable_liquidity_usd(side="BUY", max_price=max_price)
     print(f"Executable liquidity at/below ${max_price:.4f}: ${liquidity:.2f}")
@@ -196,7 +207,7 @@ def run_manual_test(
     order = OrderRequest(
         condition_id=market.condition_id, token_id=token_id, outcome=outcome, side="BUY",
         size_usd=amount, max_price=max_price, close_time=market.close_time, reason="manual test",
-        order_type=settings.default_order_type,
+        order_type=settings.default_order_type, single_book_market=single_book_market,
     )
     print(f"Order: outcome={outcome} size_usd=${amount:.2f} max_price=${max_price:.4f} order_type={order.order_type}")
 

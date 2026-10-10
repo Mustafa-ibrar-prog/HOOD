@@ -46,6 +46,7 @@ from src.polymarket.positions import PolymarketPositionStore
 from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.simple_entry_signal import assess_simple_entry
+from src.polymarket.single_book import is_single_book_market, to_no_perspective
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.strategy import BtcMomentumStrategy
 from src.polymarket.take_profit import check_and_execute_take_profits
@@ -216,13 +217,22 @@ def run_cycle(
     close_time = market.close_time if market.close_time.tzinfo else market.close_time.replace(tzinfo=timezone.utc)
     seconds_remaining = (close_time - now).total_seconds()
 
-    # --- CHECK REAL YES/NO ASK (see simple_entry_signal.py) -- BOTH
-    # outcomes' own order books are needed up front: which side (if
-    # either) qualifies isn't known until both are checked. Same
-    # rate-limit-safe, never-crash handling as before.
+    # --- CHECK REAL YES/NO IMPLIED PROBABILITY (see simple_entry_signal.py
+    # and single_book.py). On a genuinely TWO-book venue (international
+    # Polymarket), YES's and NO's own real, independent order books are
+    # both fetched. On a SINGLE-book venue (Polymarket US -- detected
+    # structurally via token_id_yes == token_id_no, never a venue name
+    # or setting), there is only ONE real book to fetch: fetching
+    # "NO's own book" a second time would return the exact same data
+    # under a different name and misread it as a second, independent
+    # price (the exact bug this round fixes -- identical YES_ASK/NO_ASK
+    # readings in the logs). single_book.to_no_perspective() derives
+    # NO's own economically-correct view of that SAME one real book
+    # instead -- never a second fetch.
+    single_book_market = is_single_book_market(market)
     try:
         yes_order_book = client.get_order_book(market.token_id_yes)
-        no_order_book = client.get_order_book(market.token_id_no)
+        no_order_book = to_no_perspective(yes_order_book) if single_book_market else client.get_order_book(market.token_id_no)
     except Exception as exc:  # noqa: BLE001 - a book-fetch failure (rate limit or otherwise) must never crash the bot or be treated as tradeable
         decision_logger.log_decision(
             kind="no_trade",
@@ -243,20 +253,27 @@ def run_cycle(
     decision_logger.log_decision(
         kind="simple_entry_signal",
         reason=(
-            f"YES_ASK={signal.yes_ask} NO_ASK={signal.no_ask} OUTCOME={signal.outcome} "
+            f"YES_BID={signal.yes_bid} YES_ASK={signal.yes_ask} MARKET_MIDPOINT={signal.market_midpoint} "
+            f"YES_IMPLIED_PROBABILITY={signal.yes_implied_probability} "
+            f"NO_IMPLIED_PROBABILITY={signal.no_implied_probability} SELECTED_OUTCOME={signal.outcome} "
+            f"EXECUTABLE_ENTRY_PRICE={signal.executable_entry_price} "
             f"REMAINING_SECONDS={seconds_remaining:.0f} {signal.reason}"
         ),
         evidence={
-            "condition_id": market.condition_id, "yes_ask": signal.yes_ask, "no_ask": signal.no_ask,
-            "outcome": signal.outcome, "remaining_seconds": seconds_remaining,
+            "condition_id": market.condition_id, "single_book_market": single_book_market,
+            "yes_bid": signal.yes_bid, "yes_ask": signal.yes_ask, "market_midpoint": signal.market_midpoint,
+            "yes_implied_probability": signal.yes_implied_probability,
+            "no_implied_probability": signal.no_implied_probability, "outcome": signal.outcome,
+            "executable_entry_price": signal.executable_entry_price, "remaining_seconds": seconds_remaining,
         },
     )
     if signal.outcome is None:
         decision_logger.log_decision(
             kind="no_trade", reason=signal.reason,
             evidence={
-                "question": market.question, "rejection_reason": "no_qualifying_ask",
-                "remaining_seconds": seconds_remaining, "yes_ask": signal.yes_ask, "no_ask": signal.no_ask,
+                "question": market.question, "rejection_reason": "no_qualifying_probability",
+                "remaining_seconds": seconds_remaining, "yes_implied_probability": signal.yes_implied_probability,
+                "no_implied_probability": signal.no_implied_probability,
             },
         )
         return CycleReport(
@@ -320,12 +337,18 @@ def run_cycle(
     decision_logger.log_decision(
         kind="entry_allowed",
         reason=(
-            f"OUTCOME={outcome} YES_ASK={signal.yes_ask} NO_ASK={signal.no_ask} SIZE=${size_usd:.2f} "
+            f"SELECTED_OUTCOME={outcome} MARKET_MIDPOINT={signal.market_midpoint} "
+            f"YES_IMPLIED_PROBABILITY={signal.yes_implied_probability} "
+            f"NO_IMPLIED_PROBABILITY={signal.no_implied_probability} "
+            f"EXECUTABLE_ENTRY_PRICE={signal.executable_entry_price} SIZE=${size_usd:.2f} "
             f"REMAINING_SECONDS={seconds_remaining:.0f} ENTRY_DECISION=ALLOW"
         ),
         evidence={
-            "condition_id": market.condition_id, "selected_outcome": outcome, "yes_ask": signal.yes_ask,
-            "no_ask": signal.no_ask, "actual_allowed_size_usd": size_usd, "remaining_seconds": seconds_remaining,
+            "condition_id": market.condition_id, "selected_outcome": outcome,
+            "yes_implied_probability": signal.yes_implied_probability,
+            "no_implied_probability": signal.no_implied_probability,
+            "executable_entry_price": signal.executable_entry_price,
+            "actual_allowed_size_usd": size_usd, "remaining_seconds": seconds_remaining,
             "entry_price": order_book.best_ask, "spread": market.yes_spread_pct, "liquidity": entry_liquidity_usd,
             "decision": "ALLOW",
         },
@@ -339,8 +362,9 @@ def run_cycle(
     entry_context = {
         "strategy_id": STRATEGY_ID_SIMPLE_PRICE_THRESHOLD,
         "market_question": market.question,
-        "yes_ask_at_entry": signal.yes_ask,
-        "no_ask_at_entry": signal.no_ask,
+        "yes_implied_probability_at_entry": signal.yes_implied_probability,
+        "no_implied_probability_at_entry": signal.no_implied_probability,
+        "executable_entry_price_at_entry": signal.executable_entry_price,
         "polymarket_yes_bid": market.yes_bid,
         "polymarket_yes_ask": market.yes_ask,
         "entry_spread": market.yes_spread_pct,
@@ -351,8 +375,8 @@ def run_cycle(
     order = OrderRequest(
         condition_id=market.condition_id, token_id=token_id, outcome=outcome, side="BUY",
         size_usd=size_usd, max_price=max_price, close_time=market.close_time,
-        reason=f"simple_entry: {outcome} ask >= {settings.simple_entry_ask_threshold:.2f}",
-        order_type=settings.default_order_type,
+        reason=f"simple_entry: {outcome} implied probability >= {settings.simple_entry_ask_threshold:.2f}",
+        order_type=settings.default_order_type, single_book_market=single_book_market,
     )
     result = gateway.submit_order(order)
 

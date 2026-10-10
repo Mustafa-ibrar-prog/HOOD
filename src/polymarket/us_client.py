@@ -142,11 +142,24 @@ src/polymarket/__init__.py). Most importantly:
      treat that as "re-confirm the live pattern," never as a reason to
      fall back to a text search for trading.
   2. The exact book-side/pricing mechanics of a BUY_SHORT ("betting
-     NO") order. This module maps "NO" to ORDER_INTENT_BUY_SHORT with
-     the SAME price/quantity/tif construction as "YES" (ORDER_INTENT_
-     BUY_LONG) — the most defensible reading of CreateOrderParams'
-     shape, but UNVERIFIED. Confirm with orders.preview() before
-     trusting this live.
+     NO") order. RESOLVED BY REASONING, STILL NOT LIVE-CONFIRMED: this
+     venue's MarketBook/MarketBBO types (polymarket_us.types.markets)
+     have exactly ONE bids/offers (bid/ask) pair — there is no second,
+     independent "NO" book or price field anywhere in the installed
+     SDK's schema. The only coherent reading is that `price` is ALWAYS
+     expressed on that one YES axis, for EVERY intent. _build_create_
+     order_params() therefore converts a NO order's price via
+     `1 - order.max_price` before submission (BUY_SHORT/SELL_SHORT),
+     and get_fill_status() converts avgPx back the same way for a NO
+     fill (reading the response's own `intent` to know which to do —
+     see _OUTCOME_FOR_INTENT). This is NOT the same as the earlier,
+     now-superseded assumption that NO reused YES's RAW price
+     unconverted — that was wrong, and is exactly the class of
+     latent bug a live orders.preview() call against a real NO
+     candidate would have caught. STILL CONFIRM with orders.preview()
+     before ever trusting this live — this sandbox cannot reach
+     polymarket.us/docs.polymarket.us to verify it against a real
+     response.
   3. Whether a retail API key_id/secret_key grants direct order-
      placement rights at all, versus Polymarket US's "intermediated
      access via futures commission merchants/brokerages" regulatory
@@ -250,6 +263,16 @@ _RESTING_STATES = frozenset({
     "ORDER_STATE_NEW", "ORDER_STATE_PENDING_NEW", "ORDER_STATE_PENDING_REPLACE",
     "ORDER_STATE_PENDING_CANCEL", "ORDER_STATE_PENDING_RISK", "ORDER_STATE_REPLACED",
 })
+
+# Inverse of _INTENT_FOR_OUTCOME/_CLOSE_INTENT_FOR_OUTCOME above -- used
+# by get_fill_status() to know whether a fill's avgPx (always reported
+# on this venue's single YES axis -- see _build_create_order_params's
+# docstring) needs converting back into this system's own NO-terms
+# convention before it is ever stored as OpenPosition.avg_fill_price.
+_OUTCOME_FOR_INTENT = {
+    "ORDER_INTENT_BUY_LONG": "YES", "ORDER_INTENT_SELL_LONG": "YES",
+    "ORDER_INTENT_BUY_SHORT": "NO", "ORDER_INTENT_SELL_SHORT": "NO",
+}
 
 
 class PolymarketUSClientError(PolymarketClientError):
@@ -811,12 +834,40 @@ class PolymarketUSClient:
             count roughly half the time under ordinary floating-point
             imprecision, which is unacceptable for closing an exact
             position size.
-        `order.max_price` is used as the single `price` field either
-        way — for a BUY it is the ceiling the exchange will not cross;
-        for a SELL it is read as the FLOOR (the minimum acceptable sale
-        price, i.e. the position's own profit-target price) — this
-        venue's CreateOrderParams has one price field regardless of
-        side, so there is no separate min_price to populate.
+        `order.max_price` is ALWAYS in the OUTCOME'S OWN probability/
+        cost terms — for YES that's the real YES-axis price directly;
+        for NO it's the real price a NO buyer/holder pays or receives
+        (computed by the caller from single_book.to_no_perspective()'s
+        derived book — see engine.py/take_profit.py), never the raw
+        YES-axis number. This venue has exactly ONE real order book,
+        priced entirely on the YES axis — there is no separate "NO
+        price" field in CreateOrderParams, so a NO order's price must
+        be converted to the corresponding YES-axis value before it is
+        ever sent: api_price = 1 - order.max_price. This is the ONLY
+        coherent reading of the single order book/single price-field
+        schema (MarketBook has exactly one bids/offers pair, never a
+        second "NO" pair — confirmed in the installed polymarket-us
+        SDK's own types.markets.MarketBook) and matches exactly how
+        this system's own NO-side math already works: going short
+        (BUY_SHORT) by crossing the real YES bid at price P is
+        economically identical to a NO buyer paying (1 - P); closing a
+        NO/short position (SELL_SHORT) by crossing the real YES ask at
+        price P realizes NO proceeds of (1 - P) for the holder. NOT
+        independently confirmed against a live order (this sandbox
+        cannot reach polymarket.us/docs.polymarket.us) — confirm with
+        orders.preview() before this is ever relied on live, per this
+        module's own "unverified" conventions above.
+
+        Applies uniformly to BUY and SELL: for a BUY (entry),
+        order.max_price is the outcome's own ceiling; for a SELL
+        (exit_manager.py's profit-target exit) it is read as the
+        outcome's own FLOOR (the minimum acceptable sale price, i.e.
+        the position's own profit-target price). The conversion only
+        ever touches the FINAL `price` field sent to the exchange —
+        `quantity` (a contract count, sized from size_usd/order.max_price
+        for a BUY) is computed from the SAME outcome-own-terms
+        max_price, since cost-per-contract is correctly expressed in
+        that same axis either way.
         """
         tif = _TIF_FOR_ORDER_TYPE.get(order.order_type)
         if tif is None:
@@ -850,9 +901,16 @@ class PolymarketUSClient:
         else:
             raise PolymarketUSClientError(f"Unsupported side {order.side!r}")
 
+        # Convert to this venue's single YES-axis price convention --
+        # see this method's own docstring above. YES needs no
+        # conversion (the outcome's own terms ARE the YES axis); NO
+        # does, unconditionally, since this venue always has exactly
+        # one book.
+        api_price = round(1 - order.max_price, 4) if order.outcome == "NO" else order.max_price
+
         return {
             "marketSlug": order.token_id, "intent": intent, "type": "ORDER_TYPE_LIMIT",
-            "price": {"value": f"{order.max_price:.2f}", "currency": "USD"},
+            "price": {"value": f"{api_price:.2f}", "currency": "USD"},
             "quantity": quantity, "tif": tif,
         }
 
@@ -1022,6 +1080,23 @@ class PolymarketUSClient:
                 order_id=exchange_order_id, status="unknown", requested_shares=requested,
                 filled_shares=0.0, avg_fill_price=None, raw={"state": state, "missing_avg_px": True},
             )
+        # avgPx is ALWAYS reported on this venue's single YES axis,
+        # regardless of intent (see _build_create_order_params's
+        # docstring) -- a NO (BUY_SHORT/SELL_SHORT) fill's own
+        # avg_fill_price, in THIS system's outcome-own-terms convention,
+        # is the complement. Fails closed (status="unknown") rather
+        # than guess if the response's own intent is missing or
+        # unrecognized -- never silently store a YES-axis price as a
+        # NO position's cost basis, which would corrupt every
+        # downstream take_profit.py target/P&L computation for it.
+        outcome = _OUTCOME_FOR_INTENT.get(order.get("intent"))
+        if outcome is None:
+            return FillResult(
+                order_id=exchange_order_id, status="unknown", requested_shares=requested,
+                filled_shares=0.0, avg_fill_price=None, raw={"state": state, "unrecognized_intent": order.get("intent")},
+            )
+        if outcome == "NO":
+            avg_price = round(1 - avg_price, 4)
         status = "filled" if cum >= requested else "partially_filled"
         assert status in FILLED_STATUSES  # sanity check against models.py's own vocabulary
         # Order.commissionNotionalTotalCollected (confirmed in the

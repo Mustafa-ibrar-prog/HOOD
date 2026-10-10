@@ -116,6 +116,15 @@ class OpenPosition:
     # never yet reached its +20% floor.
     trailing_stop_armed: bool = False
     trailing_stop_peak_price: float | None = None
+    # Copied verbatim from OrderRequest.single_book_market at entry time
+    # (see models.py and single_book.py) -- True only for a
+    # single-order-book venue (Polymarket US), where this position's
+    # own token_id is the SAME single market book regardless of
+    # outcome. take_profit.py's exit check uses this to know whether a
+    # NO position's "current executable bid" must be derived via
+    # single_book.to_no_perspective() rather than read directly off
+    # the fetched book.
+    single_book_market: bool = False
 
     @property
     def filled_size_usd(self) -> float:
@@ -146,6 +155,7 @@ class OpenPosition:
             entry_context=data.get("entry_context"),
             trailing_stop_armed=bool(data.get("trailing_stop_armed", False)),
             trailing_stop_peak_price=data.get("trailing_stop_peak_price"),
+            single_book_market=bool(data.get("single_book_market", False)),
         )
 
 

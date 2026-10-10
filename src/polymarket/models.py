@@ -99,7 +99,14 @@ class OrderBookSnapshot:
     NO. Polymarket's CLOB books each ERC-1155 token independently (they
     stay near-complementary via arbitrage, but are never guaranteed to
     be exact mirrors), so a NO entry must check NO's own book, not
-    `1 - YES`."""
+    `1 - YES`.
+
+    This is the INTERNATIONAL venue's model. Polymarket US has exactly
+    ONE real order book per market (token_id_yes == token_id_no == the
+    same market slug there) — see single_book.py, which derives NO's
+    own economically-correct view of that one book via
+    to_no_perspective() rather than ever fetching (or fabricating) a
+    second, independent one."""
 
     token_id: str
     bids: tuple[BookLevel, ...]  # best (highest) bid first
@@ -205,7 +212,12 @@ class OrderBookSnapshot:
 class BinaryMarket:
     """One Polymarket binary market snapshot. token_id_yes/token_id_no are
     the two ERC-1155 token ids this market's order book trades — every
-    order references one of them, never a strike or expiration."""
+    order references one of them, never a strike or expiration.
+
+    On Polymarket US (a single-order-book venue) token_id_yes ==
+    token_id_no == that one market's slug -- see single_book.py's
+    is_single_book_market(), the structural (never a venue name/
+    setting) way this is detected."""
 
     condition_id: str
     question: str
@@ -335,6 +347,17 @@ class OrderRequest:
     ref_id: str | None = None
     quantity: int | None = None
     closes_client_order_id: str | None = None
+    # True iff this order's market is a single-order-book venue
+    # (Polymarket US -- see single_book.py), where token_id_yes ==
+    # token_id_no and `price` must be converted to that venue's
+    # single YES-axis convention before submission for an outcome of
+    # "NO" (see us_client.py's _build_create_order_params). Carried
+    # through PendingLiveOrder -> OpenPosition (reconciliation.py) so
+    # a later exit check also knows to read this position's order
+    # book via single_book.to_no_perspective() rather than directly.
+    # False (the default) for international Polymarket's genuinely
+    # separate YES/NO books, which need no such conversion.
+    single_book_market: bool = False
 
     def __post_init__(self) -> None:
         if self.outcome not in _OUTCOMES:
@@ -356,6 +379,7 @@ class OrderRequest:
             "size_usd": self.size_usd, "max_price": self.max_price, "close_time": self.close_time.isoformat(),
             "reason": self.reason, "order_type": self.order_type, "ref_id": self.ref_id,
             "quantity": self.quantity, "closes_client_order_id": self.closes_client_order_id,
+            "single_book_market": self.single_book_market,
         }
 
     @classmethod
@@ -367,6 +391,7 @@ class OrderRequest:
             reason=data.get("reason", ""), order_type=data.get("order_type", "FOK"),
             ref_id=data.get("ref_id"),
             quantity=data.get("quantity"), closes_client_order_id=data.get("closes_client_order_id"),
+            single_book_market=bool(data.get("single_book_market", False)),
         )
 
 
