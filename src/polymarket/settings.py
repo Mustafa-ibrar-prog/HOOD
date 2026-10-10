@@ -267,9 +267,33 @@ class PolymarketSettings:
     # strategy code. Fractions of the position's own ACTUAL average
     # fill price: target_price = avg_fill_price * (1 + simple_take_profit_pct);
     # stop_loss_price = avg_fill_price * (1 - simple_stop_loss_pct).
-    # Defaults match this round's governing spec: +5% / -20%.
+    # Defaults match this round's governing spec: +10% / -20%.
     simple_take_profit_pct: float
     simple_stop_loss_pct: float
+
+    # --- Minimum entry edge (see simple_entry_signal.py) -- a SECOND,
+    # independent filter layered on top of the threshold-free favored-
+    # side rule above, never a reintroduction of the old fixed ">=0.70"
+    # gate: that gate was an ABSOLUTE floor on one side's own
+    # probability; this is a RELATIVE gap requirement BETWEEN the two
+    # sides. edge = abs(yes_implied_probability - no_implied_probability);
+    # a candidate is only eligible when edge >= simple_min_entry_edge.
+    # Example: YES 60% / NO 40% -> edge 0.20, eligible at the 0.10
+    # default. An exact tie or missing book data were ALREADY no-trade
+    # before this setting existed (see simple_entry_signal.py) and stay
+    # that way regardless of this value.
+    simple_min_entry_edge: float
+    # --- Entry persistence (see engine.MarketHistory.observe_entry_candidate)
+    # -- do not enter on a single snapshot. The SAME favored outcome
+    # (already edge-qualified above) must be the chosen candidate on
+    # this many CONSECUTIVE strategy evaluations, for the SAME market,
+    # before a submission is allowed. The favored side flipping, the
+    # edge falling back below simple_min_entry_edge, a tie, or missing
+    # book data all reset the counter (collapsed into one "outcome is
+    # None this cycle" case -- see simple_entry_signal.py). 1 disables
+    # this filter entirely (every qualifying cycle is immediately
+    # eligible, the pre-this-round behavior).
+    simple_entry_persistence_required: int
 
     # --- Entry retry guard (see entry_guard.py) — an IDEMPOTENCY/safety
     # gate, not a risk threshold: after a live incident showed
@@ -495,6 +519,16 @@ class PolymarketSettings:
                 "POLYMARKET_SIMPLE_STOP_LOSS_PCT must be between 0 and 1 (exclusive) — a stop-loss price "
                 "(avg_fill_price * (1 - pct)) must stay strictly positive"
             )
+        if not 0 <= self.simple_min_entry_edge < 1:
+            raise PolymarketConfigError(
+                "POLYMARKET_SIMPLE_MIN_ENTRY_EDGE must be between 0 (inclusive -- disables the filter) and "
+                "1 (exclusive -- a probability gap can never reach 1)"
+            )
+        if self.simple_entry_persistence_required < 1:
+            raise PolymarketConfigError(
+                "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED must be >= 1 (1 disables the filter -- every "
+                "qualifying cycle is immediately eligible)"
+            )
         if self.simple_entry_size_usd != 20.0:
             raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_SIZE_USD must be exactly $20 (minimum == maximum == $20)")
         # Deliberately NOT cross-validated against max_bet_usd here: a
@@ -713,8 +747,10 @@ class PolymarketSettings:
             min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 10.0),
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
             simple_entry_size_usd=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_SIZE_USD", 20.0),
-            simple_take_profit_pct=_get_float(env, "POLYMARKET_SIMPLE_TAKE_PROFIT_PCT", 0.05),
+            simple_take_profit_pct=_get_float(env, "POLYMARKET_SIMPLE_TAKE_PROFIT_PCT", 0.10),
             simple_stop_loss_pct=_get_float(env, "POLYMARKET_SIMPLE_STOP_LOSS_PCT", 0.20),
+            simple_min_entry_edge=_get_float(env, "POLYMARKET_SIMPLE_MIN_ENTRY_EDGE", 0.10),
+            simple_entry_persistence_required=_get_int(env, "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED", 3),
             entry_retry_cooldown_seconds=_get_float(env, "POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS", 120.0),
             entry_retry_min_price_change=_get_float(env, "POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE", 0.02),
             exit_retry_cooldown_seconds=_get_float(env, "POLYMARKET_EXIT_RETRY_COOLDOWN_SECONDS", 90.0),

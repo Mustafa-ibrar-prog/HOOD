@@ -1,6 +1,6 @@
 """Focused tests for take_profit.py -- the ONLY automatic exit logic
 as of this round: a configurable take-profit AND a configurable
-stop-loss (defaults +5% / -20%), BOTH driven by settings rather than
+stop-loss (defaults +10% / -20%), BOTH driven by settings rather than
 hard-coded constants. Pure-function tests against evaluate_take_profit()
 directly, plus a restart-persistence test against the store; the
 per-cycle submit/loop functions (check_and_execute_take_profits) are
@@ -37,10 +37,10 @@ def _position(**overrides) -> OpenPosition:
 # --- A: strictly between the two bounds -> HOLD, never an early exit -------
 
 def test_a_below_target_holds_never_an_early_exit():
-    position = _position(avg_fill_price=0.70)  # target = 0.735 at the 5% default
+    position = _position(avg_fill_price=0.70)  # target = 0.77 at the 10% default
     decision = evaluate_take_profit(position, executable_bid=0.73)
     assert decision.action == "HOLD"
-    assert decision.target_price == pytest.approx(0.735)
+    assert decision.target_price == pytest.approx(0.77)
 
 
 def test_a2_a_profitable_but_sub_target_position_still_holds():
@@ -63,10 +63,10 @@ def test_a3_a_small_loss_above_the_stop_loss_floor_also_holds():
 
 def test_b_exactly_at_target_sells():
     position = _position(avg_fill_price=0.70)
-    decision = evaluate_take_profit(position, executable_bid=0.735)
+    decision = evaluate_take_profit(position, executable_bid=0.77)
     assert decision.action == "SELL"
     assert decision.trigger == TRIGGER_TAKE_PROFIT
-    assert decision.executable_bid == pytest.approx(0.735)
+    assert decision.executable_bid == pytest.approx(0.77)
 
 
 # --- C: above the target -> SELL (reaches OR exceeds) ----------------------
@@ -91,7 +91,7 @@ def test_d_no_executable_bid_is_always_hold():
 
 @pytest.mark.parametrize(
     ("entry_price", "expected_target"),
-    [(0.70, 0.735), (0.75, 0.7875), (0.80, 0.84)],
+    [(0.70, 0.77), (0.75, 0.825), (0.80, 0.88)],
 )
 def test_e_worked_examples_from_spec(entry_price, expected_target):
     position = _position(avg_fill_price=entry_price)
@@ -99,14 +99,14 @@ def test_e_worked_examples_from_spec(entry_price, expected_target):
     assert decision.target_price == pytest.approx(expected_target)
 
 
-def test_e2_default_take_profit_pct_is_exactly_005():
-    assert DEFAULT_TAKE_PROFIT_PCT == pytest.approx(0.05)
+def test_e2_default_take_profit_pct_is_exactly_010():
+    assert DEFAULT_TAKE_PROFIT_PCT == pytest.approx(0.10)
 
 
 def test_e3_dollar_worked_examples_from_the_governing_spec():
-    # $100 entry -> ~$105 take-profit; $20 entry -> ~$21.
-    assert _position(avg_fill_price=100.0).avg_fill_price * (1 + DEFAULT_TAKE_PROFIT_PCT) == pytest.approx(105.0)
-    assert _position(avg_fill_price=20.0).avg_fill_price * (1 + DEFAULT_TAKE_PROFIT_PCT) == pytest.approx(21.0)
+    # $100 entry -> $110 take-profit; $20 entry -> ~$22.
+    assert _position(avg_fill_price=100.0).avg_fill_price * (1 + DEFAULT_TAKE_PROFIT_PCT) == pytest.approx(110.0)
+    assert _position(avg_fill_price=20.0).avg_fill_price * (1 + DEFAULT_TAKE_PROFIT_PCT) == pytest.approx(22.0)
 
 
 # --- F: a full position exit sells the ACTUAL filled share count, never
@@ -139,8 +139,9 @@ def test_g_target_price_persists_across_a_restart(tmp_path):
     reloaded = reopened_store.get("restart-1")
     assert reloaded is not None
 
-    decision_before = evaluate_take_profit(_position(avg_fill_price=0.70), executable_bid=0.735)
-    decision_after_restart = evaluate_take_profit(reloaded, executable_bid=0.735)
+    target_price = 0.70 * (1 + DEFAULT_TAKE_PROFIT_PCT)
+    decision_before = evaluate_take_profit(_position(avg_fill_price=0.70), executable_bid=target_price)
+    decision_after_restart = evaluate_take_profit(reloaded, executable_bid=target_price)
     assert decision_after_restart.target_price == pytest.approx(decision_before.target_price)
     assert decision_after_restart.action == decision_before.action == "SELL"
 
@@ -200,7 +201,7 @@ def test_i3_dollar_worked_examples_from_the_governing_spec():
 # --- J: strictly between both bounds -> HOLD, checking both bounds ---------
 
 def test_j_strictly_between_stop_loss_and_target_holds():
-    position = _position(avg_fill_price=0.70)  # stop_loss=0.56, target=0.735
+    position = _position(avg_fill_price=0.70)  # stop_loss=0.56, target=0.77
     decision = evaluate_take_profit(position, executable_bid=0.65)
     assert decision.action == "HOLD"
     assert decision.trigger is None
@@ -239,8 +240,8 @@ def test_l_stop_loss_price_persists_across_a_restart(tmp_path):
 
 def test_m_a_different_take_profit_pct_changes_the_target_not_the_default():
     position = _position(avg_fill_price=0.70)
-    decision = evaluate_take_profit(position, executable_bid=0.70, take_profit_pct=0.10)
-    assert decision.target_price == pytest.approx(0.77)  # 0.70 * 1.10, not the 5% default's 0.735
+    decision = evaluate_take_profit(position, executable_bid=0.70, take_profit_pct=0.20)
+    assert decision.target_price == pytest.approx(0.84)  # 0.70 * 1.20, not the 10% default's 0.77
 
 
 def test_m2_a_different_stop_loss_pct_changes_the_floor_not_the_default():
@@ -250,15 +251,12 @@ def test_m2_a_different_stop_loss_pct_changes_the_floor_not_the_default():
 
 
 def test_m3_a_configured_pair_sells_at_its_own_configured_target_not_the_default():
-    # At the DEFAULT 5%/20%, 0.76 would just HOLD (below the 0.735
-    # default target, above the 0.56 default floor) -- but with a
-    # configured 10% take-profit, target becomes 0.77... still holds
-    # at 0.76. Use 0.78 instead to cross the CONFIGURED target while
-    # remaining BELOW where the default target would already have
-    # fired, proving the configured value (not the default) is what's
-    # actually being evaluated.
+    # At the DEFAULT 10%/20%, 0.75 holds (below the 0.77 default
+    # target). A configured 5% take-profit target (0.735) is BELOW
+    # 0.75, so it sells instead -- proving the configured value (not
+    # the default) is what's actually being evaluated.
     position = _position(avg_fill_price=0.70)
-    configured = evaluate_take_profit(position, executable_bid=0.76, take_profit_pct=0.10)
-    default = evaluate_take_profit(position, executable_bid=0.76)
-    assert configured.action == "HOLD"  # 0.76 < 0.77 (configured 10% target)
-    assert default.action == "SELL"  # 0.76 >= 0.735 (default 5% target)
+    configured = evaluate_take_profit(position, executable_bid=0.75, take_profit_pct=0.05)
+    default = evaluate_take_profit(position, executable_bid=0.75)
+    assert configured.action == "SELL"  # 0.75 >= 0.735 (configured 5% target)
+    assert default.action == "HOLD"  # 0.75 < 0.77 (default 10% target)

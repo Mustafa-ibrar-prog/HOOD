@@ -90,7 +90,16 @@ class _FakeClient:
 
 
 def _harness(tmp_path: Path, market: BinaryMarket | None, *, recent_mids_seed: list[float] | None = None, book_liquidity_shares: float = 1000.0):
-    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
+    # POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED=1 here, NOT the
+    # production default of 3 -- this harness's tests are about risk
+    # gates, retry guards, reconciliation, etc., not the persistence
+    # filter itself (see test_qualifying_setup_enters_a_paper_position
+    # and friends, which call run_cycle() exactly ONCE and expect an
+    # immediate entry). The persistence filter has its own dedicated
+    # tests further down this file.
+    settings = PolymarketSettings.from_env(env={
+        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "1",
+    })
     client = _FakeClient(market, book_liquidity_shares=book_liquidity_shares)
     strategy = BtcMomentumStrategy()
     risk = PolymarketRiskManager(settings)
@@ -521,6 +530,71 @@ def test_market_history_resets_on_a_different_market():
     assert len(history.mids) == 1  # reset for the new market
 
 
+# --- MarketHistory.observe_entry_candidate -- the entry PERSISTENCE
+# tracker (Change 3), unit-tested directly against the pure state
+# machine before the end-to-end run_cycle() tests further down prove
+# it's actually wired in. --------------------------------------------------
+
+def test_persistence_requires_the_configured_number_of_consecutive_observations():
+    history = MarketHistory()
+    assert history.observe_entry_candidate("YES", required=3) is False
+    assert history.consecutive_qualifying_observations == 1
+    assert history.observe_entry_candidate("YES", required=3) is False
+    assert history.consecutive_qualifying_observations == 2
+    assert history.observe_entry_candidate("YES", required=3) is True
+    assert history.consecutive_qualifying_observations == 3
+
+
+def test_persistence_required_of_one_is_satisfied_immediately():
+    history = MarketHistory()
+    assert history.observe_entry_candidate("NO", required=1) is True
+
+
+def test_persistence_a_flipped_favored_side_resets_the_counter_to_one():
+    history = MarketHistory()
+    history.observe_entry_candidate("YES", required=3)
+    history.observe_entry_candidate("YES", required=3)
+    assert history.consecutive_qualifying_observations == 2
+    # NO now, not YES -- the count restarts at 1 for the new side, never
+    # carries over the prior side's count and never drops to 0 (this
+    # cycle itself still qualifies, just for a different outcome).
+    satisfied = history.observe_entry_candidate("NO", required=3)
+    assert satisfied is False
+    assert history.persistent_outcome == "NO"
+    assert history.consecutive_qualifying_observations == 1
+
+
+def test_persistence_none_resets_the_counter_to_zero():
+    # None covers every reset condition at once (see
+    # simple_entry_signal.py): a tie, missing book data, OR an edge
+    # that fell below the configured minimum.
+    history = MarketHistory()
+    history.observe_entry_candidate("YES", required=3)
+    history.observe_entry_candidate("YES", required=3)
+    assert history.consecutive_qualifying_observations == 2
+    satisfied = history.observe_entry_candidate(None, required=3)
+    assert satisfied is False
+    assert history.persistent_outcome is None
+    assert history.consecutive_qualifying_observations == 0
+    # A fresh qualifying observation afterward starts over at 1, not
+    # resuming from the count before the reset.
+    history.observe_entry_candidate("YES", required=3)
+    assert history.consecutive_qualifying_observations == 1
+
+
+def test_persistence_resets_on_a_new_market_exactly_like_mids():
+    market1 = _market(condition_id="c1", yes_bid=0.5, yes_ask=0.52)
+    market2 = _market(condition_id="c2", yes_bid=0.3, yes_ask=0.32)
+    history = MarketHistory()
+    history.observe(market1)
+    history.observe_entry_candidate("YES", required=5)
+    history.observe_entry_candidate("YES", required=5)
+    assert history.consecutive_qualifying_observations == 2
+    history.observe(market2)  # a genuinely different market
+    assert history.persistent_outcome is None
+    assert history.consecutive_qualifying_observations == 0
+
+
 # --- Reconciliation wiring (Task 5) -------------------------------------------
 
 def test_run_cycle_sweeps_and_reconciles_a_prior_cycles_pending_order(tmp_path):
@@ -590,7 +664,7 @@ def test_run_cycle_reconciles_immediately_with_live_auto_execute(tmp_path):
     settings = PolymarketSettings.from_env(env={
         "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_TRADING_MODE": "live",
         "POLYMARKET_LIVE_TRADING_CONFIRMED": "true", "POLYMARKET_LIVE_AUTO_EXECUTE": "true",
-        "POLYMARKET_PRIVATE_KEY": _VALID_KEY,
+        "POLYMARKET_PRIVATE_KEY": _VALID_KEY, "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "1",
     })
     client = _FakeClient(market)
 
@@ -683,7 +757,12 @@ class _FakeSingleBookClient:
 
 
 def _single_book_harness(tmp_path: Path, market: BinaryMarket | None, book: OrderBookSnapshot):
-    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
+    # Same rationale as _harness() above -- persistence required=1 so
+    # these tests' single run_cycle() call enters immediately, exactly
+    # as before this round's persistence filter existed.
+    settings = PolymarketSettings.from_env(env={
+        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "1",
+    })
     client = _FakeSingleBookClient(market, book)
     strategy = BtcMomentumStrategy()
     risk = PolymarketRiskManager(settings)
@@ -783,10 +862,10 @@ def test_single_book_market_no_position_exit_check_uses_the_inverted_book(tmp_pa
     entry/exit interaction in the same cycle."""
     market = _single_book_market()
     # Raw book: bid 0.20 / ask 0.22 -- the NO position's own exit price
-    # is 1 - 0.22 = 0.78, which clears its +5% take-profit target
-    # (0.73 * 1.05 = 0.7665). Reading the raw book's own best_bid
+    # is 1 - 0.22 = 0.78, which clears its +10% take-profit target
+    # (0.65 * 1.10 = 0.715). Reading the raw book's own best_bid
     # (0.20) directly would (wrongly) read as a catastrophic loss
-    # instead (well past the -20% stop-loss floor, 0.584) -- see the
+    # instead (well past the -20% stop-loss floor, 0.52) -- see the
     # next test, which proves exactly that confusion when the flag is
     # (correctly, for this position) False.
     book = OrderBookSnapshot(
@@ -800,7 +879,7 @@ def test_single_book_market_no_position_exit_check_uses_the_inverted_book(tmp_pa
     now = datetime.now(timezone.utc)
     harness["position_store"].add_if_absent(OpenPosition(
         condition_id="sb-existing", token_id="slug-1", outcome="NO", requested_size_usd=20.0,
-        filled_shares=27.0, avg_fill_price=0.73, order_id="paper:seed", client_order_id="seed-no-1",
+        filled_shares=27.0, avg_fill_price=0.65, order_id="paper:seed", client_order_id="seed-no-1",
         status="filled", opened_at=now - timedelta(minutes=5), close_time=now + timedelta(minutes=10),
         single_book_market=True,
     ))
@@ -823,7 +902,7 @@ def test_single_book_market_no_position_without_the_flag_misreads_the_raw_book_a
     SAME raw book, position size, and avg_fill_price as the test
     above, differing ONLY in the flag. Reading the raw book directly
     (0.20) misreads a genuinely profitable NO position (whose real
-    exit price is 0.78, well above its 0.7665 take-profit target) as a
+    exit price is 0.78, well above its 0.715 take-profit target) as a
     catastrophic loss instead -- triggering the WRONG exit (stop-loss,
     not take-profit). This is exactly why the flag, and the conversion
     it gates, matter: the position still exits (there is no "silently
@@ -841,7 +920,7 @@ def test_single_book_market_no_position_without_the_flag_misreads_the_raw_book_a
     now = datetime.now(timezone.utc)
     harness["position_store"].add_if_absent(OpenPosition(
         condition_id="sb-existing-2", token_id="slug-1", outcome="NO", requested_size_usd=20.0,
-        filled_shares=27.0, avg_fill_price=0.73, order_id="paper:seed", client_order_id="seed-no-2",
+        filled_shares=27.0, avg_fill_price=0.65, order_id="paper:seed", client_order_id="seed-no-2",
         status="filled", opened_at=now - timedelta(minutes=5), close_time=now + timedelta(minutes=10),
         single_book_market=False,
     ))
@@ -866,3 +945,116 @@ def test_single_book_market_sanity_check_against_to_no_perspective_directly(tmp_
         asks=(BookLevel(price=0.22, size=1000.0),), fetched_at=datetime.now(timezone.utc),
     )
     assert to_no_perspective(book).best_bid == pytest.approx(0.78)
+
+
+# --- Minimum entry edge (Change 2) + entry persistence (Change 3),
+# end to end through run_cycle() -- proving both are actually WIRED IN
+# from settings, not just correct in isolation (see
+# test_polymarket_simple_entry_signal.py and the MarketHistory unit
+# tests above). ---------------------------------------------------------
+
+def _persistence_harness(tmp_path: Path, market: BinaryMarket, *, min_entry_edge: float = 0.10, persistence_required: int = 3):
+    harness = _harness(tmp_path, market)
+    harness["settings"] = PolymarketSettings.from_env(env={
+        "POLYMARKET_LOG_DIR": str(tmp_path),
+        "POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": str(min_entry_edge),
+        "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": str(persistence_required),
+    })
+    return harness
+
+
+def test_entry_requires_n_consecutive_qualifying_cycles_before_entering(tmp_path):
+    """The DEFAULT persistence_required=3 -- a favored, edge-qualified
+    side must hold for 3 CONSECUTIVE cycles before a submission
+    happens, never on the first qualifying snapshot."""
+    market = _market(yes_bid=0.78, yes_ask=0.80)  # YES favored, edge 0.58 -- comfortably above the 0.10 minimum
+    harness = _persistence_harness(tmp_path, market, persistence_required=3)
+    now = datetime.now(timezone.utc)
+
+    assert not run_cycle(**harness, now=now).entered  # 1/3
+    assert not run_cycle(**harness, now=now).entered  # 2/3
+    report = run_cycle(**harness, now=now)
+    assert report.entered  # 3/3 -- the 3rd consecutive qualifying observation
+    positions = harness["position_store"].load()
+    assert len(positions) == 1
+    assert positions[0].outcome == "YES"
+
+
+def test_entry_persistence_pending_cycles_are_logged_and_never_submit(tmp_path):
+    market = _market(yes_bid=0.78, yes_ask=0.80)
+    harness = _persistence_harness(tmp_path, market, persistence_required=3)
+    now = datetime.now(timezone.utc)
+    run_cycle(**harness, now=now)
+    run_cycle(**harness, now=now)
+    assert harness["position_store"].load() == []
+    pending_logs = [e for e in harness["decision_logger"].read_all() if e.get("kind") == "entry_persistence_pending"]
+    assert len(pending_logs) == 2
+    assert pending_logs[0]["evidence"]["consecutive_qualifying_observations"] == 1
+    assert pending_logs[1]["evidence"]["consecutive_qualifying_observations"] == 2
+
+
+def test_entry_persistence_required_of_one_enters_on_the_first_qualifying_cycle(tmp_path):
+    market = _market(yes_bid=0.78, yes_ask=0.80)
+    harness = _persistence_harness(tmp_path, market, persistence_required=1)
+    report = run_cycle(**harness, now=datetime.now(timezone.utc))
+    assert report.entered
+
+
+def test_entry_persistence_resets_when_the_favored_side_flips(tmp_path):
+    """A flipped favored side (YES -> NO) restarts the persistence
+    count rather than carrying it over -- required=3, so 2 YES
+    observations then 2 NO observations never together add up to an
+    entry; only a FRESH run of 3 consecutive NO observations does."""
+    yes_favored = _market(condition_id="flip-1", yes_bid=0.78, yes_ask=0.80)  # edge 0.58, favors YES
+    no_favored = _market(condition_id="flip-1", yes_bid=0.20, yes_ask=0.22)  # edge 0.58, favors NO
+    harness = _persistence_harness(tmp_path, yes_favored, persistence_required=3)
+    now = datetime.now(timezone.utc)
+
+    assert not run_cycle(**harness, now=now).entered  # YES, 1/3
+    assert not run_cycle(**harness, now=now).entered  # YES, 2/3
+    harness["client"]._market = no_favored
+    assert not run_cycle(**harness, now=now).entered  # flipped -- restarts at NO, 1/3 (never 3/3)
+    assert not run_cycle(**harness, now=now).entered  # NO, 2/3
+    report = run_cycle(**harness, now=now)
+    assert report.entered  # NO, 3/3 -- a fresh run after the flip
+    positions = harness["position_store"].load()
+    assert len(positions) == 1
+    assert positions[0].outcome == "NO"
+
+
+def test_entry_persistence_resets_when_the_edge_drops_below_the_minimum(tmp_path):
+    """An edge that temporarily falls back below the configured
+    minimum resets the counter, exactly like a side flip or missing
+    data -- required=2 here (fewer cycles needed) keeps the proof
+    unambiguous: 1 qualifying + 1 insufficient-edge + 1 qualifying must
+    NOT short-circuit to an entry; only a FRESH second consecutive
+    qualifying cycle does."""
+    strong_yes = _market(condition_id="edge-drop-1", yes_bid=0.78, yes_ask=0.80)  # edge 0.58
+    weak_yes = _market(condition_id="edge-drop-1", yes_bid=0.51, yes_ask=0.51)  # mid 0.51, edge 0.02 -- below the 0.10 minimum
+    harness = _persistence_harness(tmp_path, strong_yes, persistence_required=2)
+    now = datetime.now(timezone.utc)
+
+    assert not run_cycle(**harness, now=now).entered  # 1/2
+    harness["client"]._market = weak_yes
+    assert not run_cycle(**harness, now=now).entered  # insufficient edge -- resets to 0/2
+    harness["client"]._market = strong_yes
+    assert not run_cycle(**harness, now=now).entered  # fresh 1/2
+    report = run_cycle(**harness, now=now)
+    assert report.entered  # fresh 2/2
+
+
+def test_min_entry_edge_is_actually_wired_from_settings_into_run_cycle(tmp_path):
+    """A market whose edge would have qualified under the
+    threshold-free favored-side rule alone, but falls below a
+    DELIBERATELY RAISED POLYMARKET_SIMPLE_MIN_ENTRY_EDGE, must NOT
+    enter -- proving engine.py actually reads
+    settings.simple_min_entry_edge (never a hard-coded value or the
+    pure function's own 0.0 unit-test fallback)."""
+    market = _market(yes_bid=0.55, yes_ask=0.55)  # mid 0.55, edge 0.10 -- clearly favors YES
+    harness = _persistence_harness(tmp_path, market, min_entry_edge=0.20, persistence_required=1)
+    report = run_cycle(**harness, now=datetime.now(timezone.utc))
+    assert not report.entered
+    no_trade = [e for e in harness["decision_logger"].read_all() if e.get("kind") == "no_trade"]
+    assert len(no_trade) == 1
+    assert "insufficient edge" in no_trade[0]["reason"]
+    assert harness["position_store"].load() == []

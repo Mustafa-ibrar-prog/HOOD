@@ -89,18 +89,61 @@ def test_entry_cutoff_setting_no_longer_exists():
 
 def test_take_profit_and_stop_loss_defaults_match_the_governing_spec():
     """Both are configurable settings, never hard-coded constants --
-    see take_profit.py. Defaults: +5% take-profit, -20% stop-loss."""
+    see take_profit.py. Defaults: +10% take-profit, -20% stop-loss."""
     settings = PolymarketSettings.from_env(env={})
-    assert settings.simple_take_profit_pct == pytest.approx(0.05)
+    assert settings.simple_take_profit_pct == pytest.approx(0.10)
     assert settings.simple_stop_loss_pct == pytest.approx(0.20)
 
 
 def test_take_profit_and_stop_loss_are_configurable_via_env():
     settings = PolymarketSettings.from_env(env={
-        "POLYMARKET_SIMPLE_TAKE_PROFIT_PCT": "0.10", "POLYMARKET_SIMPLE_STOP_LOSS_PCT": "0.15",
+        "POLYMARKET_SIMPLE_TAKE_PROFIT_PCT": "0.25", "POLYMARKET_SIMPLE_STOP_LOSS_PCT": "0.15",
     })
-    assert settings.simple_take_profit_pct == pytest.approx(0.10)
+    assert settings.simple_take_profit_pct == pytest.approx(0.25)
     assert settings.simple_stop_loss_pct == pytest.approx(0.15)
+
+
+def test_min_entry_edge_and_persistence_defaults_match_the_governing_spec():
+    """Change 2/Change 3 of this round: a configurable minimum
+    probability edge (default 0.10) and a configurable consecutive-
+    observation persistence requirement (default 3), both settings,
+    never hard-coded constants -- see simple_entry_signal.py/engine.py."""
+    settings = PolymarketSettings.from_env(env={})
+    assert settings.simple_min_entry_edge == pytest.approx(0.10)
+    assert settings.simple_entry_persistence_required == 3
+
+
+def test_min_entry_edge_and_persistence_are_configurable_via_env():
+    settings = PolymarketSettings.from_env(env={
+        "POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": "0.20", "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "5",
+    })
+    assert settings.simple_min_entry_edge == pytest.approx(0.20)
+    assert settings.simple_entry_persistence_required == 5
+
+
+def test_min_entry_edge_of_zero_is_allowed_disables_the_filter():
+    settings = PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": "0"})
+    assert settings.simple_min_entry_edge == pytest.approx(0.0)
+
+
+def test_min_entry_edge_of_one_or_more_is_rejected():
+    with pytest.raises(PolymarketConfigError):
+        PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": "1"})
+
+
+def test_negative_min_entry_edge_is_rejected():
+    with pytest.raises(PolymarketConfigError):
+        PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": "-0.01"})
+
+
+def test_persistence_required_of_one_is_allowed_disables_the_filter():
+    settings = PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "1"})
+    assert settings.simple_entry_persistence_required == 1
+
+
+def test_persistence_required_below_one_is_rejected():
+    with pytest.raises(PolymarketConfigError):
+        PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "0"})
 
 
 def test_non_positive_take_profit_pct_rejected():

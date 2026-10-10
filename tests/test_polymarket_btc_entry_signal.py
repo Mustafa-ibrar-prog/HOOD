@@ -271,7 +271,14 @@ def test_j_bearish_thesis_with_unusable_no_book_yields_no_candidate():
 def _engine_harness(tmp_path: Path, market: BinaryMarket):
     from tests.test_polymarket_engine import _FakeClient
 
-    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
+    # POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED=1 -- this harness's
+    # tests are about whether BTC evidence is consulted at all, not
+    # about the (separate) persistence filter, so a single qualifying
+    # cycle should be immediately eligible, exactly as before that
+    # filter existed.
+    settings = PolymarketSettings.from_env(env={
+        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "1",
+    })
     client = _FakeClient(market)
     strategy = BtcMomentumStrategy()
     risk = PolymarketRiskManager(settings)

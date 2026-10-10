@@ -377,6 +377,13 @@ def _live_harness(tmp_path: Path, market: BinaryMarket, placer: _FakePlacer, *, 
     env = dict(
         POLYMARKET_LOG_DIR=str(tmp_path), POLYMARKET_TRADING_MODE="live", POLYMARKET_PRIVATE_KEY=_VALID_KEY,
         POLYMARKET_LIVE_TRADING_CONFIRMED="true", POLYMARKET_LIVE_AUTO_EXECUTE="true",
+        # These tests are about the entry retry guard's own idempotency
+        # behavior (unknown/rejected results, cooldowns, price-change
+        # overrides), not the persistence filter -- required=1 so a
+        # single qualifying cycle is immediately eligible, exactly as
+        # before that filter existed. The persistence filter has its
+        # own dedicated tests in test_polymarket_engine.py.
+        POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED="1",
     )
     env.update(settings_overrides)
     settings = PolymarketSettings.from_env(env=env)

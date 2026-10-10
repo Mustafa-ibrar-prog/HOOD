@@ -1,4 +1,4 @@
-"""A configurable +5% take-profit AND a configurable -20% stop-loss --
+"""A configurable +10% take-profit AND a configurable -20% stop-loss --
 the ONLY automatic exit logic as of this round, replacing the +20%
 trailing stop (trailing_stop.py) and before that the Coinbase-BTC-
 evidence-based dynamic exit (exit_manager.py's evaluate_dynamic_exit/
@@ -25,7 +25,7 @@ RSI, MACD, EMA, BTC momentum, confidence, or historical learning):
      automatically persistent across a restart with no separate
      stored field to go stale or drift. take_profit_pct/stop_loss_pct
      are themselves SETTINGS (settings.simple_take_profit_pct /
-     settings.simple_stop_loss_pct -- defaults +5% / -20%, see
+     settings.simple_stop_loss_pct -- defaults +10% / -20%, see
      settings.py), never hard-coded constants -- either can change
      without touching this module's logic.
   2. Strictly between the two: HOLD. Never sells merely because the
@@ -78,7 +78,7 @@ from src.polymarket.trade_learning import CompletedTradeStore
 # check_and_execute_take_profits below), so these are never a second,
 # independently-tuned production constant; they only matter for a
 # direct unit-test call that doesn't care about either value.
-DEFAULT_TAKE_PROFIT_PCT = 0.05
+DEFAULT_TAKE_PROFIT_PCT = 0.10
 DEFAULT_STOP_LOSS_PCT = 0.20
 
 # A fixed, price-scale threshold for exit_retry_guard.check_exit_retry_guard's
@@ -113,7 +113,7 @@ def evaluate_take_profit(
     fresh OrderBookSnapshot.best_bid read for this position's own
     token; None (no bid liquidity at all right now) is always HOLD,
     never a guess. `take_profit_pct`/`stop_loss_pct` are fractions
-    (0.05 == +5%, 0.20 == -20%) -- production always passes
+    (0.10 == +10%, 0.20 == -20%) -- production always passes
     settings.simple_take_profit_pct/simple_stop_loss_pct explicitly
     (see check_and_execute_take_profits). target_price and
     stop_loss_price never cross for any take_profit_pct > -1 and

@@ -7,13 +7,25 @@ external scheduler, since nothing here needs an agent to relay data
 PRODUCTION STRATEGY (as of this round): a deliberately simple,
 Polymarket-price-only, fully autonomous strategy -- see
 simple_entry_signal.py (entry) and take_profit.py (exit: a
-configurable +5% take-profit AND a configurable -20% stop-loss, both
+configurable +10% take-profit AND a configurable -20% stop-loss, both
 settings-driven, never hard-coded). Entry is evaluated continuously
 across the FULL 15-minute market, at ANY point while it is open --
-there is no "only in the final N minutes" restriction, and (as of
-this round) NO required implied-probability threshold either: the bot
-simply takes whichever side the market currently favors, autonomously,
-with no manual YES/NO selection required for normal operation.
+there is no "only in the final N minutes" restriction, and there is NO
+fixed implied-probability threshold either: the bot simply takes
+whichever side the market currently favors, autonomously, with no
+manual YES/NO selection required for normal operation. Two further,
+independent filters sit on top of that favored-side rule, both
+settings-driven (see simple_entry_signal.py and MarketHistory below):
+  - A MINIMUM EDGE: the gap between the two sides' own implied
+    probabilities must be at least settings.simple_min_entry_edge
+    (default 0.10) -- never a reintroduction of the old fixed ">=0.70"
+    floor on one side, always a RELATIVE gap requirement between both.
+  - PERSISTENCE: the same favored, edge-qualified outcome must hold
+    for settings.simple_entry_persistence_required (default 3)
+    CONSECUTIVE cycles, for the SAME market, before a submission is
+    allowed -- never a single noisy snapshot. A flipped favored side,
+    an edge that falls back below the minimum, a tie, or missing book
+    data all reset this counter.
 Coinbase BTC intelligence (btc_entry_signal.py), the settlement-
 reference divergence check (reference_divergence.py), confidence
 scoring (entry_confidence.py), and historical self-learning
@@ -76,18 +88,54 @@ class MarketHistory:
     particular market's own price history is an acceptable cost (the
     strategy just waits for min_samples again), far cheaper than adding
     another file-backed store for data that's only ever useful within
-    one 15-minute window."""
+    one 15-minute window.
+
+    Also the home of the ENTRY PERSISTENCE tracker (Change 3 of this
+    round's strategy update): the same per-market, in-memory,
+    restart-losable lifecycle already proven for `mids` above is
+    exactly what persistence needs too -- see observe_entry_candidate()
+    below. Both reset together, on the same condition_id change, by
+    the same observe() call -- there is deliberately no separate
+    "reset persistence" call site anywhere else."""
 
     condition_id: str | None = None
     mids: list[float] = field(default_factory=list)
+    persistent_outcome: str | None = None
+    consecutive_qualifying_observations: int = 0
 
     def observe(self, market: BinaryMarket) -> list[float]:
         if market.condition_id != self.condition_id:
             self.condition_id = market.condition_id
             self.mids = []
+            self.persistent_outcome = None
+            self.consecutive_qualifying_observations = 0
         if market.yes_mid is not None:
             self.mids.append(market.yes_mid)
         return list(self.mids)
+
+    def observe_entry_candidate(self, outcome: str | None, *, required: int) -> bool:
+        """Call exactly once per cycle, for THIS market (after
+        observe() above has already run this cycle), with
+        simple_entry_signal.SimpleEntrySignal.outcome -- the favored
+        side AFTER the minimum-edge filter already applied, so `None`
+        here uniformly covers every reset condition at once: a tied
+        market, missing book data, OR an edge that fell below the
+        configured minimum (see simple_entry_signal.py). Returns True
+        only once the SAME outcome has been observed on `required`
+        CONSECUTIVE calls for this market; a different outcome (the
+        favored side flipped) restarts the count at 1 rather than 0,
+        since THIS cycle still qualifies -- it just starts a new run
+        for the new side."""
+        if outcome is None:
+            self.persistent_outcome = None
+            self.consecutive_qualifying_observations = 0
+            return False
+        if outcome != self.persistent_outcome:
+            self.persistent_outcome = outcome
+            self.consecutive_qualifying_observations = 1
+        else:
+            self.consecutive_qualifying_observations += 1
+        return self.consecutive_qualifying_observations >= max(1, required)
 
 
 def settle_resolved_positions(
@@ -185,7 +233,7 @@ def run_cycle(
         trade_store=trade_store,
     )
 
-    # Fixed +5% take-profit exit check (see take_profit.py) -- the
+    # Configurable take-profit/stop-loss exit check (see take_profit.py) -- the
     # ONLY production exit logic as of this round. Deliberately placed
     # AFTER settlement (a position that already resolved this cycle is
     # gone, nothing to exit-check) and BEFORE any new-entry evaluation
@@ -253,13 +301,16 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    signal = assess_simple_entry(yes_order_book=yes_order_book, no_order_book=no_order_book)
+    signal = assess_simple_entry(
+        yes_order_book=yes_order_book, no_order_book=no_order_book, min_entry_edge=settings.simple_min_entry_edge,
+    )
     decision_logger.log_decision(
         kind="simple_entry_signal",
         reason=(
             f"YES_BID={signal.yes_bid} YES_ASK={signal.yes_ask} MARKET_MIDPOINT={signal.market_midpoint} "
             f"YES_IMPLIED_PROBABILITY={signal.yes_implied_probability} "
-            f"NO_IMPLIED_PROBABILITY={signal.no_implied_probability} SELECTED_OUTCOME={signal.outcome} "
+            f"NO_IMPLIED_PROBABILITY={signal.no_implied_probability} EDGE={signal.edge} "
+            f"MIN_ENTRY_EDGE={settings.simple_min_entry_edge} SELECTED_OUTCOME={signal.outcome} "
             f"EXECUTABLE_ENTRY_PRICE={signal.executable_entry_price} "
             f"REMAINING_SECONDS={seconds_remaining:.0f} {signal.reason}"
         ),
@@ -267,17 +318,48 @@ def run_cycle(
             "condition_id": market.condition_id, "single_book_market": single_book_market,
             "yes_bid": signal.yes_bid, "yes_ask": signal.yes_ask, "market_midpoint": signal.market_midpoint,
             "yes_implied_probability": signal.yes_implied_probability,
-            "no_implied_probability": signal.no_implied_probability, "outcome": signal.outcome,
+            "no_implied_probability": signal.no_implied_probability, "edge": signal.edge,
+            "min_entry_edge": settings.simple_min_entry_edge, "outcome": signal.outcome,
             "executable_entry_price": signal.executable_entry_price, "remaining_seconds": seconds_remaining,
         },
     )
+
+    # Entry PERSISTENCE (Change 3): called every cycle, regardless of
+    # outcome, so a tie/missing-data/insufficient-edge cycle correctly
+    # resets the counter too (see MarketHistory.observe_entry_candidate's
+    # own docstring) -- never only called on the "would otherwise
+    # qualify" path, which would silently let a flip-flopping signal
+    # keep a stale count alive across a cycle that should have reset it.
+    persistence_satisfied = history.observe_entry_candidate(
+        signal.outcome, required=settings.simple_entry_persistence_required,
+    )
+
     if signal.outcome is None:
         decision_logger.log_decision(
             kind="no_trade", reason=signal.reason,
             evidence={
                 "question": market.question, "rejection_reason": "no_qualifying_probability",
                 "remaining_seconds": seconds_remaining, "yes_implied_probability": signal.yes_implied_probability,
-                "no_implied_probability": signal.no_implied_probability,
+                "no_implied_probability": signal.no_implied_probability, "edge": signal.edge,
+            },
+        )
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
+
+    if not persistence_satisfied:
+        decision_logger.log_decision(
+            kind="entry_persistence_pending",
+            reason=(
+                f"{signal.outcome} on {market.condition_id} is favored and edge-qualified "
+                f"({history.consecutive_qualifying_observations}/{settings.simple_entry_persistence_required} "
+                "consecutive observations) -- waiting for persistence before entering"
+            ),
+            evidence={
+                "condition_id": market.condition_id, "outcome": signal.outcome, "edge": signal.edge,
+                "consecutive_qualifying_observations": history.consecutive_qualifying_observations,
+                "persistence_required": settings.simple_entry_persistence_required,
             },
         )
         return CycleReport(
@@ -344,14 +426,16 @@ def run_cycle(
         reason=(
             f"SELECTED_OUTCOME={outcome} MARKET_MIDPOINT={signal.market_midpoint} "
             f"YES_IMPLIED_PROBABILITY={signal.yes_implied_probability} "
-            f"NO_IMPLIED_PROBABILITY={signal.no_implied_probability} "
+            f"NO_IMPLIED_PROBABILITY={signal.no_implied_probability} EDGE={signal.edge} "
+            f"PERSISTENCE={history.consecutive_qualifying_observations}/{settings.simple_entry_persistence_required} "
             f"EXECUTABLE_ENTRY_PRICE={signal.executable_entry_price} SIZE=${size_usd:.2f} "
             f"REMAINING_SECONDS={seconds_remaining:.0f} ENTRY_DECISION=ALLOW"
         ),
         evidence={
             "condition_id": market.condition_id, "selected_outcome": outcome,
             "yes_implied_probability": signal.yes_implied_probability,
-            "no_implied_probability": signal.no_implied_probability,
+            "no_implied_probability": signal.no_implied_probability, "edge": signal.edge,
+            "consecutive_qualifying_observations": history.consecutive_qualifying_observations,
             "executable_entry_price": signal.executable_entry_price,
             "actual_allowed_size_usd": size_usd, "remaining_seconds": seconds_remaining,
             "entry_price": order_book.best_ask, "spread": market.yes_spread_pct, "liquidity": entry_liquidity_usd,
@@ -369,6 +453,8 @@ def run_cycle(
         "market_question": market.question,
         "yes_implied_probability_at_entry": signal.yes_implied_probability,
         "no_implied_probability_at_entry": signal.no_implied_probability,
+        "edge_at_entry": signal.edge,
+        "consecutive_qualifying_observations_at_entry": history.consecutive_qualifying_observations,
         "executable_entry_price_at_entry": signal.executable_entry_price,
         "polymarket_yes_bid": market.yes_bid,
         "polymarket_yes_ask": market.yes_ask,

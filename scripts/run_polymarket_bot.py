@@ -74,14 +74,19 @@ def main() -> int:
     # NOTE: as of this round, the production strategy is fully
     # autonomous and deliberately simple: entry is evaluated across
     # the full 15-minute market, at any point while it's open, with NO
-    # probability threshold -- direction is whichever side the market
-    # currently favors (simple_entry_signal.py). Every open position is
-    # then actively managed by a configurable +5% take-profit AND a
-    # configurable -20% stop-loss (take_profit.py; both settings, see
-    # settings.py's simple_take_profit_pct/simple_stop_loss_pct) --
-    # engine.run_cycle() no longer calls btc_entry_signal.py or
-    # exit_manager.check_and_execute_dynamic_exits() at all (see
-    # engine.py's own module docstring). The BTC bootstrap/
+    # fixed probability threshold -- direction is whichever side the
+    # market currently favors, gated by a configurable MINIMUM EDGE
+    # (settings.simple_min_entry_edge, default 0.10 -- the gap between
+    # the two sides' own implied probabilities) and a configurable
+    # PERSISTENCE requirement (settings.simple_entry_persistence_required,
+    # default 3 consecutive qualifying cycles) before entering (see
+    # simple_entry_signal.py / engine.MarketHistory.observe_entry_candidate).
+    # Every open position is then actively managed by a configurable
+    # +10% take-profit AND a configurable -20% stop-loss (take_profit.py;
+    # both settings, see settings.py's simple_take_profit_pct/
+    # simple_stop_loss_pct) -- engine.run_cycle() no longer calls
+    # btc_entry_signal.py or exit_manager.check_and_execute_dynamic_exits()
+    # at all (see engine.py's own module docstring). The BTC bootstrap/
     # feed-refresh plumbing below is kept running harmlessly (feeding
     # btc_price_store, never read by the live decision) so Coinbase
     # BTC intelligence stays warm and ready to re-enable later without
