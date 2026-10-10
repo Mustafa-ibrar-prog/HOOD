@@ -242,8 +242,8 @@ class PolymarketSettings:
     # YES/NO's own order book executable ask must be >= this for that
     # outcome to become the candidate (see simple_entry_signal.py).
     simple_entry_ask_threshold: float
-    # Fixed entry size for every approved trade -- validated below to
-    # stay within [$10, $20]; max_bet_usd (the risk manager's own
+    # Fixed entry size for every approved trade -- minimum == maximum
+    # == $20 (validated below); max_bet_usd (the risk manager's own
     # independent hard ceiling) is never bypassed by this.
     simple_entry_size_usd: float
 
@@ -473,8 +473,8 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_WINDOW_SECONDS must be > 0")
         if not 0 < self.simple_entry_ask_threshold < 1:
             raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_ASK_THRESHOLD must be between 0 and 1 (exclusive)")
-        if not 10.0 <= self.simple_entry_size_usd <= 20.0:
-            raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_SIZE_USD must be between $10 and $20")
+        if self.simple_entry_size_usd != 20.0:
+            raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_SIZE_USD must be exactly $20 (minimum == maximum == $20)")
         # Deliberately NOT cross-validated against max_bet_usd here: a
         # caller is free to configure max_bet_usd below
         # simple_entry_size_usd (e.g. many existing risk.py tests set a
@@ -683,7 +683,7 @@ class PolymarketSettings:
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
             simple_entry_window_seconds=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_WINDOW_SECONDS", 300.0),
             simple_entry_ask_threshold=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_ASK_THRESHOLD", 0.70),
-            simple_entry_size_usd=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_SIZE_USD", 10.0),
+            simple_entry_size_usd=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_SIZE_USD", 20.0),
             entry_retry_cooldown_seconds=_get_float(env, "POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS", 120.0),
             entry_retry_min_price_change=_get_float(env, "POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE", 0.02),
             exit_retry_cooldown_seconds=_get_float(env, "POLYMARKET_EXIT_RETRY_COOLDOWN_SECONDS", 90.0),

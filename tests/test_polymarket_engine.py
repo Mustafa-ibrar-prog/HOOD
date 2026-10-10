@@ -198,11 +198,11 @@ def test_max_open_positions_blocks_a_second_entry(tmp_path):
     assert len(harness["position_store"].load()) == 1  # unchanged — still just the pre-seeded one
 
 
-def test_max_open_positions_blocks_new_entry_but_never_short_circuits_trailing_stop(tmp_path):
+def test_max_open_positions_blocks_new_entry_but_never_short_circuits_take_profit(tmp_path):
     """Requirement: MAX_OPEN_POSITIONS may block NEW entries only -- it
-    must never short-circuit trailing-stop evaluation for an EXISTING
+    must never short-circuit take-profit evaluation for an EXISTING
     position. engine.run_cycle() already places
-    check_and_execute_trailing_stops() before find_active_btc_market()/
+    check_and_execute_take_profits() before find_active_btc_market()/
     risk_manager.evaluate_new_trade() (where check_open_positions is
     actually enforced -- see risk.py); this proves that ordering holds
     end to end. A market that would otherwise clearly qualify for a
@@ -226,16 +226,15 @@ def test_max_open_positions_blocks_new_entry_but_never_short_circuits_trailing_s
     now = datetime.now(timezone.utc)
 
     # An EXISTING open position, already at the max_open_positions cap,
-    # already ARMED (it previously rode above its own +20% floor) and
-    # now fallen back TO that floor at the live book's bid (0.78, this
-    # same market's own yes_bid -- the fake client keys any token
-    # matching token_id_yes to it): floor = 0.70 * 1.20 = 0.84 >= 0.78,
-    # so this is exactly "fell back to the floor" -- a full exit.
+    # whose own +5% take-profit target has been reached at the live
+    # book's bid (0.78, this same market's own yes_bid -- the fake
+    # client keys any token matching token_id_yes to it): target =
+    # 0.70 * 1.05 = 0.735 <= 0.78, so this is exactly "target reached"
+    # -- a full exit.
     position_store.add_if_absent(OpenPosition(
         condition_id="existing-market", token_id="y", outcome="YES", requested_size_usd=5.0,
         filled_shares=10.0, avg_fill_price=0.70, order_id="paper:seed", client_order_id="seed-1",
         status="filled", opened_at=now - timedelta(minutes=5), close_time=now + timedelta(minutes=5),
-        trailing_stop_armed=True, trailing_stop_peak_price=0.95,
     ))
     state = state_store.load(today=now.date())
     state.open_position_count = 1
@@ -247,24 +246,23 @@ def test_max_open_positions_blocks_new_entry_but_never_short_circuits_trailing_s
         pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
     )
 
-    assert report.exits_submitted == 1  # the existing position's trailing-stop exit ran and fired despite being AT the cap
+    assert report.exits_submitted == 1  # the existing position's take-profit exit ran and fired despite being AT the cap
     assert not report.entered  # the new entry was still correctly blocked by max_open_positions
     assert position_store.load() == []  # paper mode: the exit fills immediately
 
 
-def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_trailing_stop(tmp_path):
+def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_take_profit(tmp_path):
     """A live incident this round fixes: an entry order submitted in an
     EARLIER cycle that sat UNKNOWN finally reconciles FILLED via
     reconcile_pending_orders()'s sweep at the top of THIS cycle --
-    creating a position this very call. Trailing-stop evaluation must
+    creating a position this very call. Take-profit evaluation must
     NOT immediately touch that just-adopted position on this same
     cycle -- it gets the same one-cycle grace an ordinary brand-new
-    entry already gets for free (see engine.py/trailing_stop.py's
+    entry already gets for free (see engine.py/take_profit.py's
     module docstrings). A second cycle then proves the deferral is
     exactly one cycle, never a permanent shield: the position IS
     evaluated completely normally from then on (here, correctly held
-    -- its price never reached the +20% floor, so a never-armed
-    trailing stop has nothing to sell)."""
+    -- its price never reached its own +5% target)."""
     market = _market(yes_bid=0.50, yes_ask=0.52)  # flat -- no NEW entry this cycle, keeps the test focused
     settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
     client = _FakeClient(market)
@@ -306,10 +304,9 @@ def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_trailing_st
     assert len(deferred) == 1
 
     # A SECOND cycle: the grace has expired -- the position IS now
-    # evaluated normally by trailing_stop.py, with no special-casing.
-    # Its price (0.50 bid) never reached its own +20% floor (0.672), so
-    # a never-armed stop correctly just holds -- never a sell, and
-    # never deferred again either.
+    # evaluated normally by take_profit.py, with no special-casing.
+    # Its price (0.50 bid) never reached its own +5% target (0.588), so
+    # it correctly just holds -- never a sell, and never deferred again.
     second_report = run_cycle(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
@@ -318,7 +315,7 @@ def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_trailing_st
     )
     assert second_report.exits_submitted == 0
     assert len(position_store.load()) == 1  # still open -- correctly held, not sold
-    holds = [e for e in logger.read_all() if e.get("kind") == "trailing_stop_hold"]
+    holds = [e for e in logger.read_all() if e.get("kind") == "take_profit_hold"]
     assert len(holds) == 1  # evaluated normally on cycle 2 -- not deferred a second time
     deferred_total = [e for e in logger.read_all() if e.get("kind") == "exit_check_deferred"]
     assert len(deferred_total) == 1  # still just the one from cycle 1 -- never deferred again

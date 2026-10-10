@@ -6,11 +6,11 @@ external scheduler, since nothing here needs an agent to relay data
 
 PRODUCTION STRATEGY (as of this round): a deliberately simple,
 Polymarket-price-only strategy -- see simple_entry_signal.py (entry)
-and trailing_stop.py (exit). Coinbase BTC intelligence
-(btc_entry_signal.py), the settlement-reference divergence check
-(reference_divergence.py), confidence scoring (entry_confidence.py),
-and historical self-learning (trade_learning.py's adjustment
-machinery) are NO LONGER CALLED from run_cycle() at all -- they
+and take_profit.py (exit, a fixed +5% target). Coinbase BTC
+intelligence (btc_entry_signal.py), the settlement-reference
+divergence check (reference_divergence.py), confidence scoring
+(entry_confidence.py), and historical self-learning (trade_learning.py's
+adjustment machinery) are NOT CALLED from run_cycle() at all -- they
 remain in the codebase, with their own tests, in case they're wanted
 again later, but none of them influences a live entry or exit
 decision any more. trade_learning.CompletedTradeStore is still used,
@@ -19,10 +19,11 @@ settlement/exit) -- never for its historical-adjustment role, which
 this module never calls.
 
 check_and_execute_dynamic_exits() (exit_manager.py, BTC-evidence-
-based) is likewise no longer called -- trailing_stop.check_and_execute_trailing_stops()
-is the only exit logic that runs, so a position opened by this
-strategy is never independently sold by the old evidence-based exit
-too."""
+based) and trailing_stop.check_and_execute_trailing_stops() (the
+earlier +20% trailing-stop exit) are likewise no longer called --
+take_profit.check_and_execute_take_profits() is the only exit logic
+that runs, so a position opened by this strategy is never
+independently sold by either earlier exit system too."""
 
 from __future__ import annotations
 
@@ -43,8 +44,8 @@ from src.polymarket.settings import PolymarketSettings
 from src.polymarket.simple_entry_signal import assess_simple_entry
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.strategy import BtcMomentumStrategy
+from src.polymarket.take_profit import check_and_execute_take_profits
 from src.polymarket.trade_learning import CompletedTradeStore, STRATEGY_ID_SIMPLE_PRICE_THRESHOLD, record_completed_trade
-from src.polymarket.trailing_stop import check_and_execute_trailing_stops
 
 
 @dataclass
@@ -173,15 +174,15 @@ def run_cycle(
         trade_store=trade_store,
     )
 
-    # +20% profit trailing-stop exit check (see trailing_stop.py) --
-    # the ONLY production exit logic as of this round. Deliberately
-    # placed AFTER settlement (a position that already resolved this
-    # cycle is gone, nothing to exit-check) and BEFORE any new-entry
-    # evaluation below, so the open-position count a new trade's risk
-    # checks read reflects any exit that just closed. Never touches
-    # MAX_BET_SIZE/MAX_DAILY_LOSS/MAX_SPREAD/ORDER_BOOK_LIQUIDITY/
-    # ENTRY_CUTOFF or anything below this point.
-    exits_submitted = check_and_execute_trailing_stops(
+    # Fixed +5% take-profit exit check (see take_profit.py) -- the
+    # ONLY production exit logic as of this round. Deliberately placed
+    # AFTER settlement (a position that already resolved this cycle is
+    # gone, nothing to exit-check) and BEFORE any new-entry evaluation
+    # below, so the open-position count a new trade's risk checks read
+    # reflects any exit that just closed. Never touches MAX_BET_SIZE/
+    # MAX_DAILY_LOSS/MAX_SPREAD/ORDER_BOOK_LIQUIDITY/ENTRY_CUTOFF or
+    # anything below this point.
+    exits_submitted = check_and_execute_take_profits(
         client=client, settings=settings, gateway=gateway, position_store=position_store,
         pending_store=pending_store, state_store=state_store, decision_logger=decision_logger,
         trade_store=trade_store, skip_client_order_ids=newly_adopted_client_order_ids, now=now,
@@ -289,7 +290,7 @@ def run_cycle(
     # existing aggressive LIMIT + FOK execution model — never an
     # unrestricted market order.
     max_price = round(min(order_book.best_ask * (1 + settings.max_price_slippage_pct), 0.99), 4)
-    size_usd = settings.simple_entry_size_usd  # fixed, validated at load time to stay within [$10, $20]
+    size_usd = settings.simple_entry_size_usd  # fixed $20 (minimum == maximum), validated at load time
 
     state = state_store.load(today=now.date())
     decision = risk_manager.evaluate_new_trade(
