@@ -232,13 +232,12 @@ class PolymarketSettings:
     max_price_slippage_pct: float
 
     # --- Simple price-based strategy (see simple_entry_signal.py/
-    # trailing_stop.py) -- the ONLY production entry/exit logic as of
+    # take_profit.py) -- the ONLY production entry/exit logic as of
     # this round. Coinbase/Chainlink/confidence/historical-learning
     # modules remain in the codebase (with their own tests) but are no
-    # longer called from engine.run_cycle(). ------------------------
-    # Only evaluate NEW entries once this many seconds or fewer remain
-    # on the current market.
-    simple_entry_window_seconds: float
+    # longer called from engine.run_cycle(). Entry is evaluated
+    # continuously across the full 15-minute market -- there is no
+    # time-remaining window setting any more. ------------------------
     # YES/NO's own order book executable ask must be >= this for that
     # outcome to become the candidate (see simple_entry_signal.py).
     simple_entry_ask_threshold: float
@@ -469,8 +468,6 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD must be >= 0")
         if not 0 <= self.max_price_slippage_pct < 1:
             raise PolymarketConfigError("POLYMARKET_MAX_PRICE_SLIPPAGE_PCT must be between 0 and 1 (exclusive of 1)")
-        if self.simple_entry_window_seconds <= 0:
-            raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_WINDOW_SECONDS must be > 0")
         if not 0 < self.simple_entry_ask_threshold < 1:
             raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_ASK_THRESHOLD must be between 0 and 1 (exclusive)")
         if self.simple_entry_size_usd != 20.0:
@@ -681,7 +678,6 @@ class PolymarketSettings:
             max_spread_usd=_get_float(env, "POLYMARKET_MAX_SPREAD_USD", 0.03),
             min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 10.0),
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
-            simple_entry_window_seconds=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_WINDOW_SECONDS", 300.0),
             simple_entry_ask_threshold=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_ASK_THRESHOLD", 0.70),
             simple_entry_size_usd=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_SIZE_USD", 20.0),
             entry_retry_cooldown_seconds=_get_float(env, "POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS", 120.0),

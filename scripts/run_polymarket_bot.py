@@ -72,9 +72,10 @@ def main() -> int:
     pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file))
     history = MarketHistory()
     # NOTE: as of this round, the production strategy is a simple
-    # Polymarket-price threshold (simple_entry_signal.py) + a +20%
-    # trailing stop (trailing_stop.py) -- engine.run_cycle() no longer
-    # calls btc_entry_signal.py or exit_manager.check_and_execute_dynamic_exits()
+    # Polymarket-price threshold evaluated across the full 15-minute
+    # market (simple_entry_signal.py) + a fixed +5% take-profit, no
+    # stop-loss (take_profit.py) -- engine.run_cycle() no longer calls
+    # btc_entry_signal.py or exit_manager.check_and_execute_dynamic_exits()
     # at all (see engine.py's own module docstring). The BTC bootstrap/
     # feed-refresh plumbing below is kept running harmlessly (feeding
     # btc_price_store, never read by the live decision) so Coinbase

@@ -6,7 +6,9 @@ external scheduler, since nothing here needs an agent to relay data
 
 PRODUCTION STRATEGY (as of this round): a deliberately simple,
 Polymarket-price-only strategy -- see simple_entry_signal.py (entry)
-and take_profit.py (exit, a fixed +5% target). Coinbase BTC
+and take_profit.py (exit, a fixed +5% target, no stop-loss). Entry is
+evaluated continuously across the FULL 15-minute market -- there is
+no "only in the final N minutes" restriction any more. Coinbase BTC
 intelligence (btc_entry_signal.py), the settlement-reference
 divergence check (reference_divergence.py), confidence scoring
 (entry_confidence.py), and historical self-learning (trade_learning.py's
@@ -23,7 +25,9 @@ based) and trailing_stop.check_and_execute_trailing_stops() (the
 earlier +20% trailing-stop exit) are likewise no longer called --
 take_profit.check_and_execute_take_profits() is the only exit logic
 that runs, so a position opened by this strategy is never
-independently sold by either earlier exit system too."""
+independently sold by either earlier exit system too. There is no
+stop-loss: a losing position is held until either the +5% target is
+reached or the market resolves."""
 
 from __future__ import annotations
 
@@ -202,29 +206,15 @@ def run_cycle(
     # reads history.mids any more -- see module docstring).
     history.observe(market)
 
-    # --- <= 5 MINUTES REMAINING? (see simple_entry_signal.py) -- the
-    # now-aware computation, NEVER BinaryMarket.seconds_to_close (which
-    # reads real wall-clock time and would make this non-deterministic
-    # under a test's fixed `now`).
+    # The now-aware computation, NEVER BinaryMarket.seconds_to_close
+    # (which reads real wall-clock time and would make this
+    # non-deterministic under a test's fixed `now`) -- kept purely for
+    # logging/record-keeping (trade_learning.py's seconds_remaining_at_entry
+    # bucketing). There is no "too early to evaluate" gate any more:
+    # the simple entry signal is evaluated every cycle across the FULL
+    # 15-minute market, not only its final minutes.
     close_time = market.close_time if market.close_time.tzinfo else market.close_time.replace(tzinfo=timezone.utc)
     seconds_remaining = (close_time - now).total_seconds()
-
-    if seconds_remaining > settings.simple_entry_window_seconds:
-        decision_logger.log_decision(
-            kind="no_trade",
-            reason=(
-                f"{seconds_remaining:.0f}s remaining on {market.condition_id} > "
-                f"{settings.simple_entry_window_seconds:.0f}s entry window -- too early to evaluate"
-            ),
-            evidence={
-                "question": market.question, "rejection_reason": "too_early",
-                "remaining_seconds": seconds_remaining,
-            },
-        )
-        return CycleReport(
-            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
-            exits_submitted=exits_submitted,
-        )
 
     # --- CHECK REAL YES/NO ASK (see simple_entry_signal.py) -- BOTH
     # outcomes' own order books are needed up front: which side (if
@@ -248,8 +238,7 @@ def run_cycle(
         )
 
     signal = assess_simple_entry(
-        seconds_remaining=seconds_remaining, yes_order_book=yes_order_book, no_order_book=no_order_book,
-        entry_window_seconds=settings.simple_entry_window_seconds, ask_threshold=settings.simple_entry_ask_threshold,
+        yes_order_book=yes_order_book, no_order_book=no_order_book, ask_threshold=settings.simple_entry_ask_threshold,
     )
     decision_logger.log_decision(
         kind="simple_entry_signal",

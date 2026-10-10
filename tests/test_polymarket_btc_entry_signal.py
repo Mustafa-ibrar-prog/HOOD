@@ -13,11 +13,14 @@ Three layers:
   - UNIT tests against build_entry_candidate() directly — the
     Polymarket-quote mapping step, including the "thesis is directional
     but the book is unusable" case.
-  - A couple of full end-to-end run_cycle() tests proving a Polymarket
-    price move, by itself (zero BTC evidence fed), can never create an
-    entry in either direction — the one property no unit test on
-    btc_entry_signal.py alone could demonstrate, since that module
-    never even looks at Polymarket data.
+  - A couple of full end-to-end run_cycle() tests confirming the
+    CURRENT production entry path (simple_entry_signal.py's own
+    Polymarket-price threshold) never even reads btc_entry_signal.py
+    or any fed BTC evidence: a qualifying Polymarket ask alone DOES
+    create an entry (that's the whole point of the current strategy),
+    and a non-qualifying one does not, regardless of what Coinbase
+    evidence would have said under the superseded Coinbase-driven
+    strategy this module implements.
 
 Never places a real order — every client/gateway here is paper mode or
 a local fake.
@@ -258,7 +261,11 @@ def test_j_bearish_thesis_with_unusable_no_book_yields_no_candidate():
 # Full run_cycle() end to end, with ZERO BTC bars fed (the harness's
 # btc_price_store is always empty here) -- only Polymarket's own
 # yes_bid/yes_ask/history.mids move; btc_entry_signal.py never reads
-# any of it, so the result must be "no entry" regardless of direction.
+# any of it. The CURRENT production entry path (simple_entry_signal.py)
+# decides purely from the real executable ask against the 0.70
+# threshold, so a qualifying ask DOES enter (test_g) and a
+# non-qualifying one does not (test_h) -- in neither case does
+# btc_entry_signal.py or any BTC evidence ever factor in.
 
 def _engine_harness(tmp_path: Path, market: BinaryMarket):
     from tests.test_polymarket_engine import _FakeClient
@@ -281,27 +288,33 @@ def _engine_harness(tmp_path: Path, market: BinaryMarket):
     )
 
 
-def test_g_polymarket_price_rising_alone_never_triggers_a_yes_entry(tmp_path):
-    """The exact OLD trigger (YES mid .50 -> .56-ish, a clear rising
-    move) with zero Coinbase BTC evidence fed -- must NOT enter."""
-    market = _market(yes_bid=0.78, yes_ask=0.80)  # would have clearly qualified under the old strategy
+def test_g_a_qualifying_polymarket_ask_alone_enters_with_zero_btc_evidence(tmp_path):
+    """YES ask >= the 0.70 threshold, with zero Coinbase BTC evidence
+    fed and a big (irrelevant) Polymarket mid move in history -- DOES
+    enter under the current simple_entry_signal.py strategy; proves
+    btc_entry_signal.py's evidence (there is none here) was never
+    consulted to reach that decision."""
+    market = _market(yes_bid=0.78, yes_ask=0.80)
     harness = _engine_harness(tmp_path, market)
     harness["history"].observe(market)
-    harness["history"].mids = [0.50, 0.60, 0.70]  # a big rising Polymarket move, on its own
+    harness["history"].mids = [0.50, 0.60, 0.70]  # a big rising Polymarket move -- irrelevant either way
 
     report = run_cycle(**harness)
 
-    assert report.entered is False
-    assert harness["position_store"].load() == []
+    assert report.entered is True
+    positions = harness["position_store"].load()
+    assert len(positions) == 1
+    assert positions[0].outcome == "YES"
 
 
-def test_h_polymarket_price_falling_alone_never_triggers_a_no_entry(tmp_path):
-    """The symmetric case: YES mid falling (.50 -> .36-ish) alone must
-    not trigger a NO entry either."""
+def test_h_a_non_qualifying_polymarket_ask_alone_never_enters(tmp_path):
+    """Neither side's ask reaches 0.70 -- no entry, exactly like any
+    other sub-threshold case; the falling Polymarket mid history is
+    irrelevant, same as the rising one above."""
     market = _market(yes_bid=0.35, yes_ask=0.37)
     harness = _engine_harness(tmp_path, market)
     harness["history"].observe(market)
-    harness["history"].mids = [0.50, 0.45, 0.40]  # a big falling Polymarket move, on its own
+    harness["history"].mids = [0.50, 0.45, 0.40]  # a big falling Polymarket move -- irrelevant either way
 
     report = run_cycle(**harness)
 

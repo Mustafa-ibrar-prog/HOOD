@@ -14,10 +14,9 @@ longer calls any of them.
 RULE (verbatim, intentionally simple -- never second-guessed by BTC
 momentum, RSI, MACD, EMA, confidence, or historical learning):
 
-  1. Only evaluated at all once <= entry_window_seconds remain on the
-     current market (default 300s / 5 minutes) -- any earlier, this
-     function is never even called with real order books (see
-     `eligible` below).
+  1. Evaluated continuously across the FULL 15-minute market -- there
+     is no "only in the last N minutes" restriction any more; every
+     cycle for which the market is still open is evaluated.
   2. YES is the candidate when YES's own order book's REAL executable
      ask (OrderBookSnapshot.best_ask -- never BinaryMarket.yes_ask,
      which can be a stale top-of-book snapshot from market discovery,
@@ -35,7 +34,6 @@ from dataclasses import dataclass
 
 from src.polymarket.models import OrderBookSnapshot
 
-DEFAULT_ENTRY_WINDOW_SECONDS = 300.0
 DEFAULT_ASK_THRESHOLD = 0.70
 
 
@@ -45,7 +43,6 @@ class SimpleEntrySignal:
     yes_ask/no_ask were actually observed (even on a NO-TRADE result)
     for full auditability in the decision log."""
 
-    eligible: bool  # False whenever more than entry_window_seconds remain -- no real evaluation was even attempted
     outcome: str | None  # "YES" | "NO" | None
     yes_ask: float | None
     no_ask: float | None
@@ -58,25 +55,14 @@ class SimpleEntrySignal:
 
 def assess_simple_entry(
     *,
-    seconds_remaining: float | None,
     yes_order_book: OrderBookSnapshot | None,
     no_order_book: OrderBookSnapshot | None,
-    entry_window_seconds: float = DEFAULT_ENTRY_WINDOW_SECONDS,
     ask_threshold: float = DEFAULT_ASK_THRESHOLD,
 ) -> SimpleEntrySignal:
-    """Pure and deterministic. `seconds_remaining` is the CALLER's own
-    now-aware computation (engine.py: `(market.close_time - now)`,
-    never BinaryMarket.seconds_to_close, which reads real wall-clock
-    time and would make this non-deterministic under a test's fixed
-    `now`). None (unknown remaining time) is treated exactly like "too
-    early" -- never a reason to guess and proceed."""
-    if seconds_remaining is None or seconds_remaining > entry_window_seconds:
-        remaining_str = f"{seconds_remaining:.0f}s" if seconds_remaining is not None else "unknown"
-        return SimpleEntrySignal(
-            eligible=False, outcome=None, yes_ask=None, no_ask=None,
-            reason=f"{remaining_str} remaining > {entry_window_seconds:.0f}s entry window -- too early to evaluate",
-        )
-
+    """Pure and deterministic. Evaluated every cycle the market is
+    open -- no time-remaining gate; the caller (engine.py) decides
+    only WHETHER a market is still open, never WHEN within its
+    lifetime to evaluate."""
     yes_ask = yes_order_book.best_ask if yes_order_book is not None else None
     no_ask = no_order_book.best_ask if no_order_book is not None else None
     yes_qualifies = yes_ask is not None and yes_ask >= ask_threshold
@@ -84,7 +70,7 @@ def assess_simple_entry(
 
     if yes_qualifies and no_qualifies:
         return SimpleEntrySignal(
-            eligible=True, outcome=None, yes_ask=yes_ask, no_ask=no_ask,
+            outcome=None, yes_ask=yes_ask, no_ask=no_ask,
             reason=(
                 f"both YES ask ({yes_ask:.4f}) and NO ask ({no_ask:.4f}) are >= {ask_threshold:.2f} -- "
                 "conflicting/invalid setup, no trade"
@@ -92,16 +78,16 @@ def assess_simple_entry(
         )
     if yes_qualifies:
         return SimpleEntrySignal(
-            eligible=True, outcome="YES", yes_ask=yes_ask, no_ask=no_ask,
+            outcome="YES", yes_ask=yes_ask, no_ask=no_ask,
             reason=f"YES ask {yes_ask:.4f} >= {ask_threshold:.2f} threshold",
         )
     if no_qualifies:
         return SimpleEntrySignal(
-            eligible=True, outcome="NO", yes_ask=yes_ask, no_ask=no_ask,
+            outcome="NO", yes_ask=yes_ask, no_ask=no_ask,
             reason=f"NO ask {no_ask:.4f} >= {ask_threshold:.2f} threshold",
         )
     return SimpleEntrySignal(
-        eligible=True, outcome=None, yes_ask=yes_ask, no_ask=no_ask,
+        outcome=None, yes_ask=yes_ask, no_ask=no_ask,
         reason=(
             f"neither YES ask ({yes_ask if yes_ask is not None else 'n/a'}) nor NO ask "
             f"({no_ask if no_ask is not None else 'n/a'}) reach the {ask_threshold:.2f} threshold"
