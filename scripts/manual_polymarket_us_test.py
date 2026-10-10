@@ -50,7 +50,8 @@ can ever be placed (any one missing keeps this at the preflight stage):
   6. orders.preview() succeeded
   7. PolymarketRiskManager.evaluate_new_trade().allowed (max bet,
      daily loss, open positions, cooldown, stale data, spread,
-     liquidity, entry cutoff)
+     liquidity) -- there is no entry-cutoff check any more: entry is
+     allowed at any point while the market is genuinely open.
   8. No existing open position (positions.py) — this is a ONE-position
      integration test, not an averaging-down tool.
   9. No existing pending order awaiting approval — refuses to risk a
@@ -250,7 +251,6 @@ def run_manual_test(
     conflicting_pending = pending_store.list_awaiting_approval(now)
     live_confirmed = settings.live_trading_confirmed  # settings.is_live is already true here
 
-    entry_cutoff_ok = _risk_result(decision, "ENTRY_CUTOFF").passed
     ready = (
         decision.allowed and preview_ok and not stopped and live_confirmed
         and not open_positions and not conflicting_pending
@@ -277,7 +277,7 @@ def run_manual_test(
     print(f"BEST ASK: {order_book.best_ask}")
     print(f"SPREAD: {order_book.spread_pct}")
     print(f"LIQUIDITY: ${liquidity:.2f}")
-    print(f"ENTRY CUTOFF: {'PASS' if entry_cutoff_ok else 'FAIL'} ({market.seconds_to_close:.0f}s remaining)")
+    print(f"TIME TO CLOSE: {market.seconds_to_close:.0f}s remaining (no entry-cutoff restriction -- entry is allowed at any point while the market is open)")
     print(f"RISK: {'PASS' if decision.allowed else 'FAIL'}")
     print(f"PREVIEW: {'PASS' if preview_ok else 'FAIL'}")
     print(f"EMERGENCY STOP: {'ACTIVE' if stopped else 'CLEARED'}")

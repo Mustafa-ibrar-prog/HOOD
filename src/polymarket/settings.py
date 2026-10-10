@@ -236,15 +236,23 @@ class PolymarketSettings:
     # this round. Coinbase/Chainlink/confidence/historical-learning
     # modules remain in the codebase (with their own tests) but are no
     # longer called from engine.run_cycle(). Entry is evaluated
-    # continuously across the full 15-minute market -- there is no
-    # time-remaining window setting any more. ------------------------
-    # YES/NO's own order book executable ask must be >= this for that
-    # outcome to become the candidate (see simple_entry_signal.py).
-    simple_entry_ask_threshold: float
+    # continuously across the full 15-minute market, at ANY point while
+    # it is open -- there is no time-remaining window setting and NO
+    # probability-threshold setting any more (see simple_entry_signal.py:
+    # direction is simply whichever side the market currently favors).
+    # ------------------------------------------------------------------
     # Fixed entry size for every approved trade -- minimum == maximum
     # == $20 (validated below); max_bet_usd (the risk manager's own
     # independent hard ceiling) is never bypassed by this.
     simple_entry_size_usd: float
+    # Automatic exit targets (see take_profit.py) -- BOTH configurable,
+    # never hard-coded constants, so either can change without touching
+    # strategy code. Fractions of the position's own ACTUAL average
+    # fill price: target_price = avg_fill_price * (1 + simple_take_profit_pct);
+    # stop_loss_price = avg_fill_price * (1 - simple_stop_loss_pct).
+    # Defaults match this round's governing spec: +5% / -20%.
+    simple_take_profit_pct: float
+    simple_stop_loss_pct: float
 
     # --- Entry retry guard (see entry_guard.py) — an IDEMPOTENCY/safety
     # gate, not a risk threshold: after a live incident showed
@@ -426,11 +434,6 @@ class PolymarketSettings:
     # actually live — see client.py's module docstring: this has not
     # been run against the real API from this environment.
     market_duration_minutes: int
-    # How close to a market's close time this system still allows a NEW
-    # entry — mirrors entry_cutoff_time's spirit (don't open a fresh
-    # position seconds before resolution, where there's no time left to
-    # be right).
-    entry_cutoff_seconds_before_close: int
 
     # --- Operational ---------------------------------------------------------
     poll_interval_seconds: int
@@ -468,8 +471,13 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD must be >= 0")
         if not 0 <= self.max_price_slippage_pct < 1:
             raise PolymarketConfigError("POLYMARKET_MAX_PRICE_SLIPPAGE_PCT must be between 0 and 1 (exclusive of 1)")
-        if not 0 < self.simple_entry_ask_threshold < 1:
-            raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_ASK_THRESHOLD must be between 0 and 1 (exclusive)")
+        if self.simple_take_profit_pct <= 0:
+            raise PolymarketConfigError("POLYMARKET_SIMPLE_TAKE_PROFIT_PCT must be > 0")
+        if not 0 < self.simple_stop_loss_pct < 1:
+            raise PolymarketConfigError(
+                "POLYMARKET_SIMPLE_STOP_LOSS_PCT must be between 0 and 1 (exclusive) — a stop-loss price "
+                "(avg_fill_price * (1 - pct)) must stay strictly positive"
+            )
         if self.simple_entry_size_usd != 20.0:
             raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_SIZE_USD must be exactly $20 (minimum == maximum == $20)")
         # Deliberately NOT cross-validated against max_bet_usd here: a
@@ -482,8 +490,6 @@ class PolymarketSettings:
         # remains the final authority."
         if self.market_duration_minutes <= 0:
             raise PolymarketConfigError("POLYMARKET_MARKET_DURATION_MINUTES must be > 0")
-        if self.entry_cutoff_seconds_before_close < 0:
-            raise PolymarketConfigError("POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE must be >= 0")
         if self.poll_interval_seconds <= 0:
             raise PolymarketConfigError("POLYMARKET_POLL_INTERVAL_SECONDS must be > 0")
         if self.profit_target_pct <= 0:
@@ -678,8 +684,9 @@ class PolymarketSettings:
             max_spread_usd=_get_float(env, "POLYMARKET_MAX_SPREAD_USD", 0.03),
             min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 10.0),
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
-            simple_entry_ask_threshold=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_ASK_THRESHOLD", 0.70),
             simple_entry_size_usd=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_SIZE_USD", 20.0),
+            simple_take_profit_pct=_get_float(env, "POLYMARKET_SIMPLE_TAKE_PROFIT_PCT", 0.05),
+            simple_stop_loss_pct=_get_float(env, "POLYMARKET_SIMPLE_STOP_LOSS_PCT", 0.20),
             entry_retry_cooldown_seconds=_get_float(env, "POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS", 120.0),
             entry_retry_min_price_change=_get_float(env, "POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE", 0.02),
             exit_retry_cooldown_seconds=_get_float(env, "POLYMARKET_EXIT_RETRY_COOLDOWN_SECONDS", 90.0),
@@ -705,7 +712,6 @@ class PolymarketSettings:
             completed_trades_file=_get_str(env, "POLYMARKET_COMPLETED_TRADES_FILE", "logs/polymarket/completed_trades.json"),
             asset=_get_str(env, "POLYMARKET_ASSET", "bitcoin").lower(),
             market_duration_minutes=_get_int(env, "POLYMARKET_MARKET_DURATION_MINUTES", 15),
-            entry_cutoff_seconds_before_close=_get_int(env, "POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE", 60),
             poll_interval_seconds=_get_int(env, "POLYMARKET_POLL_INTERVAL_SECONDS", 10),
             log_dir=_get_str(env, "POLYMARKET_LOG_DIR", "logs/polymarket"),
             decision_log_file=_get_str(env, "POLYMARKET_DECISION_LOG_FILE", "logs/polymarket/decisions.jsonl"),

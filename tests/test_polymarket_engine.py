@@ -120,7 +120,12 @@ def test_no_active_market_is_a_clean_skip_not_an_error(tmp_path):
 
 
 def test_no_setup_logs_no_trade_and_does_not_enter(tmp_path):
-    market = _market(yes_bid=0.50, yes_ask=0.52)  # flat, no momentum yet
+    # Exactly tied (yes_bid == yes_ask == 0.50, so YES's and NO's own
+    # implied probabilities are both exactly 0.50) -- there is no
+    # probability-threshold gate any more (see simple_entry_signal.py),
+    # so this is the one case that still correctly produces no trade:
+    # neither side is favored, and a tie is never resolved by guessing.
+    market = _market(yes_bid=0.50, yes_ask=0.50)
     harness = _harness(tmp_path, market=market)
     report = run_cycle(**harness)
     assert report.ran
@@ -778,9 +783,12 @@ def test_single_book_market_no_position_exit_check_uses_the_inverted_book(tmp_pa
     entry/exit interaction in the same cycle."""
     market = _single_book_market()
     # Raw book: bid 0.20 / ask 0.22 -- the NO position's own exit price
-    # is 1 - 0.22 = 0.78, which clears its +5% target (0.73 * 1.05 =
-    # 0.7665). Reading the raw book's own best_bid (0.20) directly
-    # would (wrongly) never reach that target at all.
+    # is 1 - 0.22 = 0.78, which clears its +5% take-profit target
+    # (0.73 * 1.05 = 0.7665). Reading the raw book's own best_bid
+    # (0.20) directly would (wrongly) read as a catastrophic loss
+    # instead (well past the -20% stop-loss floor, 0.584) -- see the
+    # next test, which proves exactly that confusion when the flag is
+    # (correctly, for this position) False.
     book = OrderBookSnapshot(
         token_id="slug-1", bids=(BookLevel(price=0.20, size=1000.0),),
         asks=(BookLevel(price=0.22, size=1000.0),), fetched_at=datetime.now(timezone.utc),
@@ -803,15 +811,24 @@ def test_single_book_market_no_position_exit_check_uses_the_inverted_book(tmp_pa
     assert report.exits_submitted == 1
     assert not report.entered  # no fresh entry snuck in despite the same book also qualifying NO
     assert harness["position_store"].load() == []  # paper mode: the exit fills immediately
+    submissions = [e for e in harness["decision_logger"].read_all() if e.get("kind") == "take_profit_exit_submitted"]
+    assert len(submissions) == 1  # correctly the TAKE-PROFIT trigger, never stop-loss, once converted
 
 
-def test_single_book_market_no_position_without_the_flag_reads_the_raw_book_unconverted(tmp_path):
+def test_single_book_market_no_position_without_the_flag_misreads_the_raw_book_as_a_loss(tmp_path):
     """Regression guard for the flag itself: a NO position with
     single_book_market=False (e.g. one opened on international
     Polymarket, which genuinely has a separate NO book) must NOT be
-    run through to_no_perspective() -- confirmed here by using the
-    SAME raw book as the test above, where the conversion would have
-    fired but the direct reading must not."""
+    run through to_no_perspective() -- confirmed here with the EXACT
+    SAME raw book, position size, and avg_fill_price as the test
+    above, differing ONLY in the flag. Reading the raw book directly
+    (0.20) misreads a genuinely profitable NO position (whose real
+    exit price is 0.78, well above its 0.7665 take-profit target) as a
+    catastrophic loss instead -- triggering the WRONG exit (stop-loss,
+    not take-profit). This is exactly why the flag, and the conversion
+    it gates, matter: the position still exits (there is no "silently
+    does nothing" failure mode here now that a stop-loss also exists),
+    but for the wrong reason, which this test makes visible."""
     market = _single_book_market()
     book = OrderBookSnapshot(
         token_id="slug-1", bids=(BookLevel(price=0.20, size=1000.0),),
@@ -832,9 +849,11 @@ def test_single_book_market_no_position_without_the_flag_reads_the_raw_book_unco
     state.open_position_count = 1
     harness["state_store"].save(state)
     report = run_cycle(**harness, now=now)
-    assert report.exits_submitted == 0  # raw best_bid (0.20) never reaches the 0.7665 target
+    assert report.exits_submitted == 1
     assert not report.entered  # MAX_OPEN_POSITIONS=1, already at the cap -- no fresh entry either
-    assert len(harness["position_store"].load()) == 1
+    assert harness["position_store"].load() == []
+    submissions = [e for e in harness["decision_logger"].read_all() if e.get("kind") == "stop_loss_exit_submitted"]
+    assert len(submissions) == 1  # the WRONG trigger -- proof the missing conversion matters
 
 
 def test_single_book_market_sanity_check_against_to_no_perspective_directly(tmp_path):

@@ -71,12 +71,17 @@ def main() -> int:
     # gateway.py's PaperPolymarketGateway — it never calls place_order).
     pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file))
     history = MarketHistory()
-    # NOTE: as of this round, the production strategy is a simple
-    # Polymarket-price threshold evaluated across the full 15-minute
-    # market (simple_entry_signal.py) + a fixed +5% take-profit, no
-    # stop-loss (take_profit.py) -- engine.run_cycle() no longer calls
-    # btc_entry_signal.py or exit_manager.check_and_execute_dynamic_exits()
-    # at all (see engine.py's own module docstring). The BTC bootstrap/
+    # NOTE: as of this round, the production strategy is fully
+    # autonomous and deliberately simple: entry is evaluated across
+    # the full 15-minute market, at any point while it's open, with NO
+    # probability threshold -- direction is whichever side the market
+    # currently favors (simple_entry_signal.py). Every open position is
+    # then actively managed by a configurable +5% take-profit AND a
+    # configurable -20% stop-loss (take_profit.py; both settings, see
+    # settings.py's simple_take_profit_pct/simple_stop_loss_pct) --
+    # engine.run_cycle() no longer calls btc_entry_signal.py or
+    # exit_manager.check_and_execute_dynamic_exits() at all (see
+    # engine.py's own module docstring). The BTC bootstrap/
     # feed-refresh plumbing below is kept running harmlessly (feeding
     # btc_price_store, never read by the live decision) so Coinbase
     # BTC intelligence stays warm and ready to re-enable later without

@@ -126,15 +126,6 @@ class PolymarketRiskManager:
                  f"{self._settings.max_spread_pct:.1%} and the absolute limit ${self._settings.max_spread_usd:.4f}",
         )
 
-    def check_entry_cutoff(self, market: BinaryMarket) -> RiskCheckResult:
-        remaining = market.seconds_to_close
-        ok = remaining > self._settings.entry_cutoff_seconds_before_close
-        return RiskCheckResult(
-            "ENTRY_CUTOFF", ok,
-            f"{remaining:.0f}s to close, before cutoff" if ok
-            else f"Only {remaining:.0f}s to close — past entry cutoff ({self._settings.entry_cutoff_seconds_before_close}s); no new entries this close to resolution",
-        )
-
     def check_order_book_liquidity(
         self, order_book: OrderBookSnapshot, *, side: str, max_price: float,
     ) -> RiskCheckResult:
@@ -168,7 +159,6 @@ class PolymarketRiskManager:
             self.check_cooldown(state, now),
             self.check_data_freshness(market),
             self.check_spread(market),
-            self.check_entry_cutoff(market),
             self.check_order_book_liquidity(order_book, side=side, max_price=max_price),
         )
         return RiskDecision(allowed=all(r.passed for r in results), results=results)

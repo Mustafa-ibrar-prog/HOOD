@@ -262,10 +262,11 @@ def test_j_bearish_thesis_with_unusable_no_book_yields_no_candidate():
 # btc_price_store is always empty here) -- only Polymarket's own
 # yes_bid/yes_ask/history.mids move; btc_entry_signal.py never reads
 # any of it. The CURRENT production entry path (simple_entry_signal.py)
-# decides purely from the real executable ask against the 0.70
-# threshold, so a qualifying ask DOES enter (test_g) and a
-# non-qualifying one does not (test_h) -- in neither case does
-# btc_entry_signal.py or any BTC evidence ever factor in.
+# decides purely from whichever side the market currently favors --
+# there is no probability threshold any more, so a favored ask DOES
+# enter (test_g) and only a genuinely, exactly tied market does not
+# (test_h) -- in neither case does btc_entry_signal.py or any BTC
+# evidence ever factor in.
 
 def _engine_harness(tmp_path: Path, market: BinaryMarket):
     from tests.test_polymarket_engine import _FakeClient
@@ -307,11 +308,15 @@ def test_g_a_qualifying_polymarket_ask_alone_enters_with_zero_btc_evidence(tmp_p
     assert positions[0].outcome == "YES"
 
 
-def test_h_a_non_qualifying_polymarket_ask_alone_never_enters(tmp_path):
-    """Neither side's ask reaches 0.70 -- no entry, exactly like any
-    other sub-threshold case; the falling Polymarket mid history is
-    irrelevant, same as the rising one above."""
-    market = _market(yes_bid=0.35, yes_ask=0.37)
+def test_h_an_exactly_tied_market_alone_never_enters(tmp_path):
+    """There is no probability threshold any more -- even a market
+    barely favoring one side enters (see test_g). The one case that
+    still correctly produces no trade is an EXACT tie (yes_bid ==
+    yes_ask == 0.50, so both sides' implied probabilities are exactly
+    0.50): neither side is favored, and this is never resolved by
+    guessing. The falling Polymarket mid history is irrelevant either
+    way, same as the rising one in test_g."""
+    market = _market(yes_bid=0.50, yes_ask=0.50)
     harness = _engine_harness(tmp_path, market)
     harness["history"].observe(market)
     harness["history"].mids = [0.50, 0.45, 0.40]  # a big falling Polymarket move -- irrelevant either way

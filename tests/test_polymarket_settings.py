@@ -78,7 +78,40 @@ def test_entry_microstructure_defaults_tuned_for_the_btc_15m_market():
     assert settings.max_spread_pct == pytest.approx(0.05)
     assert settings.max_spread_usd == pytest.approx(0.03)
     assert settings.min_order_book_liquidity_usd == pytest.approx(10.0)
-    assert settings.entry_cutoff_seconds_before_close == 60
+
+
+def test_entry_cutoff_setting_no_longer_exists():
+    """FIX 8: there is no entry-cutoff restriction any more -- entry
+    is allowed at any point while the market is genuinely open."""
+    settings = PolymarketSettings.from_env(env={})
+    assert not hasattr(settings, "entry_cutoff_seconds_before_close")
+
+
+def test_take_profit_and_stop_loss_defaults_match_the_governing_spec():
+    """Both are configurable settings, never hard-coded constants --
+    see take_profit.py. Defaults: +5% take-profit, -20% stop-loss."""
+    settings = PolymarketSettings.from_env(env={})
+    assert settings.simple_take_profit_pct == pytest.approx(0.05)
+    assert settings.simple_stop_loss_pct == pytest.approx(0.20)
+
+
+def test_take_profit_and_stop_loss_are_configurable_via_env():
+    settings = PolymarketSettings.from_env(env={
+        "POLYMARKET_SIMPLE_TAKE_PROFIT_PCT": "0.10", "POLYMARKET_SIMPLE_STOP_LOSS_PCT": "0.15",
+    })
+    assert settings.simple_take_profit_pct == pytest.approx(0.10)
+    assert settings.simple_stop_loss_pct == pytest.approx(0.15)
+
+
+def test_non_positive_take_profit_pct_rejected():
+    with pytest.raises(PolymarketConfigError, match="TAKE_PROFIT_PCT"):
+        PolymarketSettings.from_env(env=_env(POLYMARKET_SIMPLE_TAKE_PROFIT_PCT="0"))
+
+
+@pytest.mark.parametrize("value", ["0", "1", "-0.01", "1.5"])
+def test_stop_loss_pct_outside_0_1_exclusive_rejected(value):
+    with pytest.raises(PolymarketConfigError, match="STOP_LOSS_PCT"):
+        PolymarketSettings.from_env(env=_env(POLYMARKET_SIMPLE_STOP_LOSS_PCT=value))
 
 
 @pytest.mark.parametrize("value", ["0", "1", "-0.01"])

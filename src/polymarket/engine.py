@@ -5,29 +5,35 @@ external scheduler, since nothing here needs an agent to relay data
 (client.py calls the real API directly).
 
 PRODUCTION STRATEGY (as of this round): a deliberately simple,
-Polymarket-price-only strategy -- see simple_entry_signal.py (entry)
-and take_profit.py (exit, a fixed +5% target, no stop-loss). Entry is
-evaluated continuously across the FULL 15-minute market -- there is
-no "only in the final N minutes" restriction any more. Coinbase BTC
-intelligence (btc_entry_signal.py), the settlement-reference
-divergence check (reference_divergence.py), confidence scoring
-(entry_confidence.py), and historical self-learning (trade_learning.py's
-adjustment machinery) are NOT CALLED from run_cycle() at all -- they
-remain in the codebase, with their own tests, in case they're wanted
-again later, but none of them influences a live entry or exit
-decision any more. trade_learning.CompletedTradeStore is still used,
-but only for its RECORD-KEEPING role (record_completed_trade at
-settlement/exit) -- never for its historical-adjustment role, which
-this module never calls.
+Polymarket-price-only, fully autonomous strategy -- see
+simple_entry_signal.py (entry) and take_profit.py (exit: a
+configurable +5% take-profit AND a configurable -20% stop-loss, both
+settings-driven, never hard-coded). Entry is evaluated continuously
+across the FULL 15-minute market, at ANY point while it is open --
+there is no "only in the final N minutes" restriction, and (as of
+this round) NO required implied-probability threshold either: the bot
+simply takes whichever side the market currently favors, autonomously,
+with no manual YES/NO selection required for normal operation.
+Coinbase BTC intelligence (btc_entry_signal.py), the settlement-
+reference divergence check (reference_divergence.py), confidence
+scoring (entry_confidence.py), and historical self-learning
+(trade_learning.py's adjustment machinery) are NOT CALLED from
+run_cycle() at all -- they remain in the codebase, with their own
+tests, in case they're wanted again later, but none of them
+influences a live entry or exit decision any more. trade_learning.
+CompletedTradeStore is still used, but only for its RECORD-KEEPING
+role (record_completed_trade at settlement/exit) -- never for its
+historical-adjustment role, which this module never calls.
 
 check_and_execute_dynamic_exits() (exit_manager.py, BTC-evidence-
 based) and trailing_stop.check_and_execute_trailing_stops() (the
 earlier +20% trailing-stop exit) are likewise no longer called --
 take_profit.check_and_execute_take_profits() is the only exit logic
 that runs, so a position opened by this strategy is never
-independently sold by either earlier exit system too. There is no
-stop-loss: a losing position is held until either the +5% target is
-reached or the market resolves."""
+independently sold by either earlier exit system too. Every open
+position is actively managed: it exits automatically the instant
+either the take-profit target or the stop-loss floor is reached,
+never merely held to resolution by default."""
 
 from __future__ import annotations
 
@@ -247,9 +253,7 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    signal = assess_simple_entry(
-        yes_order_book=yes_order_book, no_order_book=no_order_book, ask_threshold=settings.simple_entry_ask_threshold,
-    )
+    signal = assess_simple_entry(yes_order_book=yes_order_book, no_order_book=no_order_book)
     decision_logger.log_decision(
         kind="simple_entry_signal",
         reason=(
@@ -286,8 +290,9 @@ def run_cycle(
     # The SAME order book already fetched above for this outcome --
     # never re-fetched, never inferred from the other side. best_ask is
     # guaranteed not-None here: assess_simple_entry only ever returns a
-    # non-None outcome when that side's own best_ask cleared the
-    # threshold, which is itself only possible when best_ask exists.
+    # non-None outcome when that side's own midpoint was favored over
+    # the other's, which is itself only possible when both bid and ask
+    # (and so best_ask) exist.
     order_book = yes_order_book if outcome == "YES" else no_order_book
 
     # Hard ceiling the exchange will not cross, anchored to the REAL
@@ -375,7 +380,7 @@ def run_cycle(
     order = OrderRequest(
         condition_id=market.condition_id, token_id=token_id, outcome=outcome, side="BUY",
         size_usd=size_usd, max_price=max_price, close_time=market.close_time,
-        reason=f"simple_entry: {outcome} implied probability >= {settings.simple_entry_ask_threshold:.2f}",
+        reason=f"simple_entry: market currently favors {outcome}",
         order_type=settings.default_order_type, single_book_market=single_book_market,
     )
     result = gateway.submit_order(order)

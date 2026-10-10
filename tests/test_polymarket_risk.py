@@ -15,7 +15,6 @@ def _settings(**overrides) -> PolymarketSettings:
         "POLYMARKET_MAX_BET_USD": "5.0", "POLYMARKET_MAX_DAILY_LOSS_USD": "20.0",
         "POLYMARKET_MAX_OPEN_POSITIONS": "1", "POLYMARKET_COOLDOWN_SECONDS_AFTER_EXIT": "60",
         "POLYMARKET_STALE_DATA_MAX_SECONDS": "20.0", "POLYMARKET_MAX_SPREAD_PCT": "0.05",
-        "POLYMARKET_ENTRY_CUTOFF_SECONDS_BEFORE_CLOSE": "120",
         "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD": "25.0",
     }
     env.update(overrides)
@@ -115,12 +114,17 @@ def test_wide_spread_blocks():
     assert any("spread" in r.lower() for r in decision.reasons_failed)
 
 
-def test_entry_cutoff_blocks_near_close():
+def test_no_entry_cutoff_blocks_an_otherwise_valid_entry_even_seconds_before_close():
+    """FIX 8: there is no entry-cutoff restriction any more -- an
+    otherwise valid entry must never be refused just because the
+    market is about to close. A genuinely closed/resolved market, or
+    an unavailable order book, are the real (separate) hard no-trade
+    conditions -- not time remaining."""
     risk = PolymarketRiskManager(_settings())
-    closing_soon = _market(close_time=datetime.now(timezone.utc) + timedelta(seconds=30))
+    closing_soon = _market(close_time=datetime.now(timezone.utc) + timedelta(seconds=1))
     decision = _evaluate(risk, market=closing_soon)
-    assert not decision.allowed
-    assert any("cutoff" in r.lower() for r in decision.reasons_failed)
+    assert decision.allowed
+    assert not any(r.name == "ENTRY_CUTOFF" for r in decision.results)  # the check itself no longer exists
 
 
 def test_missing_quote_blocks_spread_check():
