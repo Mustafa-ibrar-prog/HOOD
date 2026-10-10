@@ -39,7 +39,11 @@ def _market(**overrides) -> BinaryMarket:
     now = datetime.now(timezone.utc)
     defaults = dict(
         condition_id="c1", question="Will BTC be up?", token_id_yes="y", token_id_no="n",
-        close_time=now + timedelta(minutes=10), fetched_at=now, yes_bid=0.60, yes_ask=0.62,
+        # Within the simple-entry 300s window by default (see
+        # simple_entry_signal.py) -- the ONLY production entry-
+        # direction logic as of this round. Callers testing "too early"
+        # explicitly override close_time further out.
+        close_time=now + timedelta(seconds=200), fetched_at=now, yes_bid=0.60, yes_ask=0.62,
     )
     defaults.update(overrides)
     return BinaryMarket(**defaults)
@@ -125,10 +129,13 @@ def test_no_setup_logs_no_trade_and_does_not_enter(tmp_path):
 
 
 def test_qualifying_setup_enters_a_paper_position(tmp_path):
+    # ask=0.80 >= the 0.70 threshold, close_time within the 300s window
+    # (see _market()'s own defaults) -- the ONLY production entry
+    # signal as of this round (simple_entry_signal.py); no BTC feed at
+    # all is needed or consulted.
     market = _market(yes_bid=0.78, yes_ask=0.80)
     harness = _harness(tmp_path, market=market)
-    end_t = _feed_bullish_btc(harness["btc_price_store"])  # real, materially-bullish BTC evidence
-    now = end_t + timedelta(seconds=5)
+    now = datetime.now(timezone.utc)
     report = run_cycle(**harness, now=now)
     assert report.entered
     positions = harness["position_store"].load()
@@ -149,14 +156,13 @@ def test_qualifying_setup_enters_a_paper_position(tmp_path):
 
 
 def test_qualifying_setup_skipped_when_outcome_book_has_no_liquidity(tmp_path):
-    """Task 6: even with a clear bullish BTC signal, a trade must be
+    """Task 6: even with an otherwise-qualifying ask, a trade must be
     refused when the SPECIFIC outcome's own order book can't actually
     absorb it near our ceiling price."""
     market = _market(yes_bid=0.78, yes_ask=0.80)
     harness = _harness(tmp_path, market=market, book_liquidity_shares=1.0)
-    end_t = _feed_bullish_btc(harness["btc_price_store"])
-    now = end_t + timedelta(seconds=5)
-    # 1 share at ~0.80 is <$1 notional — well below the $25 default minimum.
+    now = datetime.now(timezone.utc)
+    # 1 share at ~0.80 is <$1 notional — well below the $10 minimum.
     report = run_cycle(**harness, now=now)
     assert not report.entered
     assert harness["position_store"].load() == []
@@ -192,23 +198,19 @@ def test_max_open_positions_blocks_a_second_entry(tmp_path):
     assert len(harness["position_store"].load()) == 1  # unchanged — still just the pre-seeded one
 
 
-def test_max_open_positions_blocks_new_entry_but_never_short_circuits_dynamic_exit(tmp_path):
+def test_max_open_positions_blocks_new_entry_but_never_short_circuits_trailing_stop(tmp_path):
     """Requirement: MAX_OPEN_POSITIONS may block NEW entries only -- it
-    must never short-circuit dynamic-exit evaluation for an EXISTING
+    must never short-circuit trailing-stop evaluation for an EXISTING
     position. engine.run_cycle() already places
-    check_and_execute_dynamic_exits() before find_active_btc_market()/
+    check_and_execute_trailing_stops() before find_active_btc_market()/
     risk_manager.evaluate_new_trade() (where check_open_positions is
     actually enforced -- see risk.py); this proves that ordering holds
-    end to end with real BTC evidence, not just by reading the source.
-    A market that would otherwise clearly qualify for a brand-new
-    entry is present too, specifically so this test can also confirm
-    that entry really was blocked, not merely never attempted."""
-    from tests.test_polymarket_dynamic_exit_replay import _REVERSING_CLOSES, _REVERSING_SEED, _feed
-
+    end to end. A market that would otherwise clearly qualify for a
+    brand-new entry is present too, specifically so this test can also
+    confirm that entry really was blocked, not merely never attempted."""
     market = _market(yes_bid=0.78, yes_ask=0.80)  # would otherwise qualify for a brand-new entry too
     settings = PolymarketSettings.from_env(env={
-        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_DYNAMIC_EXIT_ENABLED": "true",
-        "POLYMARKET_MAX_OPEN_POSITIONS": "1",
+        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_MAX_OPEN_POSITIONS": "1",
     })
     client = _FakeClient(market)
     strategy = BtcMomentumStrategy()
@@ -220,20 +222,20 @@ def test_max_open_positions_blocks_new_entry_but_never_short_circuits_dynamic_ex
     pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
     history = MarketHistory()
     history.observe(market)
-    history.mids = [0.50, 0.60, 0.70]
     btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
-    end_t = _feed(btc_price_store, _REVERSING_CLOSES, seed=_REVERSING_SEED)  # real, materially-reversing BTC evidence
-    now = end_t + timedelta(seconds=5)
+    now = datetime.now(timezone.utc)
 
     # An EXISTING open position, already at the max_open_positions cap,
-    # deeply profitable at the live book (0.78 bid vs 0.36 entry) --
-    # under the v2 edge model that huge gain must NOT be what decides
-    # anything; only the real, materially-reversing BTC evidence above
-    # should.
+    # already ARMED (it previously rode above its own +20% floor) and
+    # now fallen back TO that floor at the live book's bid (0.78, this
+    # same market's own yes_bid -- the fake client keys any token
+    # matching token_id_yes to it): floor = 0.70 * 1.20 = 0.84 >= 0.78,
+    # so this is exactly "fell back to the floor" -- a full exit.
     position_store.add_if_absent(OpenPosition(
         condition_id="existing-market", token_id="y", outcome="YES", requested_size_usd=5.0,
-        filled_shares=10.0, avg_fill_price=0.36, order_id="paper:seed", client_order_id="seed-1",
+        filled_shares=10.0, avg_fill_price=0.70, order_id="paper:seed", client_order_id="seed-1",
         status="filled", opened_at=now - timedelta(minutes=5), close_time=now + timedelta(minutes=5),
+        trailing_stop_armed=True, trailing_stop_peak_price=0.95,
     ))
     state = state_store.load(today=now.date())
     state.open_position_count = 1
@@ -245,29 +247,26 @@ def test_max_open_positions_blocks_new_entry_but_never_short_circuits_dynamic_ex
         pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
     )
 
-    assert report.exits_submitted == 1  # the existing position's exit ran and fired despite being AT the cap
+    assert report.exits_submitted == 1  # the existing position's trailing-stop exit ran and fired despite being AT the cap
     assert not report.entered  # the new entry was still correctly blocked by max_open_positions
     assert position_store.load() == []  # paper mode: the exit fills immediately
 
 
-def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_dynamic_exit(tmp_path):
-    """A second live incident this round fixes: an entry order
-    submitted in an EARLIER cycle that sat UNKNOWN finally reconciles
-    FILLED via reconcile_pending_orders()'s sweep at the top of THIS
-    cycle -- creating a position this very call. Dynamic-exit
-    evaluation must NOT immediately reverse that stale-thesis entry on
-    this same cycle's fresh (here, materially opposing) evidence -- it
-    gets the same one-cycle grace an ordinary brand-new entry already
-    gets for free (see engine.py/exit_manager.py's module docstrings).
-    A second cycle then proves the deferral is exactly one cycle, never
-    a permanent shield: the genuinely bad position still exits, just
-    one poll interval later."""
-    from tests.test_polymarket_dynamic_exit_replay import _REVERSING_CLOSES, _REVERSING_SEED, _feed
-
+def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_trailing_stop(tmp_path):
+    """A live incident this round fixes: an entry order submitted in an
+    EARLIER cycle that sat UNKNOWN finally reconciles FILLED via
+    reconcile_pending_orders()'s sweep at the top of THIS cycle --
+    creating a position this very call. Trailing-stop evaluation must
+    NOT immediately touch that just-adopted position on this same
+    cycle -- it gets the same one-cycle grace an ordinary brand-new
+    entry already gets for free (see engine.py/trailing_stop.py's
+    module docstrings). A second cycle then proves the deferral is
+    exactly one cycle, never a permanent shield: the position IS
+    evaluated completely normally from then on (here, correctly held
+    -- its price never reached the +20% floor, so a never-armed
+    trailing stop has nothing to sell)."""
     market = _market(yes_bid=0.50, yes_ask=0.52)  # flat -- no NEW entry this cycle, keeps the test focused
-    settings = PolymarketSettings.from_env(env={
-        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_DYNAMIC_EXIT_ENABLED": "true",
-    })
+    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
     client = _FakeClient(market)
     strategy = BtcMomentumStrategy()
     risk = PolymarketRiskManager(settings)
@@ -278,8 +277,7 @@ def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_dynamic_exi
     pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
     history = MarketHistory()
     btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
-    end_t = _feed(btc_price_store, _REVERSING_CLOSES, seed=_REVERSING_SEED)  # real, materially-reversing BTC evidence
-    now = end_t + timedelta(seconds=5)
+    now = datetime.now(timezone.utc)
 
     from src.polymarket.models import OrderRequest, PendingLiveOrder
     order = OrderRequest(
@@ -303,21 +301,27 @@ def test_delayed_entry_reconciliation_gets_one_cycle_of_grace_before_dynamic_exi
     positions = position_store.load()
     assert len(positions) == 1
     assert positions[0].client_order_id == pending.id  # the SAME position, never duplicated/replaced
-    assert report.exits_submitted == 0  # deferred -- NOT immediately exited this same cycle
+    assert report.exits_submitted == 0  # deferred -- NOT immediately evaluated this same cycle
     deferred = [e for e in logger.read_all() if e.get("kind") == "exit_check_deferred"]
     assert len(deferred) == 1
 
-    # A SECOND cycle, evidence unchanged (still materially REVERSING):
-    # now evaluated completely normally, with no special-casing -- and,
-    # since the evidence genuinely still opposes it, correctly exits.
+    # A SECOND cycle: the grace has expired -- the position IS now
+    # evaluated normally by trailing_stop.py, with no special-casing.
+    # Its price (0.50 bid) never reached its own +20% floor (0.672), so
+    # a never-armed stop correctly just holds -- never a sell, and
+    # never deferred again either.
     second_report = run_cycle(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
         pending_store=pending_store, history=history, btc_price_store=btc_price_store,
         now=now + timedelta(seconds=10),
     )
-    assert second_report.exits_submitted == 1
-    assert position_store.load() == []  # paper mode: the exit fills immediately
+    assert second_report.exits_submitted == 0
+    assert len(position_store.load()) == 1  # still open -- correctly held, not sold
+    holds = [e for e in logger.read_all() if e.get("kind") == "trailing_stop_hold"]
+    assert len(holds) == 1  # evaluated normally on cycle 2 -- not deferred a second time
+    deferred_total = [e for e in logger.read_all() if e.get("kind") == "exit_check_deferred"]
+    assert len(deferred_total) == 1  # still just the one from cycle 1 -- never deferred again
 
 
 def test_stale_pending_entry_past_its_own_market_close_is_adopted_but_never_re_exited_same_cycle(tmp_path):
@@ -609,8 +613,9 @@ def test_run_cycle_reconciles_immediately_with_live_auto_execute(tmp_path):
     history = MarketHistory()
     history.observe(market)
     btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
-    end_t = _feed_bullish_btc(btc_price_store)  # real, materially-bullish BTC evidence -- the entry trigger now
-    now = end_t + timedelta(seconds=5)
+    # ask=0.80 >= 0.70 threshold, close_time within the 300s window
+    # (see _market()'s own defaults) -- no BTC feed needed or consulted.
+    now = datetime.now(timezone.utc)
 
     report = run_cycle(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,

@@ -342,7 +342,13 @@ def _market(**overrides) -> BinaryMarket:
     now = datetime.now(timezone.utc)
     defaults = dict(
         condition_id="c1", question="Will BTC be up?", token_id_yes="y", token_id_no="n",
-        close_time=now + timedelta(minutes=10), fetched_at=now, yes_bid=0.60, yes_ask=0.62,
+        # close_time within the simple-entry 300s window, and yes_ask
+        # >= the 0.70 threshold (see simple_entry_signal.py) -- the
+        # ONLY production entry-direction logic as of this round. A
+        # tight 2-cent spread so risk.py's own check_spread never
+        # independently blocks these (unrelated to what each test
+        # actually exercises).
+        close_time=now + timedelta(seconds=200), fetched_at=now, yes_bid=0.72, yes_ask=0.74,
     )
     defaults.update(overrides)
     return BinaryMarket(**defaults)
@@ -391,7 +397,7 @@ def _live_harness(tmp_path: Path, market: BinaryMarket, placer: _FakePlacer, *, 
 
 def test_scenario_1_unknown_fill_status_does_not_trigger_an_immediate_duplicate_buy(tmp_path):
     now = datetime.now(timezone.utc)
-    market = _market(yes_bid=0.60, yes_ask=0.62)
+    market = _market(yes_bid=0.72, yes_ask=0.74)
     placer = _FakePlacer([SubmissionOutcome(ok=True, exchange_order_id="ex-1", raw_status="matched")])
     harness = _live_harness(tmp_path, market, placer, now=now)
     harness["client"].set_fill_result("ex-1", FillResult(
@@ -409,7 +415,7 @@ def test_scenario_1_unknown_fill_status_does_not_trigger_an_immediate_duplicate_
 
 def test_scenario_2_rejected_does_not_trigger_an_immediate_duplicate_buy(tmp_path):
     now = datetime.now(timezone.utc)
-    market = _market(yes_bid=0.60, yes_ask=0.62)
+    market = _market(yes_bid=0.72, yes_ask=0.74)
     placer = _FakePlacer([SubmissionOutcome(ok=False, exchange_order_id=None, raw_status=None, error_code="not_enough_balance", error_message="nope")])
     harness = _live_harness(tmp_path, market, placer, now=now)
 
@@ -427,7 +433,7 @@ def test_scenario_2_rejected_does_not_trigger_an_immediate_duplicate_buy(tmp_pat
 
 def test_scenario_3_a_materially_changed_price_permits_a_later_retry(tmp_path):
     now = datetime.now(timezone.utc)
-    market = _market(yes_bid=0.60, yes_ask=0.62)
+    market = _market(yes_bid=0.72, yes_ask=0.74)
     placer = _FakePlacer([
         SubmissionOutcome(ok=False, exchange_order_id=None, raw_status=None, error_code="not_enough_balance", error_message="nope"),
         SubmissionOutcome(ok=True, exchange_order_id="ex-2", raw_status="matched"),
@@ -453,7 +459,7 @@ def test_scenario_3_a_materially_changed_price_permits_a_later_retry(tmp_path):
 
 def test_scenario_4_a_genuinely_new_market_is_not_blocked_by_the_previous_markets_guard(tmp_path):
     now = datetime.now(timezone.utc)
-    market_a = _market(condition_id="market-a", token_id_yes="ya", token_id_no="na", yes_bid=0.60, yes_ask=0.62)
+    market_a = _market(condition_id="market-a", token_id_yes="ya", token_id_no="na", yes_bid=0.72, yes_ask=0.74)
     placer = _FakePlacer([
         SubmissionOutcome(ok=False, exchange_order_id=None, raw_status=None, error_code="not_enough_balance", error_message="nope"),
         SubmissionOutcome(ok=True, exchange_order_id="ex-3", raw_status="matched"),
@@ -469,7 +475,7 @@ def test_scenario_4_a_genuinely_new_market_is_not_blocked_by_the_previous_market
 
     # A genuinely new 15-minute market -- same price/signal shape, but a
     # DIFFERENT condition_id -- must never be blocked by market-a's guard.
-    market_b = _market(condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.60, yes_ask=0.62)
+    market_b = _market(condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.72, yes_ask=0.74)
     harness["client"].set_market(market_b)
     harness["history"].observe(market_b)  # resets the mid-price buffer for the new market
     harness["history"].mids = [0.50, 0.55, 0.60]
@@ -495,7 +501,7 @@ def test_unknown_then_retry_cycle_blocked_then_original_resolves_filled(tmp_path
       4. a THIRD cycle, now that a position exists, must ALSO refuse a
          new entry -- this is the exact case the old guard got wrong."""
     now = datetime.now(timezone.utc)
-    market = _market(yes_bid=0.60, yes_ask=0.62)
+    market = _market(yes_bid=0.72, yes_ask=0.74)
     placer = _FakePlacer([SubmissionOutcome(ok=True, exchange_order_id="ex-1", raw_status="matched")])
     # MAX_OPEN_POSITIONS=2 -- the exact real-incident configuration.
     # With the default of 1, risk.py's own MAX_OPEN_POSITIONS check
@@ -567,7 +573,7 @@ def test_unknown_then_authoritative_rejected_then_retry_permitted_after_cooldown
     rejection) -> retry blocked within the cooldown -> retry permitted
     once the cooldown elapses."""
     now = datetime.now(timezone.utc)
-    market = _market(yes_bid=0.60, yes_ask=0.62)
+    market = _market(yes_bid=0.72, yes_ask=0.74)
     placer = _FakePlacer([
         SubmissionOutcome(ok=True, exchange_order_id="ex-1", raw_status="matched"),
         SubmissionOutcome(ok=True, exchange_order_id="ex-2", raw_status="matched"),
@@ -612,7 +618,7 @@ def test_two_distinct_markets_can_both_occupy_the_max_open_positions_limit(tmp_p
     the exact (condition_id, outcome) pair, never a blanket limit on
     distinct markets."""
     now = datetime.now(timezone.utc)
-    market_a = _market(condition_id="market-a", token_id_yes="ya", token_id_no="na", yes_bid=0.60, yes_ask=0.62)
+    market_a = _market(condition_id="market-a", token_id_yes="ya", token_id_no="na", yes_bid=0.72, yes_ask=0.74)
     placer = _FakePlacer([
         SubmissionOutcome(ok=True, exchange_order_id="ex-a", raw_status="matched"),
         SubmissionOutcome(ok=True, exchange_order_id="ex-b", raw_status="matched"),
@@ -626,7 +632,7 @@ def test_two_distinct_markets_can_both_occupy_the_max_open_positions_limit(tmp_p
     assert first.entered is True
     assert len(harness["position_store"].load()) == 1
 
-    market_b = _market(condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.60, yes_ask=0.62)
+    market_b = _market(condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.72, yes_ask=0.74)
     harness["client"].set_market(market_b)
     harness["client"].set_fill_result("ex-b", FillResult(
         order_id="ex-b", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.62,

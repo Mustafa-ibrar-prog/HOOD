@@ -71,13 +71,17 @@ def main() -> int:
     # gateway.py's PaperPolymarketGateway — it never calls place_order).
     pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file))
     history = MarketHistory()
-    # Dynamic-exit BTC evidence (see exit_manager.py/btc_market_data.py).
-    # check_and_execute_dynamic_exits() itself is a complete no-op while
-    # settings.dynamic_exit_enabled is False (the default) -- everything
-    # below runs regardless, so real history is already warm by the time
-    # anyone turns that flag on. CoinbaseBtcQuoteSource is a DIRECT,
-    # unattended HTTPS source (no agent/MCP) -- construction alone makes
-    # no network call; bootstrap/refresh below are what actually call it,
+    # NOTE: as of this round, the production strategy is a simple
+    # Polymarket-price threshold (simple_entry_signal.py) + a +20%
+    # trailing stop (trailing_stop.py) -- engine.run_cycle() no longer
+    # calls btc_entry_signal.py or exit_manager.check_and_execute_dynamic_exits()
+    # at all (see engine.py's own module docstring). The BTC bootstrap/
+    # feed-refresh plumbing below is kept running harmlessly (feeding
+    # btc_price_store, never read by the live decision) so Coinbase
+    # BTC intelligence stays warm and ready to re-enable later without
+    # any further setup. CoinbaseBtcQuoteSource is a DIRECT, unattended
+    # HTTPS source (no agent/MCP) -- construction alone makes no
+    # network call; bootstrap/refresh below are what actually call it,
     # and both fail safe (never raise, never crash this bot) on any
     # provider outage -- see btc_market_data.py's module docstring.
     btc_price_store = BtcPriceHistoryStore(Path(settings.btc_price_history_file))

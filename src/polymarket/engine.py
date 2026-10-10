@@ -2,7 +2,27 @@
 analogous to src/orchestrator.py's run_trading_cycle(), run repeatedly
 by scripts/run_polymarket_bot.py's loop rather than per-cycle by an
 external scheduler, since nothing here needs an agent to relay data
-(client.py calls the real API directly)."""
+(client.py calls the real API directly).
+
+PRODUCTION STRATEGY (as of this round): a deliberately simple,
+Polymarket-price-only strategy -- see simple_entry_signal.py (entry)
+and trailing_stop.py (exit). Coinbase BTC intelligence
+(btc_entry_signal.py), the settlement-reference divergence check
+(reference_divergence.py), confidence scoring (entry_confidence.py),
+and historical self-learning (trade_learning.py's adjustment
+machinery) are NO LONGER CALLED from run_cycle() at all -- they
+remain in the codebase, with their own tests, in case they're wanted
+again later, but none of them influences a live entry or exit
+decision any more. trade_learning.CompletedTradeStore is still used,
+but only for its RECORD-KEEPING role (record_completed_trade at
+settlement/exit) -- never for its historical-adjustment role, which
+this module never calls.
+
+check_and_execute_dynamic_exits() (exit_manager.py, BTC-evidence-
+based) is likewise no longer called -- trailing_stop.check_and_execute_trailing_stops()
+is the only exit logic that runs, so a position opened by this
+strategy is never independently sold by the old evidence-based exit
+too."""
 
 from __future__ import annotations
 
@@ -10,31 +30,21 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from src.polymarket import reconciliation
-from src.polymarket.btc_entry_signal import assess_btc_entry_direction, build_entry_candidate
 from src.polymarket.btc_market_data import BtcPriceHistoryStore
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
-from src.polymarket.entry_confidence import assess_confidence, confidence_bucket, recommended_size_usd
 from src.polymarket.entry_guard import check_entry_retry_guard
-from src.polymarket.exit_manager import check_and_execute_dynamic_exits
 from src.polymarket.gateway import ExecutionGateway
 from src.polymarket.logger import PolymarketDecisionLogger
 from src.polymarket.models import BinaryMarket, OrderRequest
 from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import PolymarketPositionStore
-from src.polymarket.reference_divergence import assess_divergence
 from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
+from src.polymarket.simple_entry_signal import assess_simple_entry
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.strategy import BtcMomentumStrategy
-from src.polymarket.trade_learning import (
-    CompletedTradeStore,
-    CompletedTradeStoreError,
-    apply_historical_adjustment,
-    build_setup_key,
-    compute_historical_adjustment,
-    compute_setup_stats,
-    record_completed_trade,
-)
+from src.polymarket.trade_learning import CompletedTradeStore, STRATEGY_ID_SIMPLE_PRICE_THRESHOLD, record_completed_trade
+from src.polymarket.trailing_stop import check_and_execute_trailing_stops
 
 
 @dataclass
@@ -163,19 +173,18 @@ def run_cycle(
         trade_store=trade_store,
     )
 
-    # Evidence-gated dynamic exit check (see exit_manager.py):
-    # deliberately placed AFTER settlement (a position that already
-    # resolved this cycle is gone, nothing to exit-check) and BEFORE any
-    # new-entry evaluation below, so the open-position count a new
-    # trade's risk checks read reflects any exit that just closed. A
-    # complete no-op while settings.dynamic_exit_enabled is False (the
-    # default). Never touches MAX_BET_SIZE/MAX_DAILY_LOSS/MAX_SPREAD/
-    # ORDER_BOOK_LIQUIDITY/ENTRY_CUTOFF or anything below this point.
-    exits_submitted = check_and_execute_dynamic_exits(
+    # +20% profit trailing-stop exit check (see trailing_stop.py) --
+    # the ONLY production exit logic as of this round. Deliberately
+    # placed AFTER settlement (a position that already resolved this
+    # cycle is gone, nothing to exit-check) and BEFORE any new-entry
+    # evaluation below, so the open-position count a new trade's risk
+    # checks read reflects any exit that just closed. Never touches
+    # MAX_BET_SIZE/MAX_DAILY_LOSS/MAX_SPREAD/ORDER_BOOK_LIQUIDITY/
+    # ENTRY_CUTOFF or anything below this point.
+    exits_submitted = check_and_execute_trailing_stops(
         client=client, settings=settings, gateway=gateway, position_store=position_store,
         pending_store=pending_store, state_store=state_store, decision_logger=decision_logger,
-        btc_price_store=btc_price_store, history=history, btc_feed_source=btc_feed_source,
-        skip_client_order_ids=newly_adopted_client_order_ids, now=now, trade_store=trade_store,
+        trade_store=trade_store, skip_client_order_ids=newly_adopted_client_order_ids, now=now,
     )
 
     try:
@@ -187,228 +196,28 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    # history.observe() still runs every cycle -- its own result just no
-    # longer decides entry direction (see below). It remains the ONLY
-    # source of `history.mids`, which exit_manager.py's dynamic-exit
-    # pass reads next cycle for Polymarket's own order-book-momentum
-    # microstructure signal (corroboration/veto there, never a trigger
-    # here either) -- removing this call would silently starve that
-    # unrelated, still-active exit-side signal.
+    # history.observe() still runs every cycle -- harmless bookkeeping,
+    # kept for whatever future use (nothing in the production path
+    # reads history.mids any more -- see module docstring).
     history.observe(market)
 
-    # --- COINBASE BTC -> directional entry thesis (see btc_entry_signal.py) --
-    # Polymarket price/order-book data plays NO part in this decision --
-    # a YES mid moving up or down, by itself, can never create or block
-    # an entry; only real Coinbase BTC evidence can. Reuses the EXACT
-    # SAME scoring pipeline exit_manager.py's dynamic-exit decision
-    # already relies on (build_btc_momentum_evidence/evaluate_momentum/
-    # compute_feed_status) -- never a second, competing BTC engine.
-    try:
-        bars = btc_price_store.get_bars(interval_seconds=settings.btc_bar_interval_seconds, now=now)
-    except Exception as exc:  # noqa: BLE001 - a BTC store failure must never crash the bot or fall back to the old Polymarket-only trigger
-        decision_logger.log_decision(
-            kind="btc_feed_read_failed",
-            reason=f"Could not read BTC price history for entry evaluation on {market.condition_id}: {exc}",
-            evidence={"condition_id": market.condition_id, "error_type": type(exc).__name__, "error": str(exc)},
-        )
-        bars = []
+    # --- <= 5 MINUTES REMAINING? (see simple_entry_signal.py) -- the
+    # now-aware computation, NEVER BinaryMarket.seconds_to_close (which
+    # reads real wall-clock time and would make this non-deterministic
+    # under a test's fixed `now`).
+    close_time = market.close_time if market.close_time.tzinfo else market.close_time.replace(tzinfo=timezone.utc)
+    seconds_remaining = (close_time - now).total_seconds()
 
-    btc_direction = assess_btc_entry_direction(
-        bars, now=now, max_bar_age_seconds=settings.btc_max_bar_age_seconds, feed_source=btc_feed_source,
-        min_strengthening_signals=settings.min_strengthening_signals_for_entry,
-    )
-    feed_status = btc_direction.feed_status
-    # Logged every cycle, for every active market, regardless of what
-    # else happens -- mirrors check_and_execute_dynamic_exits' own
-    # always-on btc_feed_status logging, so a dead/thin feed or a
-    # conflicting read is visible in the decision log, never silent.
-    decision_logger.log_decision(
-        kind="btc_entry_signal",
-        reason=(
-            f"BTC_DIRECTION={btc_direction.direction} BTC_EDGE_POINTS={btc_direction.edge_points:+.0f} "
-            f"BTC_STATE={btc_direction.momentum_state.value if btc_direction.momentum_state else 'n/a'} "
-            f"BTC_FEED_STATUS={feed_status.status} {btc_direction.reason}"
-        ),
-        evidence={
-            "market_slug": market.condition_id, "condition_id": market.condition_id,
-            "btc_direction": btc_direction.direction,
-            "btc_edge_points": btc_direction.edge_points,
-            "btc_momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
-            "fired_signals": list(btc_direction.selected_assessment.btc_assessment.signals) if btc_direction.selected_assessment else [],
-            "bullish_edge_points": btc_direction.bullish_edge_points, "bearish_edge_points": btc_direction.bearish_edge_points,
-            "bullish_state": btc_direction.bullish_assessment.state.value, "bearish_state": btc_direction.bearish_assessment.state.value,
-            "btc_feed_source": feed_status.source,
-            "btc_last_bar_time": feed_status.last_bar_time.isoformat() if feed_status.last_bar_time else None,
-            "btc_bar_age_seconds": feed_status.bar_age_seconds, "btc_feed_status": feed_status.status,
-            "remaining_seconds": market.seconds_to_close,
-        },
-    )
-
-    if btc_direction.direction == "neutral":
-        decision_logger.log_decision(
-            kind="no_trade", reason=btc_direction.reason,
-            evidence={
-                "question": market.question, "rejection_reason": btc_direction.neutral_reason_code,
-                "remaining_seconds": market.seconds_to_close,
-            },
-        )
-        return CycleReport(
-            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
-            exits_submitted=exits_submitted,
-        )
-
-    # --- CONFIDENCE -> whether to enter and how much to risk (see
-    # entry_confidence.py) -- reads this cycle's own already-computed
-    # Coinbase evidence (edge_points/fired_signal_count); never a second
-    # indicator engine, never a second directional signal. Direction
-    # itself was already decided above and is never touched here.
-    confidence = assess_confidence(
-        direction=btc_direction.direction, edge_points=btc_direction.edge_points,
-        fired_signal_count=btc_direction.fired_signal_count,
-    )
-    decision_logger.log_decision(
-        kind="entry_confidence",
-        reason=(
-            f"BTC_DIRECTION={btc_direction.direction} BASE_CONFIDENCE={confidence.base_confidence} "
-            f"CONFIDENCE_BUCKET={confidence.bucket} RECOMMENDED_SIZE=${confidence.recommended_size_usd:.2f} "
-            f"ENTRY_DECISION={'ALLOW' if confidence.approved else 'BLOCK'}"
-        ),
-        evidence={
-            "condition_id": market.condition_id,
-            "btc_direction": btc_direction.direction,
-            "base_confidence": confidence.base_confidence,
-            "confidence_bucket": confidence.bucket,
-            "recommended_size_usd": confidence.recommended_size_usd,
-            "edge_points": btc_direction.edge_points,
-            "momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
-            "fired_signal_count": btc_direction.fired_signal_count,
-            "feed_status": feed_status.status,
-            "remaining_seconds": market.seconds_to_close,
-            "selected_outcome": btc_direction.outcome,
-            "decision": "ALLOW" if confidence.approved else "BLOCK",
-        },
-    )
-    # --- REFERENCE DIVERGENCE -> Coinbase vs. the settlement-aligned
-    # reference feed (see reference_divergence.py). A no-op (penalty
-    # stays 0.0, status REFERENCE_UNAVAILABLE) whenever no reference
-    # feed is configured for this run -- today's default, since no
-    # legitimate free/live source exists yet (see that module's
-    # docstring); this never changes Coinbase-only behavior until a
-    # licensed feed is actually wired in.
-    reference_direction = None
-    if settings.reference_feed_enabled and reference_price_store is not None:
-        try:
-            reference_bars = reference_price_store.get_bars(
-                interval_seconds=settings.btc_bar_interval_seconds, now=now,
-            )
-        except Exception as exc:  # noqa: BLE001 - a reference-feed read failure must never crash the bot
-            decision_logger.log_decision(
-                kind="reference_feed_read_failed",
-                reason=f"Could not read reference price history for {market.condition_id}: {exc}",
-                evidence={"condition_id": market.condition_id, "error_type": type(exc).__name__, "error": str(exc)},
-            )
-            reference_bars = []
-        reference_direction = assess_btc_entry_direction(
-            reference_bars, now=now, max_bar_age_seconds=settings.btc_max_bar_age_seconds,
-            feed_source=reference_feed_source, min_strengthening_signals=settings.min_strengthening_signals_for_entry,
-        )
-    divergence = assess_divergence(
-        btc_direction, reference_direction, divergence_penalty=settings.reference_divergence_penalty,
-    )
-    decision_logger.log_decision(
-        kind="reference_divergence",
-        reason=f"REFERENCE_STATUS={divergence.status} CONFIDENCE_PENALTY={divergence.confidence_penalty:+.1f} {divergence.reason}",
-        evidence={
-            "condition_id": market.condition_id, "coinbase_direction": btc_direction.direction,
-            "reference_direction": reference_direction.direction if reference_direction else None,
-            "reference_feed_status": reference_direction.feed_status.status if reference_direction else None,
-            "status": divergence.status, "confidence_penalty": divergence.confidence_penalty,
-        },
-    )
-
-    # --- LEARNING -> a SECONDARY, bounded adjustment from this bot's own
-    # completed-trade history (see trade_learning.py, TASK 2). Never
-    # applied when base_confidence is already 0 (neutral/no-trade --
-    # apply_historical_adjustment enforces this itself too, belt and
-    # suspenders), never able to bypass anything below. A no-op
-    # (adjustment stays 0.0) whenever learning is disabled or no
-    # trade_store was configured for this run.
-    historical_adjustment = 0.0
-    final_confidence = apply_historical_adjustment(confidence.base_confidence, divergence.confidence_penalty)
-    historical_sample_count = 0
-    historical_win_rate = None
-    historical_expectancy = None
-    learning_reason = "learning disabled or no completed-trade store configured"
-    if settings.learning_enabled and trade_store is not None and confidence.base_confidence > 0:
-        # Market mid-price as a coarse, available-NOW proxy for "the
-        # price this setup is being entered at" -- the real avg_fill_price
-        # isn't known until after the order book fetch/order submission
-        # below, and setup-matching only needs a $0.05 bucket anyway.
-        setup_key_price_proxy = market.yes_mid if market.yes_mid is not None else 0.0
-        setup_key = build_setup_key(
-            btc_direction=btc_direction.direction,
-            momentum_state=btc_direction.momentum_state.value if btc_direction.momentum_state else None,
-            fired_signal_count=btc_direction.fired_signal_count,
-            entry_fill_price=setup_key_price_proxy, seconds_remaining_at_entry=market.seconds_to_close,
-        )
-        try:
-            completed_trades = trade_store.load()
-        except CompletedTradeStoreError as exc:
-            # Fail SAFE: a corrupted learning store must never crash the
-            # bot or silently use a half-read history -- just skip the
-            # adjustment this cycle; base confidence alone still governs.
-            decision_logger.log_decision(
-                kind="learning_store_corrupted",
-                reason=f"Completed-trade journal unreadable, skipping historical adjustment this cycle: {exc}",
-                evidence={"error": str(exc)},
-            )
-            completed_trades = []
-        stats = compute_setup_stats(completed_trades, setup_key)
-        adjustment_result = compute_historical_adjustment(
-            stats, min_sample_size=settings.learning_min_sample_size,
-            min_adjustment=settings.learning_min_adjustment, max_adjustment=settings.learning_max_adjustment,
-        )
-        historical_adjustment = adjustment_result.adjustment
-        learning_reason = adjustment_result.reason
-        historical_sample_count = stats.sample_count
-        historical_win_rate = stats.win_rate
-        historical_expectancy = stats.expectancy_usd
-        final_confidence = apply_historical_adjustment(
-            confidence.base_confidence, historical_adjustment + divergence.confidence_penalty,
-        )
-
-    final_bucket = confidence_bucket(final_confidence)
-    final_size_usd = recommended_size_usd(final_confidence)
-    decision_logger.log_decision(
-        kind="historical_learning",
-        reason=(
-            f"BASE_CONFIDENCE={confidence.base_confidence} HISTORICAL_SAMPLES={historical_sample_count} "
-            f"HISTORICAL_WIN_RATE={f'{historical_win_rate:.0%}' if historical_win_rate is not None else 'n/a'} "
-            f"HISTORICAL_EXPECTANCY={f'${historical_expectancy:+.2f}' if historical_expectancy is not None else 'n/a'} "
-            f"HISTORICAL_ADJUSTMENT={historical_adjustment:+.1f} FINAL_CONFIDENCE={final_confidence} "
-            f"LEARNING_REASON={learning_reason}"
-        ),
-        evidence={
-            "condition_id": market.condition_id,
-            "base_confidence": confidence.base_confidence, "historical_sample_count": historical_sample_count,
-            "historical_win_rate": historical_win_rate, "historical_expectancy": historical_expectancy,
-            "historical_adjustment": historical_adjustment, "final_confidence": final_confidence,
-            "confidence_bucket": final_bucket, "learning_reason": learning_reason,
-        },
-    )
-
-    if final_size_usd <= 0:
+    if seconds_remaining > settings.simple_entry_window_seconds:
         decision_logger.log_decision(
             kind="no_trade",
             reason=(
-                f"BTC_DIRECTION={btc_direction.direction} final confidence {final_confidence} (base "
-                f"{confidence.base_confidence}, historical adjustment {historical_adjustment:+.1f}) is below "
-                f"the minimum entry threshold (50) on {market.condition_id}"
+                f"{seconds_remaining:.0f}s remaining on {market.condition_id} > "
+                f"{settings.simple_entry_window_seconds:.0f}s entry window -- too early to evaluate"
             ),
             evidence={
-                "question": market.question, "rejection_reason": "confidence_below_minimum",
-                "base_confidence": confidence.base_confidence, "final_confidence": final_confidence,
-                "remaining_seconds": market.seconds_to_close,
+                "question": market.question, "rejection_reason": "too_early",
+                "remaining_seconds": seconds_remaining,
             },
         )
         return CycleReport(
@@ -416,79 +225,75 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    # --- POLYMARKET -> execution confirmation (direction already decided above) --
-    # Maps bullish->YES / bearish->NO against the CURRENT market's own
-    # two-sided quote -- never a price guess, never the other side.
-    candidate = build_entry_candidate(market, btc_direction, size_usd=final_size_usd)
-    if candidate is None:
-        decision_logger.log_decision(
-            kind="no_trade",
-            reason=(
-                f"Coinbase BTC evidence is {btc_direction.direction} but {btc_direction.outcome} has no "
-                f"two-sided Polymarket quote yet on {market.condition_id}"
-            ),
-            evidence={
-                "question": market.question, "rejection_reason": "unusable_outcome_quote",
-                "btc_direction": btc_direction.direction, "selected_outcome": btc_direction.outcome,
-            },
-        )
-        return CycleReport(
-            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
-            exits_submitted=exits_submitted,
-        )
-
-    token_id = market.token_id_for(candidate.thesis.outcome)
-    # The outcome's OWN order book — never inferred from the other side,
-    # never approximated from BinaryMarket.yes_bid/yes_ask (see
-    # models.OrderBookSnapshot's and BinaryMarket's docstrings). This is
-    # the only book the liquidity check and the order's max_price may be
-    # computed from.
-    #
-    # A real incident: an uncaught polymarket_us.errors.RateLimitError
-    # (Cloudflare 1015 on gateway.polymarket.us) out of this exact call
-    # crashed the whole bot process. us_client.get_order_book() already
-    # retries a rate limit internally with bounded backoff (see
-    # us_client._retry_on_rate_limit) before ever raising, so reaching
-    # this except at all means retries were exhausted (or some other,
-    # non-rate-limit failure happened) — either way, a safe no-trade
-    # skip for THIS cycle, never a crash and never a fabricated order
-    # book. No order is placed down either path.
+    # --- CHECK REAL YES/NO ASK (see simple_entry_signal.py) -- BOTH
+    # outcomes' own order books are needed up front: which side (if
+    # either) qualifies isn't known until both are checked. Same
+    # rate-limit-safe, never-crash handling as before.
     try:
-        order_book = client.get_order_book(token_id)
+        yes_order_book = client.get_order_book(market.token_id_yes)
+        no_order_book = client.get_order_book(market.token_id_no)
     except Exception as exc:  # noqa: BLE001 - a book-fetch failure (rate limit or otherwise) must never crash the bot or be treated as tradeable
         decision_logger.log_decision(
             kind="no_trade",
             reason=(
-                f"Could not fetch {candidate.thesis.outcome}'s order book on {market.condition_id} "
-                f"after retries: {type(exc).__name__}: {exc} -- sitting this cycle out"
+                f"Could not fetch YES/NO order books on {market.condition_id} after retries: "
+                f"{type(exc).__name__}: {exc} -- sitting this cycle out"
             ),
-            evidence={"token_id": token_id, "error_type": type(exc).__name__, "error": str(exc)},
-        )
-        return CycleReport(
-            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
-            exits_submitted=exits_submitted,
-        )
-    if order_book.best_ask is None:
-        decision_logger.log_decision(
-            kind="no_trade",
-            reason=f"No ask-side liquidity in {candidate.thesis.outcome}'s order book on {market.condition_id}",
-            evidence={"token_id": token_id},
+            evidence={"condition_id": market.condition_id, "error_type": type(exc).__name__, "error": str(exc)},
         )
         return CycleReport(
             ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
             exits_submitted=exits_submitted,
         )
 
-    # Hard ceiling the exchange will not cross, anchored to the REAL best
-    # ask (not the strategy's own suggested_entry_price, which for NO is
-    # only a `1 - yes_bid` estimate) plus a small configured slippage
-    # allowance. Clamped below 1.0 — OrderRequest requires max_price < 1.0.
+    signal = assess_simple_entry(
+        seconds_remaining=seconds_remaining, yes_order_book=yes_order_book, no_order_book=no_order_book,
+        entry_window_seconds=settings.simple_entry_window_seconds, ask_threshold=settings.simple_entry_ask_threshold,
+    )
+    decision_logger.log_decision(
+        kind="simple_entry_signal",
+        reason=(
+            f"YES_ASK={signal.yes_ask} NO_ASK={signal.no_ask} OUTCOME={signal.outcome} "
+            f"REMAINING_SECONDS={seconds_remaining:.0f} {signal.reason}"
+        ),
+        evidence={
+            "condition_id": market.condition_id, "yes_ask": signal.yes_ask, "no_ask": signal.no_ask,
+            "outcome": signal.outcome, "remaining_seconds": seconds_remaining,
+        },
+    )
+    if signal.outcome is None:
+        decision_logger.log_decision(
+            kind="no_trade", reason=signal.reason,
+            evidence={
+                "question": market.question, "rejection_reason": "no_qualifying_ask",
+                "remaining_seconds": seconds_remaining, "yes_ask": signal.yes_ask, "no_ask": signal.no_ask,
+            },
+        )
+        return CycleReport(
+            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
+            exits_submitted=exits_submitted,
+        )
+
+    outcome = signal.outcome
+    token_id = market.token_id_for(outcome)
+    # The SAME order book already fetched above for this outcome --
+    # never re-fetched, never inferred from the other side. best_ask is
+    # guaranteed not-None here: assess_simple_entry only ever returns a
+    # non-None outcome when that side's own best_ask cleared the
+    # threshold, which is itself only possible when best_ask exists.
+    order_book = yes_order_book if outcome == "YES" else no_order_book
+
+    # Hard ceiling the exchange will not cross, anchored to the REAL
+    # best ask plus a small configured slippage allowance. Clamped
+    # below 1.0 — OrderRequest requires max_price < 1.0. Keeps the
+    # existing aggressive LIMIT + FOK execution model — never an
+    # unrestricted market order.
     max_price = round(min(order_book.best_ask * (1 + settings.max_price_slippage_pct), 0.99), 4)
+    size_usd = settings.simple_entry_size_usd  # fixed, validated at load time to stay within [$10, $20]
 
     state = state_store.load(today=now.date())
     decision = risk_manager.evaluate_new_trade(
-        size_usd=candidate.suggested_size_usd, market=market, state=state,
-        order_book=order_book, side="BUY", max_price=max_price, now=now,
+        size_usd=size_usd, market=market, state=state, order_book=order_book, side="BUY", max_price=max_price, now=now,
     )
     if not decision.allowed:
         decision_logger.log_risk_block(decision, context="new_trade")
@@ -497,16 +302,14 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    # Idempotency/retry guard (see entry_guard.py) — deliberately
-    # separate from the risk checks above: a live incident showed
-    # auto-execute repeatedly resubmitting a live BUY for the exact
-    # same market/outcome every cycle after an unknown/rejected result
-    # (open_position_count never moved, so MAX_OPEN_POSITIONS never
-    # caught it). This never touches reconciliation's own unknown-fill
+    # Idempotency/retry guard (see entry_guard.py) — unchanged: a live
+    # incident showed auto-execute repeatedly resubmitting a live BUY
+    # for the exact same market/outcome every cycle after an unknown/
+    # rejected result. Never touches reconciliation's own unknown-fill
     # handling — it only decides whether a NEW submission may happen
     # yet for this exact (condition_id, outcome).
     retry_decision = check_entry_retry_guard(
-        pending_store, position_store, condition_id=market.condition_id, outcome=candidate.thesis.outcome,
+        pending_store, position_store, condition_id=market.condition_id, outcome=outcome,
         candidate_max_price=max_price, cooldown_seconds=settings.entry_retry_cooldown_seconds,
         min_price_change=settings.entry_retry_min_price_change, now=now,
     )
@@ -514,7 +317,7 @@ def run_cycle(
         decision_logger.log_decision(
             kind="entry_retry_blocked", reason=retry_decision.reason,
             evidence={
-                "condition_id": market.condition_id, "outcome": candidate.thesis.outcome,
+                "condition_id": market.condition_id, "outcome": outcome,
                 "candidate_max_price": max_price, "blocking_pending_order_id": retry_decision.blocking_pending_order_id,
             },
         )
@@ -523,78 +326,43 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    # Full Task-1/Task-2 required field set (see entry_confidence.py/
-    # trade_learning.py) -- the confidence/sizing/learning fields plus
-    # the execution-side facts (entry_price/spread/liquidity) only
-    # known now that the order book and risk checks above have run.
-    # `actual_allowed_size_usd` == `candidate.suggested_size_usd` here
-    # because risk.check_bet_size's own gate (size_usd <=
-    # settings.max_bet_usd) never shrinks a confidence-approved size --
-    # it only ever blocks (decision.allowed is False above) or passes
-    # it through unchanged.
     entry_liquidity_usd = order_book.executable_liquidity_usd(side="BUY", max_price=max_price)
     decision_logger.log_decision(
         kind="entry_allowed",
         reason=(
-            f"BTC_DIRECTION={btc_direction.direction} BASE_CONFIDENCE={confidence.base_confidence} "
-            f"FINAL_CONFIDENCE={final_confidence} CONFIDENCE_BUCKET={final_bucket} "
-            f"ACTUAL_ALLOWED_SIZE=${candidate.suggested_size_usd:.2f} ENTRY_DECISION=ALLOW"
+            f"OUTCOME={outcome} YES_ASK={signal.yes_ask} NO_ASK={signal.no_ask} SIZE=${size_usd:.2f} "
+            f"REMAINING_SECONDS={seconds_remaining:.0f} ENTRY_DECISION=ALLOW"
         ),
         evidence={
-            "condition_id": market.condition_id,
-            "btc_direction": btc_direction.direction,
-            "base_confidence": confidence.base_confidence,
-            "final_confidence": final_confidence,
-            "confidence_bucket": final_bucket,
-            "recommended_size_usd": final_size_usd,
-            "actual_allowed_size_usd": candidate.suggested_size_usd,
-            "historical_adjustment": historical_adjustment,
-            "edge_points": btc_direction.edge_points,
-            "momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
-            "fired_signal_count": btc_direction.fired_signal_count,
-            "feed_status": feed_status.status,
-            "remaining_seconds": market.seconds_to_close,
-            "selected_outcome": candidate.thesis.outcome,
-            "entry_price": candidate.suggested_entry_price,
-            "spread": market.yes_spread_pct,
-            "liquidity": entry_liquidity_usd,
+            "condition_id": market.condition_id, "selected_outcome": outcome, "yes_ask": signal.yes_ask,
+            "no_ask": signal.no_ask, "actual_allowed_size_usd": size_usd, "remaining_seconds": seconds_remaining,
+            "entry_price": order_book.best_ask, "spread": market.yes_spread_pct, "liquidity": entry_liquidity_usd,
             "decision": "ALLOW",
         },
     )
 
-    # Snapshot of exactly what this cycle's own entry pipeline computed
-    # — attached to the resulting OpenPosition (see positions.py) so
-    # trade_learning.py can later learn from this EXACT decision, never
-    # a reconstruction/guess after the fact (TASK 2, 2A).
+    # Snapshot of exactly what this cycle's own simple entry pipeline
+    # computed -- attached to the resulting OpenPosition (see
+    # positions.py) so trade_learning.py's RECORD-KEEPING (never its
+    # historical-adjustment machinery, which this module never calls)
+    # can still journal this decision, whatever is actually available.
     entry_context = {
-        "strategy_id": "COINBASE_MOMENTUM",
+        "strategy_id": STRATEGY_ID_SIMPLE_PRICE_THRESHOLD,
         "market_question": market.question,
-        "btc_direction": btc_direction.direction,
-        "btc_edge_points": btc_direction.edge_points,
-        "momentum_state": btc_direction.momentum_state.value if btc_direction.momentum_state else None,
-        "fired_signal_count": btc_direction.fired_signal_count,
-        "fired_signals": (
-            list(btc_direction.selected_assessment.btc_assessment.signals) if btc_direction.selected_assessment else []
-        ),
-        "btc_price_at_entry": bars[-1].close if bars else None,
-        "coinbase_feed_status": feed_status.status,
-        "reference_direction_at_entry": reference_direction.direction if reference_direction else None,
-        "reference_divergence_status": divergence.status,
+        "yes_ask_at_entry": signal.yes_ask,
+        "no_ask_at_entry": signal.no_ask,
         "polymarket_yes_bid": market.yes_bid,
         "polymarket_yes_ask": market.yes_ask,
         "entry_spread": market.yes_spread_pct,
         "entry_liquidity_usd": entry_liquidity_usd,
-        "seconds_remaining_at_entry": market.seconds_to_close,
-        "base_confidence": confidence.base_confidence,
-        "confidence_bucket": final_bucket,
-        "final_confidence": final_confidence,
-        "historical_adjustment": historical_adjustment,
+        "seconds_remaining_at_entry": seconds_remaining,
     }
 
     order = OrderRequest(
-        condition_id=market.condition_id, token_id=token_id, outcome=candidate.thesis.outcome, side="BUY",
-        size_usd=candidate.suggested_size_usd, max_price=max_price, close_time=market.close_time,
-        reason=candidate.thesis.catalyst, order_type=settings.default_order_type,
+        condition_id=market.condition_id, token_id=token_id, outcome=outcome, side="BUY",
+        size_usd=size_usd, max_price=max_price, close_time=market.close_time,
+        reason=f"simple_entry: {outcome} ask >= {settings.simple_entry_ask_threshold:.2f}",
+        order_type=settings.default_order_type,
     )
     result = gateway.submit_order(order)
 

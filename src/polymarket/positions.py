@@ -107,6 +107,15 @@ class OpenPosition:
     # fabricated" -- this is read, never guessed, at trade-completion
     # time.
     entry_context: dict[str, Any] | None = None
+    # +20% profit trailing stop state (see trailing_stop.py) -- the
+    # ONLY production exit logic as of this round. Persisted here, on
+    # the position itself, for the exact same restart-safety reason as
+    # exit_pending_order_id above: a bot restart must never forget that
+    # a position's stop was already armed or lose track of its peak.
+    # Both stay at their defaults (False/None) for a position that has
+    # never yet reached its +20% floor.
+    trailing_stop_armed: bool = False
+    trailing_stop_peak_price: float | None = None
 
     @property
     def filled_size_usd(self) -> float:
@@ -135,6 +144,8 @@ class OpenPosition:
             ),
             last_exit_attempt_edge_points=data.get("last_exit_attempt_edge_points"),
             entry_context=data.get("entry_context"),
+            trailing_stop_armed=bool(data.get("trailing_stop_armed", False)),
+            trailing_stop_peak_price=data.get("trailing_stop_peak_price"),
         )
 
 

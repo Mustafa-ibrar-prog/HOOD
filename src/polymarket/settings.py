@@ -194,13 +194,10 @@ class PolymarketSettings:
     # --- Risk controls — deliberately tiny defaults. Read every one of
     # these yourself in .env.polymarket.example before going live; they
     # are placeholders, not a recommendation. ------------------------------
-    # The HARD ceiling risk.py's check_bet_size enforces -- confidence-
-    # based sizing (entry_confidence.py) never proposes more than
-    # $20.00 (its own top bucket), so this is the backstop, not the
-    # everyday value. $5.00 remains the floor for any APPROVED trade
-    # (entry_confidence.MIN_APPROVED_TRADE_SIZE_USD) -- below the
-    # lowest confidence bucket, no trade is proposed at all (size $0),
-    # never a smaller approved size.
+    # The HARD ceiling risk.py's check_bet_size enforces -- the simple
+    # price-based strategy's own entry size (simple_entry_size_usd,
+    # below) is validated at load time to never exceed this, so this
+    # is the backstop, never the everyday value by itself.
     max_bet_usd: float
     max_daily_loss_usd: float
     max_open_positions: int
@@ -233,6 +230,22 @@ class PolymarketSettings:
     # (BUY) — bounds slippage on a FOK/FAK order beyond just "the order
     # either fills at an acceptable price or doesn't happen."
     max_price_slippage_pct: float
+
+    # --- Simple price-based strategy (see simple_entry_signal.py/
+    # trailing_stop.py) -- the ONLY production entry/exit logic as of
+    # this round. Coinbase/Chainlink/confidence/historical-learning
+    # modules remain in the codebase (with their own tests) but are no
+    # longer called from engine.run_cycle(). ------------------------
+    # Only evaluate NEW entries once this many seconds or fewer remain
+    # on the current market.
+    simple_entry_window_seconds: float
+    # YES/NO's own order book executable ask must be >= this for that
+    # outcome to become the candidate (see simple_entry_signal.py).
+    simple_entry_ask_threshold: float
+    # Fixed entry size for every approved trade -- validated below to
+    # stay within [$10, $20]; max_bet_usd (the risk manager's own
+    # independent hard ceiling) is never bypassed by this.
+    simple_entry_size_usd: float
 
     # --- Entry retry guard (see entry_guard.py) — an IDEMPOTENCY/safety
     # gate, not a risk threshold: after a live incident showed
@@ -456,6 +469,20 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD must be >= 0")
         if not 0 <= self.max_price_slippage_pct < 1:
             raise PolymarketConfigError("POLYMARKET_MAX_PRICE_SLIPPAGE_PCT must be between 0 and 1 (exclusive of 1)")
+        if self.simple_entry_window_seconds <= 0:
+            raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_WINDOW_SECONDS must be > 0")
+        if not 0 < self.simple_entry_ask_threshold < 1:
+            raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_ASK_THRESHOLD must be between 0 and 1 (exclusive)")
+        if not 10.0 <= self.simple_entry_size_usd <= 20.0:
+            raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_SIZE_USD must be between $10 and $20")
+        # Deliberately NOT cross-validated against max_bet_usd here: a
+        # caller is free to configure max_bet_usd below
+        # simple_entry_size_usd (e.g. many existing risk.py tests set a
+        # tiny max_bet_usd to exercise check_bet_size in isolation) --
+        # the risk manager (risk.py), not settings construction, is the
+        # right place to enforce that bound AT RUNTIME, by blocking the
+        # trade exactly like any other oversized bet. "The risk manager
+        # remains the final authority."
         if self.market_duration_minutes <= 0:
             raise PolymarketConfigError("POLYMARKET_MARKET_DURATION_MINUTES must be > 0")
         if self.entry_cutoff_seconds_before_close < 0:
@@ -654,6 +681,9 @@ class PolymarketSettings:
             max_spread_usd=_get_float(env, "POLYMARKET_MAX_SPREAD_USD", 0.03),
             min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 10.0),
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
+            simple_entry_window_seconds=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_WINDOW_SECONDS", 300.0),
+            simple_entry_ask_threshold=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_ASK_THRESHOLD", 0.70),
+            simple_entry_size_usd=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_SIZE_USD", 10.0),
             entry_retry_cooldown_seconds=_get_float(env, "POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS", 120.0),
             entry_retry_min_price_change=_get_float(env, "POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE", 0.02),
             exit_retry_cooldown_seconds=_get_float(env, "POLYMARKET_EXIT_RETRY_COOLDOWN_SECONDS", 90.0),

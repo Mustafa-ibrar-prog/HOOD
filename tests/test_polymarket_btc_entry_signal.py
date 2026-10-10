@@ -309,119 +309,16 @@ def test_h_polymarket_price_falling_alone_never_triggers_a_no_entry(tmp_path):
     assert harness["position_store"].load() == []
 
 
-# --- O: entry sizing is confidence-based and bounded $5-$20, end to end ----
-
-def test_o_entry_size_is_confidence_based_and_within_bounds(tmp_path):
-    """This fixture's own edge_points(+2)/fired_signal_count(2) maps to
-    the MINIMUM confidence bucket (see entry_confidence.py) -- the $5
-    floor for any APPROVED trade, never $0 (which would mean no trade
-    at all) and never above the $20 hard ceiling."""
-    market = _market(yes_bid=0.78, yes_ask=0.80)
-    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
-    from tests.test_polymarket_engine import _FakeClient
-
-    client = _FakeClient(market)
-    strategy = BtcMomentumStrategy()
-    risk = PolymarketRiskManager(settings)
-    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
-    gateway = PaperPolymarketGateway(settings, logger)
-    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
-    position_store = PolymarketPositionStore(tmp_path / "positions.json")
-    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
-    history = MarketHistory()
-    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
-    end_t = _feed(btc_price_store, _strengthening_closes(), seed=5)
-    now = end_t + timedelta(seconds=5)
-
-    report = run_cycle(
-        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
-        decision_logger=logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
-    )
-
-    assert report.entered is True
-    position = position_store.load()[0]
-    assert position.requested_size_usd == pytest.approx(5.0)
-
-
-# --- P: the risk manager remains the final authority -- a confidence-
-# approved size can still be blocked by an unrelated, pre-existing risk
-# control (here: MAX_BET_SIZE configured below what confidence
-# approved). Confidence sizing must never bypass risk.py. -------------
-
-def test_p_risk_manager_still_blocks_a_confidence_approved_size(tmp_path):
-    market = _market(yes_bid=0.78, yes_ask=0.80)
-    # This fixture's confidence-recommended size is $5.00 (see test O) --
-    # configuring MAX_BET_SIZE below that must still block the trade,
-    # exactly as it would for any other size.
-    settings = PolymarketSettings.from_env(
-        env={"POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_MAX_BET_USD": "4.00"},
-    )
-    from tests.test_polymarket_engine import _FakeClient
-
-    client = _FakeClient(market)
-    strategy = BtcMomentumStrategy()
-    risk = PolymarketRiskManager(settings)
-    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
-    gateway = PaperPolymarketGateway(settings, logger)
-    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
-    position_store = PolymarketPositionStore(tmp_path / "positions.json")
-    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
-    history = MarketHistory()
-    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
-    end_t = _feed(btc_price_store, _strengthening_closes(), seed=5)
-    now = end_t + timedelta(seconds=5)
-
-    report = run_cycle(
-        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
-        decision_logger=logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
-    )
-
-    assert report.entered is False
-    assert position_store.load() == []
-
-
-# --- P2: a corrupted completed-trade learning store fails SAFE -- the
-# cycle still runs and still enters at BASE confidence (TASK 2's
-# required "corrupted learning store fails safely" behavior), never a
-# crash and never a silently-fabricated adjustment. ------------------
-
-def test_p2_corrupted_learning_store_fails_safe_and_cycle_still_runs(tmp_path):
-    from src.polymarket.trade_learning import CompletedTradeStore
-
-    market = _market(yes_bid=0.78, yes_ask=0.80)
-    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
-    from tests.test_polymarket_engine import _FakeClient
-
-    client = _FakeClient(market)
-    strategy = BtcMomentumStrategy()
-    risk = PolymarketRiskManager(settings)
-    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
-    gateway = PaperPolymarketGateway(settings, logger)
-    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
-    position_store = PolymarketPositionStore(tmp_path / "positions.json")
-    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
-    history = MarketHistory()
-    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
-    end_t = _feed(btc_price_store, _strengthening_closes(), seed=5)
-    now = end_t + timedelta(seconds=5)
-
-    trades_path = tmp_path / "completed_trades.json"
-    trades_path.write_text("{not valid json")
-    trade_store = CompletedTradeStore(trades_path)
-
-    report = run_cycle(
-        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
-        decision_logger=logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
-        trade_store=trade_store,
-    )
-
-    assert report.entered is True  # the corrupted store never blocks or crashes the cycle
-    position = position_store.load()[0]
-    assert position.requested_size_usd == pytest.approx(5.0)  # base confidence governs; no adjustment applied
-
+# --- O/P/P2 (confidence-based sizing / risk-manager-still-blocks /
+# corrupted-learning-store, end to end via run_cycle) REMOVED this
+# round: production run_cycle() no longer calls entry_confidence.py or
+# trade_learning.py's adjustment machinery at all (see engine.py's
+# module docstring and TASK 3 of this round's governing instructions
+# -- the live strategy is now a simple Polymarket-price threshold).
+# entry_confidence.py and trade_learning.py themselves are UNCHANGED
+# and remain fully covered by their own dedicated unit tests
+# (test_polymarket_entry_confidence.py, test_polymarket_trade_learning.py)
+# -- only the now-obsolete PRODUCTION-WIRING assertions here were removed.
 
 # --- Q: no lookahead -- only data available as of `now` is ever used -------
 

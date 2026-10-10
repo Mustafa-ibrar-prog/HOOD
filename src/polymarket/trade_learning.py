@@ -49,7 +49,8 @@ from typing import Any
 
 from src.polymarket.positions import OpenPosition
 
-STRATEGY_ID_COINBASE_MOMENTUM = "COINBASE_MOMENTUM"
+STRATEGY_ID_COINBASE_MOMENTUM = "COINBASE_MOMENTUM"  # retained for completed trades recorded before this round
+STRATEGY_ID_SIMPLE_PRICE_THRESHOLD = "SIMPLE_PRICE_THRESHOLD"  # the ONLY production strategy_id as of this round
 
 # --- Outcome classification (2E) --------------------------------------------
 OUTCOME_NORMAL_WIN = "NORMAL_WIN"
