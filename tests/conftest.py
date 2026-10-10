@@ -92,6 +92,15 @@ def make_thesis(direction: str = "bullish", **overrides) -> TradeThesis:
 
 
 def make_position(**overrides) -> OpenPosition:
+    # expiration defaults relative to real wall-clock time, not a fixed
+    # calendar date: OpenPosition.minutes_to_expiration(now) is always
+    # computed against whatever `now` a caller passes (often
+    # datetime.now(timezone.utc) in these tests), so a hardcoded past
+    # date would make the position look already-expired as soon as real
+    # time passes it, forcing evaluator.py's expiration-risk branch
+    # (src/position_manager/evaluator.py) regardless of what a test
+    # actually intends to exercise. A test that specifically wants
+    # near-expiration behavior should still pass its own `expiration=`.
     defaults = dict(
         symbol="AAPL",
         option_id="11111111-1111-1111-1111-111111111111",
@@ -103,7 +112,7 @@ def make_position(**overrides) -> OpenPosition:
         thesis=make_thesis(),
         profit_target_usd=20.0,
         stop_loss_usd=15.0,
-        expiration=date(2026, 9, 18),
+        expiration=(datetime.now(timezone.utc) + timedelta(days=35)).date(),
     )
     defaults.update(overrides)
     return OpenPosition(**defaults)
