@@ -1,33 +1,40 @@
-"""A simple, fixed +5% take-profit target -- the ONLY production exit
-logic as of this round, replacing trailing_stop.py's +20% trailing
-stop entirely (and, before that, the Coinbase-BTC-evidence-based
-dynamic exit -- exit_manager.py's evaluate_dynamic_exit/
-check_and_execute_dynamic_exits). engine.py no longer calls
-check_and_execute_trailing_stops() or check_and_execute_dynamic_exits()
-in production; those modules (and their own tests) stay in the
-codebase unmodified, in case either is wanted again later, but
-neither independently sells a position alongside this one (see
-engine.py's module docstring).
+"""A simple, fixed +5% take-profit target AND a fixed -20% stop-loss
+-- the ONLY production exit logic as of this round, replacing
+trailing_stop.py's +20% trailing stop entirely (and, before that, the
+Coinbase-BTC-evidence-based dynamic exit -- exit_manager.py's
+evaluate_dynamic_exit/check_and_execute_dynamic_exits). engine.py no
+longer calls check_and_execute_trailing_stops() or
+check_and_execute_dynamic_exits() in production; those modules (and
+their own tests) stay in the codebase unmodified, in case either is
+wanted again later, but neither independently sells a position
+alongside this one (see engine.py's module docstring).
 
 RULE (verbatim, intentionally simple -- never Coinbase, Chainlink,
 RSI, MACD, EMA, BTC momentum, confidence, or historical learning):
 
-  1. target_price = position.avg_fill_price * 1.05 (the position's own
-     ACTUAL average fill price -- never the requested size, never a
-     market-wide reference price). Deterministically re-derived from
+  1. target_price = position.avg_fill_price * 1.05; stop_loss_price =
+     position.avg_fill_price * 0.80 (the position's own ACTUAL average
+     fill price -- never the requested size, never a market-wide
+     reference price). Both deterministically re-derived from
      avg_fill_price every time, which is itself already persisted on
-     the position -- so the target is automatically persistent across
-     a restart with no separate stored field to go stale or drift.
-  2. Below the target: HOLD. Never sells merely because the position
-     is profitable below +5% (no partial take, no trailing, no
-     "close enough").
+     the position -- so both are automatically persistent across a
+     restart with no separate stored field to go stale or drift.
+  2. Strictly between the two: HOLD. Never sells merely because the
+     position is profitable below +5% or merely losing below -20%
+     (no partial take, no trailing, no "close enough").
   3. The first time the position's REAL executable value -- the
      CURRENT best bid on its own order book, never the mid, never a
      stale snapshot -- reaches OR EXCEEDS target_price, the position
-     is sold in FULL (its entire actual filled share count), once.
+     is sold in FULL (its entire actual filled share count), once --
+     a take-profit exit.
+  4. The first time that same executable bid falls TO OR BELOW
+     stop_loss_price, the position is likewise sold in FULL, once --
+     a stop-loss exit, cutting the loss rather than holding it to
+     resolution.
 
-P&L is used ONLY to compute target_price from the position's own real
-fill price -- it is never consulted as an independent signal."""
+P&L is used ONLY to compute target_price/stop_loss_price from the
+position's own real fill price -- it is never consulted as an
+independent signal."""
 
 from __future__ import annotations
 
@@ -47,6 +54,7 @@ from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.trade_learning import CompletedTradeStore
 
 TAKE_PROFIT_MULTIPLE = 1.05
+STOP_LOSS_MULTIPLE = 0.80
 
 # A fixed, price-scale threshold for exit_retry_guard.check_exit_retry_guard's
 # generic "has the candidate value moved enough to justify an immediate
@@ -58,35 +66,52 @@ _RETRY_MIN_PRICE_CHANGE = 0.01
 _ACTION_HOLD = "HOLD"
 _ACTION_SELL = "SELL"
 
+TRIGGER_TAKE_PROFIT = "TAKE_PROFIT"
+TRIGGER_STOP_LOSS = "STOP_LOSS"
+
 
 @dataclass(frozen=True)
 class TakeProfitDecision:
     action: str  # one of the _ACTION_* constants above
     reason: str
     target_price: float  # avg_fill_price * 1.05, always computed, regardless of action
+    stop_loss_price: float  # avg_fill_price * 0.80, always computed, regardless of action
     executable_bid: float | None
+    trigger: str | None  # TRIGGER_TAKE_PROFIT | TRIGGER_STOP_LOSS | None (None unless action == SELL)
 
 
 def evaluate_take_profit(position: OpenPosition, *, executable_bid: float | None) -> TakeProfitDecision:
     """Pure and side-effect free. `executable_bid` is the CALLER's own
     fresh OrderBookSnapshot.best_bid read for this position's own
     token; None (no bid liquidity at all right now) is always HOLD,
-    never a guess."""
+    never a guess. target_price and stop_loss_price never cross (1.05x
+    vs 0.80x of the same positive avg_fill_price), so the two SELL
+    conditions below are always mutually exclusive."""
     target_price = position.avg_fill_price * TAKE_PROFIT_MULTIPLE
+    stop_loss_price = position.avg_fill_price * STOP_LOSS_MULTIPLE
 
     if executable_bid is None:
-        return TakeProfitDecision(_ACTION_HOLD, "no executable bid available this cycle", target_price, None)
+        return TakeProfitDecision(
+            _ACTION_HOLD, "no executable bid available this cycle", target_price, stop_loss_price, None, None,
+        )
 
     if executable_bid >= target_price:
         return TakeProfitDecision(
             _ACTION_SELL,
             f"executable bid {executable_bid:.4f} reached the +5% target {target_price:.4f} -- full exit",
-            target_price, executable_bid,
+            target_price, stop_loss_price, executable_bid, TRIGGER_TAKE_PROFIT,
+        )
+    if executable_bid <= stop_loss_price:
+        return TakeProfitDecision(
+            _ACTION_SELL,
+            f"executable bid {executable_bid:.4f} fell to the -20% stop-loss {stop_loss_price:.4f} -- full exit",
+            target_price, stop_loss_price, executable_bid, TRIGGER_STOP_LOSS,
         )
     return TakeProfitDecision(
         _ACTION_HOLD,
-        f"executable bid {executable_bid:.4f} is below the +5% target {target_price:.4f} -- holding",
-        target_price, executable_bid,
+        f"executable bid {executable_bid:.4f} is between the -20% stop-loss {stop_loss_price:.4f} and the "
+        f"+5% target {target_price:.4f} -- holding",
+        target_price, stop_loss_price, executable_bid, None,
     )
 
 
@@ -116,10 +141,11 @@ def submit_take_profit_exit(
     assert decision.action == _ACTION_SELL
     assert decision.executable_bid is not None
     quantity = int(round(position.filled_shares))
+    order_reason = "stop_loss_exit" if decision.trigger == TRIGGER_STOP_LOSS else "take_profit_exit"
     order = OrderRequest(
         condition_id=position.condition_id, token_id=position.token_id, outcome=position.outcome, side="SELL",
         size_usd=round(quantity * decision.executable_bid, 2), max_price=decision.executable_bid,
-        close_time=position.close_time, reason="take_profit_exit", order_type=settings.default_order_type,
+        close_time=position.close_time, reason=order_reason, order_type=settings.default_order_type,
         quantity=quantity, closes_client_order_id=position.client_order_id,
     )
     result = gateway.submit_order(order)
@@ -128,7 +154,7 @@ def submit_take_profit_exit(
     if pending_order_id is None and result.fill_result is not None:
         pending_order_id = result.fill_result.order_id
 
-    # pending_exit_edge_points is reused here as "the target price this
+    # pending_exit_edge_points is reused here as "the price level this
     # attempt was submitted under" -- see trailing_stop.py's own
     # identical reuse and its docstring on why this field (named for
     # the OLD BTC-evidence exit system's points scale) is still the
@@ -136,14 +162,15 @@ def submit_take_profit_exit(
     # generic over whatever numeric "has this changed enough" value a
     # caller gives it.
     position_store.update(replace(
-        position, exit_pending_order_id=pending_order_id, pending_exit_edge_points=decision.target_price,
+        position, exit_pending_order_id=pending_order_id, pending_exit_edge_points=decision.executable_bid,
     ))
     decision_logger.log_decision(
-        kind="take_profit_exit_submitted",
+        kind="take_profit_exit_submitted" if decision.trigger == TRIGGER_TAKE_PROFIT else "stop_loss_exit_submitted",
         reason=f"{position.outcome} on {position.condition_id}: {decision.reason}",
         evidence={
             "position": position.to_dict(), "order": order.to_dict(), "result_status": result.status,
-            "target_price": decision.target_price, "executable_bid": decision.executable_bid,
+            "target_price": decision.target_price, "stop_loss_price": decision.stop_loss_price,
+            "executable_bid": decision.executable_bid, "trigger": decision.trigger,
         },
     )
 
@@ -287,7 +314,10 @@ def check_and_execute_take_profits(
             decision_logger.log_decision(
                 kind="take_profit_hold",
                 reason=f"{current.outcome} on {current.condition_id}: {decision.reason}",
-                evidence={"position": current.to_dict(), "target_price": decision.target_price},
+                evidence={
+                    "position": current.to_dict(), "target_price": decision.target_price,
+                    "stop_loss_price": decision.stop_loss_price,
+                },
             )
             continue
 
@@ -303,7 +333,7 @@ def check_and_execute_take_profits(
             decision_logger.log_decision(
                 kind="take_profit_retry_blocked",
                 reason=f"{current.outcome} on {current.condition_id}: {retry_decision.reason}",
-                evidence={"position": current.to_dict()},
+                evidence={"position": current.to_dict(), "trigger": decision.trigger},
             )
             continue
 

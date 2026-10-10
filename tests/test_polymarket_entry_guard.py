@@ -287,9 +287,27 @@ class _FakeLiveClient:
         self._market = market
         self._book_liquidity_shares = book_liquidity_shares
         self._fill_results: dict[str, FillResult] = {}
+        # Every market this fake has ever been told about, keyed by EACH
+        # of its own tokens -- a real exchange always has a live, correct
+        # order book for every still-open token, regardless of which
+        # market find_active_btc_market() most recently discovered.
+        # set_market() only ever used to REPLACE "the current market" for
+        # discovery purposes; it must never erase an earlier market's own
+        # token pricing out from under a position that's still open on
+        # it, or an exit check reads the WRONG market's price for a
+        # position it doesn't belong to.
+        self._markets_by_token: dict[str, BinaryMarket] = {}
+        if market is not None:
+            self._register_market(market)
+
+    def _register_market(self, market: BinaryMarket) -> None:
+        self._markets_by_token[market.token_id_yes] = market
+        self._markets_by_token[market.token_id_no] = market
 
     def set_market(self, market: BinaryMarket | None) -> None:
         self._market = market
+        if market is not None:
+            self._register_market(market)
 
     def find_active_btc_market(self, *, now=None) -> BinaryMarket:
         if self._market is None:
@@ -300,7 +318,7 @@ class _FakeLiveClient:
         return None
 
     def get_order_book(self, token_id: str) -> OrderBookSnapshot:
-        market = self._market
+        market = self._markets_by_token.get(token_id, self._market)
         if token_id == market.token_id_yes:
             bid, ask = market.yes_bid, market.yes_ask
         else:
@@ -624,8 +642,13 @@ def test_two_distinct_markets_can_both_occupy_the_max_open_positions_limit(tmp_p
         SubmissionOutcome(ok=True, exchange_order_id="ex-b", raw_status="matched"),
     ])
     harness = _live_harness(tmp_path, market_a, placer, POLYMARKET_MAX_OPEN_POSITIONS="2", now=now)
+    # avg_fill_price=0.70 keeps market-a's own unchanged bid (0.72) strictly
+    # between its stop-loss (0.56) and take-profit target (0.735) in cycle
+    # 2's exit check -- this test exercises ONLY the entry-side duplicate-
+    # position guard across distinct markets, never take_profit.py's own
+    # exit mechanics (covered elsewhere).
     harness["client"].set_fill_result("ex-a", FillResult(
-        order_id="ex-a", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.62,
+        order_id="ex-a", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.70,
     ))
 
     first = run_cycle(**harness, now=now)
