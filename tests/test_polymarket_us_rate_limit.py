@@ -216,18 +216,44 @@ def test_get_order_book_persistent_rate_limit_raises_after_configured_retries(_n
     assert len(_no_real_sleep) == 2
 
 
-def test_get_order_book_does_not_retry_a_not_found_error(_no_real_sleep):
+def test_get_order_book_retries_a_persistent_not_found_bounded_then_raises(_no_real_sleep):
+    """As of the new-market book-warmup fix, a NotFoundError on
+    markets.book() IS now retried (bounded) -- see
+    us_client._retry_on_not_found / _retry_book_warmup -- but only up
+    to settings.us_book_warmup_max_retries, never forever."""
     markets = _FakeMarkets(book_exc=NotFoundError(
         "nope", response=httpx.Response(404, request=httpx.Request("GET", "https://gateway.polymarket.us/fake")),
     ))
     sdk = _FakeSDKClient(markets=markets)
-    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+    settings = _settings(POLYMARKET_US_BOOK_WARMUP_MAX_RETRIES="2")
+    client = PolymarketUSClient(settings, sdk_client=sdk)
 
     with pytest.raises(NotFoundError):
         client.get_order_book("tok-1")
 
-    assert len(markets.book_calls) == 1  # never retried
-    assert _no_real_sleep == []
+    assert len(markets.book_calls) == 3  # 1 initial + 2 warmup retries, never more
+    assert len(_no_real_sleep) == 2
+
+
+def test_get_order_book_recovers_from_a_transient_not_found_within_the_warmup_window(_no_real_sleep):
+    """The exact live incident this fixes: a brand-new market's book
+    404s once (or a few times) right after discovery, then becomes
+    available -- get_order_book() must recover transparently, the
+    caller never seeing an exception."""
+    response = _book_response([_book_level("0.44", "10")], [_book_level("0.46", "10")])
+    not_found = NotFoundError(
+        "nope", response=httpx.Response(404, request=httpx.Request("GET", "https://gateway.polymarket.us/fake")),
+    )
+    markets = _FakeMarkets(book_side_effects=[not_found, response])
+    sdk = _FakeSDKClient(markets=markets)
+    client = PolymarketUSClient(_settings(), sdk_client=sdk)
+
+    book = client.get_order_book("tok-1")
+
+    assert book.best_bid == 0.44
+    assert book.best_ask == 0.46
+    assert len(markets.book_calls) == 2  # one transient 404, one successful warmup retry
+    assert len(_no_real_sleep) == 1
 
 
 # --- engine.run_cycle(): never crashes, never a false entry/exit ------------

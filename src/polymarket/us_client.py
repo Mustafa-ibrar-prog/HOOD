@@ -386,6 +386,83 @@ def _retry_on_rate_limit(
         return result
 
 
+def _retry_on_not_found(
+    action: Callable[[], _T], *, endpoint: str, max_retries: int, base_delay_seconds: float,
+    max_delay_seconds: float, sleep: Callable[[float], None] | None = None,
+) -> _T:
+    """Calls `action()` (a zero-arg callable wrapping ONE read-only
+    polymarket_us SDK call against a SPECIFIC, already-known market
+    slug — never a search, never a fallback) and transparently retries
+    ONLY on polymarket_us.errors.NotFoundError, with bounded
+    exponential backoff and full jitter — the NEW-MARKET BOOK WARMUP
+    RACE: live evidence (twice) showed a brand-new BTC 15m market's
+    exact nested market slug, already confirmed present on its own
+    freshly-discovered event with real time remaining, 404 on
+    markets.book() for a few seconds before the SAME exact slug
+    returned a healthy order book with no other change. This is a
+    GENUINELY DIFFERENT transient condition from a 429 rate limit
+    (_retry_on_rate_limit above) — it is about this one market's own
+    book not being indexed YET, never about request volume — so it is
+    its own function with its own settings bounds
+    (us_book_warmup_max_retries/base_delay_seconds/max_delay_seconds),
+    never conflated with the rate-limit retry's bounds.
+
+    Every OTHER exception type (including a GENUINE 404 for a market
+    that was never going to exist, which this function cannot tell
+    apart from a warmup race by the exception alone) still only gets
+    retried up to `max_retries` times within a SHORT bounded window
+    (a few seconds total at the configured defaults) before this
+    re-raises — never an infinite loop, never a silent fallback to a
+    different market, and never a reason for find_active_btc_market()
+    to search for or substitute something else. The caller (engine.py,
+    via get_order_book()'s own propagation) is responsible for
+    degrading to a safe no-trade/skip-this-cycle outcome once this
+    gives up, exactly as it already does for any other exception a
+    read-only call can raise.
+
+    Logged via the standard `logging` module, like
+    _retry_on_rate_limit — `endpoint` is expected to carry the EXACT
+    market slug this attempt is for (e.g. "markets.book(cpc-btc-
+    updown-15m-2026-10-10-1845z)"), so every retry/recovery/give-up
+    line is independently traceable to the exact market, without this
+    function needing its own slug parameter.
+
+    If polymarket_us itself is not installed, this degrades to a pure
+    passthrough (calls `action()` once, propagates whatever it raises,
+    unchanged) — same convention as _retry_on_rate_limit, and for the
+    same reason (this module's tests exercise a FAKE sdk_client and
+    must never require the real SDK package to be installed)."""
+    try:
+        not_found_error: type[BaseException] | tuple[()] = _sdk().errors.NotFoundError
+    except PolymarketUSClientError:
+        not_found_error = ()  # SDK not installed -- nothing can ever match a real NotFoundError; never retry
+    sleep = sleep or time.sleep  # resolved at CALL time, not binding time -- lets tests monkeypatch module-level time.sleep
+    attempt = 0
+    while True:
+        try:
+            result = action()
+        except not_found_error as exc:
+            if attempt >= max_retries:
+                _logger.warning(
+                    "polymarket_us %s: book still unavailable after %d warmup retries, giving up (%s)",
+                    endpoint, max_retries, exc,
+                )
+                raise
+            delay = min(max_delay_seconds, base_delay_seconds * (2 ** attempt))
+            backoff = random.uniform(0, delay)
+            attempt += 1
+            _logger.info(
+                "polymarket_us %s: book temporarily unavailable (new-market warmup, retry %d/%d), "
+                "retrying in %.2fs (%s)",
+                endpoint, attempt, max_retries, backoff, exc,
+            )
+            sleep(backoff)
+            continue
+        if attempt > 0:
+            _logger.info("polymarket_us %s: book became available after %d warmup retry/retries", endpoint, attempt)
+        return result
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -504,6 +581,19 @@ class PolymarketUSClient:
             action, endpoint=endpoint, max_retries=self._settings.us_rate_limit_max_retries,
             base_delay_seconds=self._settings.us_rate_limit_base_delay_seconds,
             max_delay_seconds=self._settings.us_rate_limit_max_delay_seconds,
+        )
+
+    def _retry_book_warmup(self, action: Callable[[], _T], *, endpoint: str) -> _T:
+        """Bound convenience wrapper over _retry_on_not_found() using
+        this client's own settings.us_book_warmup_* bounds — ONLY
+        get_order_book() goes through this (see its own docstring);
+        never place_order() or any other read-only call, since this is
+        specifically the NEW-MARKET BOOK WARMUP RACE, not a general
+        "retry any 404" policy."""
+        return _retry_on_not_found(
+            action, endpoint=endpoint, max_retries=self._settings.us_book_warmup_max_retries,
+            base_delay_seconds=self._settings.us_book_warmup_base_delay_seconds,
+            max_delay_seconds=self._settings.us_book_warmup_max_delay_seconds,
         )
 
     # --- Market discovery (public data, no credentials needed) ---------------
@@ -703,6 +793,7 @@ class PolymarketUSClient:
         market_slug = market.get("slug")
         if not market_slug:
             raise PolymarketUSClientError(f"Event {event_slug!r}'s market has no slug")
+        _logger.info("polymarket_us: market discovered event=%s nested_market_slug=%s", event_slug, market_slug)
 
         window = _parse_btc_updown_window_from_slug(
             event_slug, market_duration_minutes=self._settings.market_duration_minutes,
@@ -753,18 +844,39 @@ class PolymarketUSClient:
         assess_polymarket_microstructure() for how these feed a real
         (if coarse) executed-trade/activity signal.
 
-        A polymarket_us.errors.RateLimitError (429 — a real incident
-        saw a Cloudflare 1015 "You are being rate limited" response
-        from gateway.polymarket.us here specifically) is retried with
-        bounded backoff via _retry() before this method gives up; if
-        retries exhaust, this still RAISES — callers (engine.py's
-        entry path, exit_manager.py's dynamic-exit sweep) are
+        TWO independent, bounded retry layers wrap this call, nested
+        with the book-warmup retry OUTSIDE the rate-limit retry (each
+        full rate-limit-resilient attempt counts as ONE book-warmup
+        attempt):
+          - A polymarket_us.errors.RateLimitError (429 — a real
+            incident saw a Cloudflare 1015 "You are being rate
+            limited" response from gateway.polymarket.us here
+            specifically) is retried with bounded backoff via
+            _retry().
+          - A polymarket_us.errors.NotFoundError for THIS exact slug
+            is retried with its OWN bounded backoff via
+            _retry_book_warmup() — the NEW-MARKET BOOK WARMUP RACE
+            (live evidence, twice: a brand-new market's exact nested
+            slug, already confirmed present on its own freshly-
+            discovered event, 404s on markets.book() for a few
+            seconds before the SAME exact slug returns a healthy
+            book). `endpoint` is parameterized with `token_id` here
+            specifically (unlike the rate-limit retry's generic
+            "markets.book") so every warmup retry/recovery/give-up
+            log line is traceable to the EXACT market slug.
+        If either retry exhausts, this still RAISES — callers
+        (engine.py's entry path, take_profit.py's exit sweep) are
         responsible for catching that and degrading to a safe no-
         trade/skip-this-position outcome, exactly as they already do
-        for any other exception this call can raise.
+        for any other exception this call can raise. NEVER retries
+        order SUBMISSION, and never substitutes a different market —
+        only this exact token_id's own book is ever retried.
         """
         client = self._client()
-        raw = self._retry(lambda: client.markets.book(token_id), endpoint="markets.book")
+        raw = self._retry_book_warmup(
+            lambda: self._retry(lambda: client.markets.book(token_id), endpoint="markets.book"),
+            endpoint=f"markets.book({token_id})",
+        )
         data = raw["marketData"]
         bids = tuple(sorted((_level(lvl) for lvl in data.get("bids") or []), key=lambda lvl: lvl.price, reverse=True))
         asks = tuple(sorted((_level(lvl) for lvl in data.get("offers") or []), key=lambda lvl: lvl.price))

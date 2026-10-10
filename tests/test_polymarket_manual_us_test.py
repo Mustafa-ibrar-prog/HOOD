@@ -12,12 +12,13 @@ run_manual_test's own gate logic (amount cap, emergency stop, the
 live-mode switches, preview success/failure, submission-vs-fill,
 duplicate reconciliation).
 
-IMPORTANT: run_manual_test's risk checks (DATA_FRESHNESS, ENTRY_CUTOFF)
-read BinaryMarket.data_age_seconds / seconds_to_close, which are both
-computed against the REAL wall clock (datetime.now(timezone.utc)), not
-against any `now` passed in. So every fixture below anchors its
-start/end times to the real wall clock at test-run time (`_real_now()`),
-never to a fixed historical date.
+IMPORTANT: run_manual_test's DATA_FRESHNESS risk check reads
+BinaryMarket.data_age_seconds, computed against the REAL wall clock
+(datetime.now(timezone.utc)), not against any `now` passed in. So
+every fixture below anchors its start/end times to the real wall
+clock at test-run time (`_real_now()`), never to a fixed historical
+date. There is no ENTRY_CUTOFF check any more (removed -- entry is
+allowed at any point while the market is genuinely open).
 """
 
 from __future__ import annotations
@@ -29,7 +30,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import httpx  # noqa: E402
 import pytest  # noqa: E402
+from polymarket_us.errors import NotFoundError  # noqa: E402
 
 from scripts.manual_polymarket_us_test import main, run_manual_test  # noqa: E402
 from src.execution.emergency_stop import EmergencyStopStore  # noqa: E402
@@ -93,6 +96,35 @@ def _happy_sdk(slug: str, *, orders: _FakeOrders | None = None) -> _FakeSDKClien
     return _FakeSDKClient(
         events=_FakeEvents({slug: {"event": _happy_event(slug)}}),
         markets=_FakeMarkets(books={slug: _good_book()}),
+        orders=orders or _FakeOrders(preview_response={"order": {"id": "preview-ok"}}),
+        account=_FakeAccount(response={"balances": [{"currency": "USD", "currentBalance": 51.58}]}),
+    )
+
+
+def _not_found_error(message: str = "market not found") -> NotFoundError:
+    """A REAL polymarket_us.errors.NotFoundError -- the exact type the
+    new-market book-warmup retry (us_client._retry_on_not_found) type-
+    checks on, mirroring the live incident: a brand-new market's own
+    nested slug 404s on markets.book() for a few seconds right after
+    discovery, before the SAME slug returns a healthy book."""
+    request = httpx.Request("GET", "https://gateway.polymarket.us/fake")
+    response = httpx.Response(404, request=request, text='{"error": "not found"}')
+    return NotFoundError(message, response=response)
+
+
+def _sdk_with_warmup_race(slug: str, *, orders: _FakeOrders | None = None) -> _FakeSDKClient:
+    """Same as _happy_sdk(), except the FIRST markets.book() call for
+    this market 404s (the new-market warmup race) before the SAME
+    exact slug returns the real, healthy book -- never a different
+    market, never a fallback. `books={slug: _good_book()}` is the
+    fallback once the queued side effect is exhausted, so ANY later
+    call for this same slug (e.g. this script's own explicit
+    get_order_book() after discovery's own internal one already
+    recovered) keeps returning the same healthy book, never a
+    KeyError from an empty, unconfigured dict."""
+    return _FakeSDKClient(
+        events=_FakeEvents({slug: {"event": _happy_event(slug)}}),
+        markets=_FakeMarkets(book_side_effects=[_not_found_error(), _good_book()], books={slug: _good_book()}),
         orders=orders or _FakeOrders(preview_response={"order": {"id": "preview-ok"}}),
         account=_FakeAccount(response={"balances": [{"currency": "USD", "currentBalance": 51.58}]}),
     )
@@ -324,6 +356,76 @@ def test_emergency_stop_active_refuses_a_live_attempt(tmp_path, capsys):
     client = PolymarketUSClient(settings, sdk_client=sdk)
     stores = _stores(tmp_path)
     stores["emergency_stop_store"].activate(reason="test", set_by="system:test")
+
+    rc = _run(settings, client, stores, confirm_live=True)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "READY FOR FIRST $5 LIVE TEST: NO" in out
+    assert "EMERGENCY STOP: active" in out
+    assert sdk.orders.create_calls == []
+
+
+def test_paper_mode_recovers_transparently_from_a_new_market_book_warmup_race(tmp_path, capsys, monkeypatch):
+    """Requirement 9: the manual script must use the EXACT SAME bounded
+    book warmup as production -- confirmed here by never changing
+    scripts/manual_polymarket_us_test.py's own get_order_book() call
+    site at all; the fix lives entirely in us_client.py's
+    get_order_book(), which this script already calls directly."""
+    import src.polymarket.us_client as us_client_module
+    monkeypatch.setattr(us_client_module.time, "sleep", lambda seconds: None)
+    slug = "manual-test-warmup-1"
+    sdk = _sdk_with_warmup_race(slug)
+    client = PolymarketUSClient(_settings(slug), sdk_client=sdk)
+    stores = _stores(tmp_path)
+
+    rc = _run(_settings(slug), client, stores)
+
+    assert rc == 0
+    assert stores["position_store"].load()[0].condition_id == slug
+    assert "could not retrieve the order book" not in capsys.readouterr().out
+
+
+def test_live_preflight_without_confirm_live_recovers_from_warmup_and_still_does_not_submit(
+    tmp_path, capsys, monkeypatch,
+):
+    """Requirement 9 + the explicit re-statement in this round's own
+    instructions: a preflight without --confirm-live must remain
+    completely non-submitting, even once the book warmup has
+    successfully recovered and every other gate is satisfied."""
+    import src.polymarket.us_client as us_client_module
+    monkeypatch.setattr(us_client_module.time, "sleep", lambda seconds: None)
+    slug = "manual-test-warmup-2"
+    sdk = _sdk_with_warmup_race(slug)
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores_with_emergency_stop_cleared(tmp_path)
+
+    rc = _run(settings, client, stores, confirm_live=False)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "READY FOR FIRST $5 LIVE TEST: YES" in out
+    assert sdk.orders.create_calls == []  # recovered from warmup, but STILL never submitted
+    assert stores["position_store"].load() == []
+    assert stores["pending_store"].load() == []
+
+
+def test_emergency_stop_still_blocks_a_live_attempt_even_after_warmup_recovery(tmp_path, capsys, monkeypatch):
+    """Requirement 10: existing live safety gates are unchanged by the
+    warmup fix -- the emergency stop still refuses a live attempt even
+    though the book warmup itself succeeded."""
+    import src.polymarket.us_client as us_client_module
+    monkeypatch.setattr(us_client_module.time, "sleep", lambda seconds: None)
+    slug = "manual-test-warmup-3"
+    sdk = _sdk_with_warmup_race(slug)
+    settings = _settings(
+        slug, **_LIVE_CREDS, POLYMARKET_TRADING_MODE="live", POLYMARKET_LIVE_TRADING_CONFIRMED="true",
+    )
+    client = PolymarketUSClient(settings, sdk_client=sdk)
+    stores = _stores(tmp_path)  # emergency stop defaults to STOPPED (fail-closed) -- never cleared here
 
     rc = _run(settings, client, stores, confirm_live=True)
 

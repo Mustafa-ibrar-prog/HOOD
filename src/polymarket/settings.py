@@ -191,6 +191,23 @@ class PolymarketSettings:
     us_rate_limit_base_delay_seconds: float
     us_rate_limit_max_delay_seconds: float
 
+    # --- US venue NEW-MARKET BOOK WARMUP: a brand-new BTC 15m market's
+    # exact nested market slug can be returned by event discovery
+    # (events.retrieve_by_slug) a few seconds before markets.book() for
+    # that SAME slug actually indexes it -- confirmed LIVE, twice: a
+    # fresh event discovered with time remaining, whose own nested
+    # market slug immediately 404'd on markets.book() via
+    # polymarket_us.errors.NotFoundError, then returned a healthy book
+    # moments later with no other change. This is a GENUINELY DIFFERENT
+    # transient condition from a 429 rate limit above (see
+    # us_client.py's _retry_on_not_found) -- these three bound exactly
+    # how long this client keeps retrying the EXACT same market's own
+    # book before giving up and letting the caller degrade safely (no
+    # trade this cycle, never a fallback to a different market).
+    us_book_warmup_max_retries: int
+    us_book_warmup_base_delay_seconds: float
+    us_book_warmup_max_delay_seconds: float
+
     # --- Risk controls — deliberately tiny defaults. Read every one of
     # these yourself in .env.polymarket.example before going live; they
     # are placeholders, not a recommendation. ------------------------------
@@ -626,6 +643,14 @@ class PolymarketSettings:
             raise PolymarketConfigError(
                 "POLYMARKET_US_RATE_LIMIT_MAX_DELAY_SECONDS must be >= POLYMARKET_US_RATE_LIMIT_BASE_DELAY_SECONDS"
             )
+        if self.us_book_warmup_max_retries < 0:
+            raise PolymarketConfigError("POLYMARKET_US_BOOK_WARMUP_MAX_RETRIES must be >= 0")
+        if self.us_book_warmup_base_delay_seconds <= 0:
+            raise PolymarketConfigError("POLYMARKET_US_BOOK_WARMUP_BASE_DELAY_SECONDS must be > 0")
+        if self.us_book_warmup_max_delay_seconds < self.us_book_warmup_base_delay_seconds:
+            raise PolymarketConfigError(
+                "POLYMARKET_US_BOOK_WARMUP_MAX_DELAY_SECONDS must be >= POLYMARKET_US_BOOK_WARMUP_BASE_DELAY_SECONDS"
+            )
         if self.entry_retry_cooldown_seconds < 0:
             raise PolymarketConfigError("POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS must be >= 0")
         if self.entry_retry_min_price_change < 0:
@@ -675,6 +700,9 @@ class PolymarketSettings:
             us_rate_limit_max_retries=_get_int(env, "POLYMARKET_US_RATE_LIMIT_MAX_RETRIES", 4),
             us_rate_limit_base_delay_seconds=_get_float(env, "POLYMARKET_US_RATE_LIMIT_BASE_DELAY_SECONDS", 0.5),
             us_rate_limit_max_delay_seconds=_get_float(env, "POLYMARKET_US_RATE_LIMIT_MAX_DELAY_SECONDS", 8.0),
+            us_book_warmup_max_retries=_get_int(env, "POLYMARKET_US_BOOK_WARMUP_MAX_RETRIES", 4),
+            us_book_warmup_base_delay_seconds=_get_float(env, "POLYMARKET_US_BOOK_WARMUP_BASE_DELAY_SECONDS", 1.0),
+            us_book_warmup_max_delay_seconds=_get_float(env, "POLYMARKET_US_BOOK_WARMUP_MAX_DELAY_SECONDS", 2.0),
             max_bet_usd=_get_float(env, "POLYMARKET_MAX_BET_USD", 20.0),
             max_daily_loss_usd=_get_float(env, "POLYMARKET_MAX_DAILY_LOSS_USD", 20.0),
             max_open_positions=_get_int(env, "POLYMARKET_MAX_OPEN_POSITIONS", 1),
