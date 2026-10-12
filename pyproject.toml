@@ -9,6 +9,40 @@ dependencies = []
 dev = [
     "pytest>=8.0",
 ]
+# Polymarket BTC 15-minute system (src/polymarket/) only — the
+# Robinhood/options code above has zero network dependencies by design
+# (it never calls an API directly; see src/live_bridge.py). client.py
+# imports this lazily (see its `_sdk()` helper) specifically so every
+# OTHER module in src/polymarket/ (models, risk, strategy, gateway,
+# positions, reconciliation, settings) and their tests run without it
+# installed — only actually running the bot, or
+# scripts/verify_polymarket_setup.py, needs this extra.
+#
+# `polymarket-client` (PyPI; import name `polymarket`) is the official
+# SDK for INTERNATIONAL polymarket.com, published by Polymarket
+# Engineering. It supersedes the now-ARCHIVED `py-clob-client` — see
+# client.py's module docstring for the verification trail. Requires
+# Python >=3.11.
+#
+# `polymarket-us` (PyPI; import name `polymarket_us`) is the SEPARATE,
+# official SDK for Polymarket US (traded via QCX LLC, a CFTC-regulated
+# exchange) — a genuinely different venue, not a regional variant of
+# the international one: different base URLs, different auth (Ed25519
+# key_id/secret_key, no wallet/private-key concept at all), different
+# market model. See us_client.py's module docstring for the full
+# verification trail and settings.py's POLYMARKET_VENUE. Requires
+# Python >=3.10.
+#
+# Both are declared together under one `polymarket` extra since a given
+# deployment only ever uses one (selected by POLYMARKET_VENUE) but both
+# are small, pure-Python-API-client installs. This project's own
+# requires-python stays >=3.10 since that only gates the Robinhood/
+# options code above, and pip/uv already enforce each SDK's own floor
+# automatically when this extra is installed.
+polymarket = [
+    "polymarket-client>=0.12.0",
+    "polymarket-us>=2.3.0",
+]
 
 [tool.pytest.ini_options]
 # Adds the repo root (not src/) to sys.path so tests can `import src...`

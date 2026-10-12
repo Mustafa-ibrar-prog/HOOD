@@ -144,6 +144,91 @@ def detect_failed_breakout(bars: Sequence[PriceBar], resistance_lookback: int = 
     return breakout_occurred and last_bar.close < resistance
 
 
+# --- Downside mirrors ---------------------------------------------------------
+# detect_breakout_continuation/detect_failed_breakout above are deliberately
+# upside-only (see strategy/momentum_breakout.py's module docstring: "CALLS
+# ONLY... a mirrored bearish detector is real, legitimate future work; this
+# strategy doesn't half-implement that to look more complete"). These two
+# functions are that mirror — needed by any two-sided market (e.g. a BTC
+# up/down prediction market, which has a genuine bearish/NO thesis, not just
+# a bullish/YES one) — built the same way, just reading support/lows instead
+# of resistance/highs.
+
+def detect_breakdown_continuation(
+    bars: Sequence[PriceBar], support_lookback: int = 20, confirm_bars: int = 2
+) -> bool:
+    """True if price broke below the support formed by the
+    `support_lookback` bars immediately preceding the most recent
+    `confirm_bars`, and has closed below that support on every one of
+    those confirming bars. Mirrors detect_breakout_continuation exactly,
+    reading lows/support instead of highs/resistance."""
+    total_needed = support_lookback + confirm_bars
+    if len(bars) < total_needed:
+        return False
+
+    support_window = bars[-total_needed:-confirm_bars]
+    support = min(b.low for b in support_window)
+    confirming = bars[-confirm_bars:]
+    return all(b.close < support for b in confirming)
+
+
+def detect_failed_breakdown(bars: Sequence[PriceBar], support_lookback: int = 20) -> bool:
+    """True if the second-to-last bar broke below the support formed by
+    the `support_lookback` bars before it, but the most recent close has
+    risen back above that support. Mirrors detect_failed_breakout."""
+    total_needed = support_lookback + 2
+    if len(bars) < total_needed:
+        return False
+
+    support_window = bars[-total_needed:-2]
+    support = min(b.low for b in support_window)
+    breakdown_bar, last_bar = bars[-2], bars[-1]
+    breakdown_occurred = breakdown_bar.low < support
+    return breakdown_occurred and last_bar.close > support
+
+
+def detect_reversal(bars: Sequence[PriceBar], *, thesis_direction: str, swing_lookback: int = 10) -> bool:
+    """A confirmed two-stage structure reversal — the standard technical
+    "break of structure" pattern, and deliberately STRONGER evidence than
+    either a single lower-high read (higher_highs_lower_highs, which only
+    ever compares highs) or a failed breakout alone (one resistance
+    retest failing). This requires BOTH:
+
+      Bullish thesis: the most recent `swing_lookback` bars made a LOWER
+      high than the `swing_lookback` bars immediately before them (the
+      uptrend failed to make a new high) AND a LOWER low than that same
+      prior window (price has broken below the prior swing's own
+      support) — the up-structure has demonstrably broken, not merely
+      paused.
+      Bearish thesis: the exact mirror (a higher high AND a higher low
+      versus the prior swing).
+
+    `swing_lookback` defaults to 10 (half of detect_breakout_continuation's
+    20-bar resistance_lookback default) so the two windows compared here
+    total 20 bars — the same order of magnitude as this module's other
+    structure checks, not an arbitrarily different scale. Needs
+    2 * swing_lookback bars; returns False (never guesses, never raises)
+    when there isn't enough history yet — exactly like every other
+    detector in this module.
+    """
+    if thesis_direction.lower() not in {"bullish", "bearish"}:
+        raise ValueError("thesis_direction must be 'bullish' or 'bearish'")
+    total_needed = swing_lookback * 2
+    if len(bars) < total_needed:
+        return False
+
+    prior_window = bars[-total_needed:-swing_lookback]
+    recent_window = bars[-swing_lookback:]
+    prior_high = max(b.high for b in prior_window)
+    recent_high = max(b.high for b in recent_window)
+    prior_low = min(b.low for b in prior_window)
+    recent_low = min(b.low for b in recent_window)
+
+    if thesis_direction.lower() == "bullish":
+        return recent_high < prior_high and recent_low < prior_low
+    return recent_high > prior_high and recent_low > prior_low
+
+
 def bid_ask_spread_pct(bid: float, ask: float) -> float:
     """Spread as a fraction of the mid price. Returns inf for an invalid or
     crossed quote so callers can't mistake missing data for a tight market."""

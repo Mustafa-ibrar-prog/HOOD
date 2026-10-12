@@ -88,7 +88,7 @@ from src.risk.models import RiskLimits
 from src.risk.store import DailyRiskState, RiskStateStore
 from src.strategy.base import SetupCandidate
 from src.strategy.decision import EXIT_DECISIONS, Decision
-from src.strategy.momentum_breakout import MomentumBreakoutStrategy
+from src.strategy.momentum_breakout import MomentumBreakoutConfig, MomentumBreakoutStrategy
 from src.strategy.scanner import StrategyScanner
 
 
@@ -279,7 +279,24 @@ def run_trading_cycle(
         # now= threads the cycle's own injected time through to expiration
         # selection — see MomentumBreakoutStrategy's constructor docstring
         # for the bug this fixes (Phase 1 audit finding).
-        scanner = StrategyScanner([MomentumBreakoutStrategy(now=now)])
+        #
+        # Scalp-oriented config, explicit user instruction (2026-09-18): the
+        # default MomentumBreakoutConfig() gate (require_confirmed_breakout +
+        # STRENGTHENING-only) is the "frozen" MOMENTUM_BREAKOUT_EXISTING_V1
+        # spec (src/options/phase35_frozen_strategy_spec.py) and stays the
+        # dataclass default for anything that constructs the config bare.
+        # This call site knowingly diverges from that frozen spec: it accepts
+        # STABLE momentum (not just STRENGTHENING) and drops the hard
+        # breakout_continuation requirement, with smaller/faster profit and
+        # stop targets, to catch quicker moves instead of only strict,
+        # fully-confirmed breakouts.
+        scalp_config = MomentumBreakoutConfig(
+            require_confirmed_breakout=False,
+            accept_stable_momentum=True,
+            profit_target_pct=0.20,
+            stop_loss_pct=0.20,
+        )
+        scanner = StrategyScanner([MomentumBreakoutStrategy(config=scalp_config, now=now)])
         scan_result = scanner.scan_for_setups(market_data, settings.scan_universe)
         report.scan_candidate_count = len(scan_result.candidates)
         decision_logger.log_decision(

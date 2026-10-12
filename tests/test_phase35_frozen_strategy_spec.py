@@ -27,7 +27,12 @@ def test_class_and_file_location_are_real():
     from src.strategy.momentum_breakout import MomentumBreakoutStrategy
 
     assert MOMENTUM_BREAKOUT_EXISTING_V1.class_name == MomentumBreakoutStrategy.__name__
-    assert inspect.getsourcefile(MomentumBreakoutStrategy).endswith(MOMENTUM_BREAKOUT_EXISTING_V1.file_location)
+    # file_location is recorded with POSIX separators ("src/strategy/...") --
+    # normalize the real sourcefile path the same way before comparing, so
+    # this doesn't spuriously fail on an OS (e.g. Windows) whose path
+    # separator is "\\".
+    actual_file = inspect.getsourcefile(MomentumBreakoutStrategy).replace("\\", "/")
+    assert actual_file.endswith(MOMENTUM_BREAKOUT_EXISTING_V1.file_location)
 
 
 def test_option_selection_matches_live_momentum_breakout_config():

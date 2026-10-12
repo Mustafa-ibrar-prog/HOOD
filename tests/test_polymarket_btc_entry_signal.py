@@ -1,0 +1,364 @@
+"""Tests for btc_entry_signal.py — an EARLIER, qualitative Coinbase-
+evidence-cascade entry-direction signal (bullish/bearish/neutral +
+signal counts, never a calibrated probability), superseded first by
+simple_entry_signal.py's favored-side rule and now by the PREDICTIVE
+BTC direction model (btc_direction_model.py/btc_model_entry_signal.py
+— see engine.py's own module docstring). btc_entry_signal.py itself
+stays dormant in the codebase, unmodified, with its own tests intact,
+in case it's wanted again later; nothing here resurrects it.
+
+Three layers:
+  - UNIT tests against assess_btc_entry_direction()/classify_btc_direction()
+    directly, using the SAME pinned, already-verified real-bar fixtures
+    test_polymarket_dynamic_exit_replay.py uses for the exit side (never
+    a second, independently-tuned set of fixtures) — proves bullish/
+    bearish/neutral/insufficient/stale detection reuses the existing
+    evidence pipeline correctly.
+  - UNIT tests against build_entry_candidate() directly — the
+    Polymarket-quote mapping step, including the "thesis is directional
+    but the book is unusable" case.
+  - A couple of full end-to-end run_cycle() tests confirming the
+    CURRENT production entry path (the predictive model) never enters
+    on a qualifying-looking Polymarket book alone, with or without
+    this module's own evidence present — see test_g/test_h's own
+    docstrings for exactly what changed here this round.
+
+Never places a real order — every client/gateway here is paper mode or
+a local fake.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from src.polymarket.btc_entry_signal import assess_btc_entry_direction, build_entry_candidate, classify_btc_direction
+from src.polymarket.btc_intelligence import BtcMarketAssessment
+from src.polymarket.btc_market_data import BtcPriceHistoryStore
+from src.polymarket.engine import MarketHistory, run_cycle
+from src.polymarket.gateway import PaperPolymarketGateway
+from src.polymarket.logger import PolymarketDecisionLogger
+from src.polymarket.models import BinaryMarket, BookLevel, OrderBookSnapshot
+from src.polymarket.pending import PolymarketPendingOrderStore
+from src.polymarket.positions import PolymarketPositionStore
+from src.polymarket.risk import PolymarketRiskManager
+from src.polymarket.settings import PolymarketSettings
+from src.polymarket.state import DailyPnlStateStore
+from src.polymarket.strategy import BtcMomentumStrategy
+from src.strategy.evidence import MomentumAssessment, MomentumState
+from tests.test_polymarket_dynamic_exit_replay import (
+    _REVERSING_CLOSES,
+    _REVERSING_SEED,
+    _STABLE_CLOSES,
+    _STABLE_SEED,
+    _WEAKENING_CLOSES,
+    _WEAKENING_SEED,
+    _feed,
+    _strengthening_closes,
+)
+
+
+def _market(**overrides) -> BinaryMarket:
+    now = datetime.now(timezone.utc)
+    defaults = dict(
+        condition_id="c1", question="Will BTC be up?", token_id_yes="y", token_id_no="n",
+        close_time=now + timedelta(minutes=10), fetched_at=now, yes_bid=0.60, yes_ask=0.62,
+    )
+    defaults.update(overrides)
+    return BinaryMarket(**defaults)
+
+
+# --- A/B/C/D/E: assess_btc_entry_direction() against real, pinned bars ------
+
+def test_a_strong_bullish_evidence_yields_bullish_direction(tmp_path):
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed(store, _strengthening_closes(), seed=5)
+    now = end_t + timedelta(seconds=5)
+    bars = store.get_bars(interval_seconds=60, now=now)
+
+    result = assess_btc_entry_direction(bars, now=now, max_bar_age_seconds=300.0, feed_source="test")
+
+    assert result.direction == "bullish"
+    assert result.outcome == "YES"
+    assert result.bullish_entry_worthy is True
+    assert result.edge_points > 0
+    assert result.momentum_state is MomentumState.STRENGTHENING
+
+
+def test_b_strong_bearish_evidence_yields_bearish_direction(tmp_path):
+    """A persistent real DECLINE confirms a bearish thesis -- the exact
+    same bars test_polymarket_dynamic_exit_replay.py pins as "STABLE
+    (bullish-framed)" read STRENGTHENING once framed bearish, since a
+    bullish thesis's own STABLE/WEAKENING state is just "a bearish
+    thesis's evidence," reused rather than re-derived."""
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed(store, _STABLE_CLOSES, seed=_STABLE_SEED)
+    now = end_t + timedelta(seconds=5)
+    bars = store.get_bars(interval_seconds=60, now=now)
+
+    result = assess_btc_entry_direction(bars, now=now, max_bar_age_seconds=300.0, feed_source="test")
+
+    assert result.direction == "bearish"
+    assert result.outcome == "NO"
+    assert result.bearish_entry_worthy is True
+    assert result.edge_points > 0
+
+
+def test_c_neutral_evidence_yields_no_entry(tmp_path):
+    """Neither framing materially confirms its own thesis -- genuinely
+    non-directional evidence, never guessed (the same real bars the
+    exit side pins as producing a bullish-framed REVERSING / bearish-
+    framed WEAKENING-but-not-STRENGTHENING split)."""
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed(store, _REVERSING_CLOSES, seed=_REVERSING_SEED)
+    now = end_t + timedelta(seconds=5)
+    bars = store.get_bars(interval_seconds=60, now=now)
+
+    result = assess_btc_entry_direction(bars, now=now, max_bar_age_seconds=300.0, feed_source="test")
+
+    assert result.direction == "neutral"
+    assert result.outcome is None
+    assert result.neutral_reason_code == "neutral_btc_evidence"
+
+
+def test_d_insufficient_evidence_yields_no_entry():
+    """No bars fed at all -- the honest INSUFFICIENT_DATA default,
+    never a guessed direction."""
+    result = assess_btc_entry_direction([], now=datetime.now(timezone.utc), max_bar_age_seconds=300.0, feed_source="test")
+
+    assert result.direction == "neutral"
+    assert result.neutral_reason_code == "insufficient_btc_evidence"
+    assert result.bullish_assessment.state is MomentumState.INSUFFICIENT_DATA
+    assert result.bearish_assessment.state is MomentumState.INSUFFICIENT_DATA
+
+
+def test_e_stale_data_yields_no_entry(tmp_path):
+    """Real bars exist, materially bullish if read -- but they are
+    older than max_bar_age_seconds, so the SAME stale-feed gate
+    assess_btc_market() already uses (compute_feed_status) must zero
+    them out here too, never letting a dead feed keep producing a
+    confident entry signal."""
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed(store, _strengthening_closes(), seed=5)
+    stale_now = end_t + timedelta(seconds=600)  # well past the 300s default max age
+    bars = store.get_bars(interval_seconds=60, now=stale_now)
+
+    result = assess_btc_entry_direction(bars, now=stale_now, max_bar_age_seconds=300.0, feed_source="test")
+
+    assert result.direction == "neutral"
+    assert result.neutral_reason_code == "insufficient_btc_evidence"
+    assert result.feed_status.status in ("STALE", "UNAVAILABLE")
+
+
+def test_weak_single_signal_strengthening_does_not_qualify_as_entry_worthy():
+    """Requirement: a single soft indicator must never be enough --
+    mirrors evaluate_momentum's own 'a single soft signal is never
+    enough' guarantee, applied on the entry side via
+    min_strengthening_signals. A hand-built assessment reading
+    STRENGTHENING with exactly ONE fired signal must not be worthy."""
+    momentum = MomentumAssessment(state=MomentumState.STRENGTHENING, weakening_score=0, strengthening_score=1, signals=("trend_intact",))
+    assessment = BtcMarketAssessment(state=MomentumState.STRENGTHENING, evidence_score=-1, btc_assessment=momentum, signals=())
+    from src.polymarket.btc_entry_signal import DEFAULT_MIN_STRENGTHENING_SIGNALS_FOR_ENTRY
+
+    direction, code, _ = classify_btc_direction(
+        bullish_assessment=assessment, bearish_assessment=assessment, bullish_edge_points=1.0, bearish_edge_points=1.0,
+        bullish_worthy=(assessment.signal_count >= DEFAULT_MIN_STRENGTHENING_SIGNALS_FOR_ENTRY), bearish_worthy=False,
+    )
+    assert direction == "neutral"  # 1 fired signal never clears the default-2 threshold on its own
+
+
+# --- F: conflicting evidence (both framings simultaneously STRENGTHENING) --
+# Exercised directly against classify_btc_direction() -- see that
+# function's own docstring on why: the two framings' detector pairs are
+# near-complementary by construction, so naturally reproducing a
+# genuine BOTH-worthy case from real bars is intentionally rare; this
+# proves the branch handles it correctly without depending on finding
+# one.
+
+def test_f_conflicting_evidence_yields_no_entry():
+    bullish = BtcMarketAssessment(
+        state=MomentumState.STRENGTHENING, evidence_score=-3,
+        btc_assessment=MomentumAssessment(MomentumState.STRENGTHENING, 0, 3, ("trend_intact", "rsi_healthy_range")),
+        signals=(),
+    )
+    bearish = BtcMarketAssessment(
+        state=MomentumState.STRENGTHENING, evidence_score=-3,
+        btc_assessment=MomentumAssessment(MomentumState.STRENGTHENING, 0, 3, ("trend_intact", "rsi_healthy_range")),
+        signals=(),
+    )
+    direction, code, reason = classify_btc_direction(
+        bullish_assessment=bullish, bearish_assessment=bearish, bullish_edge_points=3.0, bearish_edge_points=3.0,
+        bullish_worthy=True, bearish_worthy=True,
+    )
+    assert direction == "neutral"
+    assert code == "conflicting_btc_evidence"
+    assert "conflicting" in reason.lower()
+
+
+# --- build_entry_candidate(): the Polymarket-quote mapping step ------------
+
+def _assessment(direction: str) -> object:
+    """A minimal real BtcDirectionalAssessment for build_entry_candidate
+    tests -- built from real bars so .selected_assessment is a genuine,
+    fully-populated BtcMarketAssessment, not a hand-rolled stub."""
+    import tempfile
+    tmp = Path(tempfile.mkdtemp()) / "btc.json"
+    store = BtcPriceHistoryStore(tmp)
+    if direction == "bullish":
+        end_t = _feed(store, _strengthening_closes(), seed=5)
+    else:
+        end_t = _feed(store, _WEAKENING_CLOSES, seed=_WEAKENING_SEED)
+    now = end_t + timedelta(seconds=5)
+    bars = store.get_bars(interval_seconds=60, now=now)
+    return assess_btc_entry_direction(bars, now=now, max_bar_age_seconds=300.0, feed_source="test")
+
+
+def test_bullish_thesis_builds_a_yes_candidate_at_the_real_ask():
+    assessment = _assessment("bullish")
+    market = _market(yes_bid=0.60, yes_ask=0.62)
+    candidate = build_entry_candidate(market, assessment, size_usd=5.0)
+    assert candidate is not None
+    assert candidate.thesis.outcome == "YES"
+    assert candidate.suggested_entry_price == 0.62
+    assert candidate.suggested_size_usd == 5.0
+
+
+def test_bearish_thesis_builds_a_no_candidate_from_the_real_bid():
+    assessment = _assessment("bearish")
+    market = _market(yes_bid=0.60, yes_ask=0.62)
+    candidate = build_entry_candidate(market, assessment, size_usd=5.0)
+    assert candidate is not None
+    assert candidate.thesis.outcome == "NO"
+    assert candidate.suggested_entry_price == round(1 - 0.60, 4)
+    assert candidate.suggested_size_usd == 5.0
+
+
+def test_neutral_direction_never_builds_a_candidate():
+    neutral = assess_btc_entry_direction([], now=datetime.now(timezone.utc), max_bar_age_seconds=300.0)
+    market = _market(yes_bid=0.60, yes_ask=0.62)
+    assert build_entry_candidate(market, neutral, size_usd=5.0) is None
+
+
+def test_i_bullish_thesis_with_unusable_yes_book_yields_no_candidate():
+    """Requirement I: BTC evidence confirms bullish, but the YES side
+    has no two-sided quote yet -- never guess a price, never fall back
+    to the other side."""
+    assessment = _assessment("bullish")
+    market = _market(yes_bid=0.60, yes_ask=None)  # no ask to buy YES at
+    assert build_entry_candidate(market, assessment, size_usd=5.0) is None
+
+
+def test_j_bearish_thesis_with_unusable_no_book_yields_no_candidate():
+    """Requirement J: BTC evidence confirms bearish, but there's no
+    yes_bid to derive the NO entry price from."""
+    assessment = _assessment("bearish")
+    market = _market(yes_bid=None, yes_ask=0.62)
+    assert build_entry_candidate(market, assessment, size_usd=5.0) is None
+
+
+# --- G/H: a Polymarket price move, ALONE, can never create an entry --
+# as of THIS round's rewrite (the predictive-model strategy), this is
+# true for the OPPOSITE reason the old module docstring here used to
+# give: it is no longer that "the current simple_entry_signal.py
+# strategy follows Polymarket's own price and ignores BTC evidence" --
+# simple_entry_signal.py is DELETED. It is now that the predictive
+# strategy requires a TRAINED model AND real BTC feature data
+# (btc_model_entry_signal.py's own hard gates) REGARDLESS of how
+# favorable Polymarket's own book looks -- see
+# test_polymarket_engine.py's test_untrained_model_never_enters_even_with_a_qualifying_book
+# and test_missing_btc_history_never_enters_even_with_a_trained_model_and_qualifying_book
+# for the focused versions of this. The two tests below confirm the
+# SAME holds true specifically when btc_entry_signal.py's own bars
+# (fed via this file's _feed() fixtures elsewhere) are the ONLY BTC
+# data present -- a qualifying Polymarket book alone, with Coinbase
+# momentum evidence present but with NO price-to-beat (window_start
+# unset) and no trained model, still never enters.
+
+def _engine_harness(tmp_path: Path, market: BinaryMarket):
+    from tests.test_polymarket_engine import _FakeClient
+    from src.polymarket.btc_direction_model import BtcDirectionModel
+
+    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
+    client = _FakeClient(market)
+    strategy = BtcMomentumStrategy()
+    risk = PolymarketRiskManager(settings)
+    logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
+    gateway = PaperPolymarketGateway(settings, logger)
+    state_store = DailyPnlStateStore(tmp_path / "pnl.json")
+    position_store = PolymarketPositionStore(tmp_path / "positions.json")
+    pending_store = PolymarketPendingOrderStore(tmp_path / "pending.json")
+    history = MarketHistory()
+    btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")  # deliberately never fed
+    return dict(
+        settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
+        decision_logger=logger, state_store=state_store, position_store=position_store,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        model=BtcDirectionModel.untrained(),
+    )
+
+
+def test_g_a_qualifying_polymarket_ask_alone_never_enters_without_a_trained_model(tmp_path):
+    """A heavily-favored YES ask, with an untrained model and no BTC
+    feature data -- NEVER enters under the predictive strategy,
+    regardless of how favorable Polymarket's own book looks. This is
+    the OPPOSITE premise from this test's pre-rewrite version (which
+    proved the OLD favored-side strategy didn't need BTC evidence);
+    simple_entry_signal.py is deleted, so there is no favored-side path
+    left to take at all."""
+    market = _market(yes_bid=0.78, yes_ask=0.80)
+    harness = _engine_harness(tmp_path, market)
+    harness["history"].observe(market)
+    harness["history"].mids = [0.50, 0.60, 0.70]  # irrelevant -- nothing in production reads history.mids any more
+
+    report = run_cycle(**harness)
+
+    assert report.entered is False
+    assert harness["position_store"].load() == []
+
+
+def test_h_an_exactly_tied_market_also_never_enters(tmp_path):
+    """Same hard gates apply regardless of whether Polymarket's book
+    happens to be tied or lopsided -- an untrained model with no BTC
+    feature data is NO TRADE either way."""
+    market = _market(yes_bid=0.50, yes_ask=0.50)
+    harness = _engine_harness(tmp_path, market)
+    harness["history"].observe(market)
+    harness["history"].mids = [0.50, 0.45, 0.40]
+
+    report = run_cycle(**harness)
+
+    assert report.entered is False
+    assert harness["position_store"].load() == []
+
+
+# --- O/P/P2 (confidence-based sizing / risk-manager-still-blocks /
+# corrupted-learning-store, end to end via run_cycle) REMOVED this
+# round: production run_cycle() no longer calls entry_confidence.py or
+# trade_learning.py's adjustment machinery at all (see engine.py's
+# module docstring and TASK 3 of this round's governing instructions
+# -- the live strategy is now a simple Polymarket-price threshold).
+# entry_confidence.py and trade_learning.py themselves are UNCHANGED
+# and remain fully covered by their own dedicated unit tests
+# (test_polymarket_entry_confidence.py, test_polymarket_trade_learning.py)
+# -- only the now-obsolete PRODUCTION-WIRING assertions here were removed.
+
+# --- Q: no lookahead -- only data available as of `now` is ever used -------
+
+def test_q_bars_fed_after_now_are_never_used_for_the_decision(tmp_path):
+    """BtcPriceHistoryStore.get_bars(now=...) already refuses to return
+    a still-in-progress or future bucket (see btc_market_data.py) --
+    this proves that guarantee holds for the ENTRY path specifically:
+    materially bullish ticks timestamped entirely AFTER `decision_now`
+    must never influence a decision made AT `decision_now`."""
+    store = BtcPriceHistoryStore(tmp_path / "btc.json")
+    end_t = _feed(store, _strengthening_closes(), seed=5)  # ticks span roughly [end_t - 45min, end_t]
+    decision_now = end_t - timedelta(hours=2)  # well before any of that data exists
+
+    bars = store.get_bars(interval_seconds=60, now=decision_now)
+    assert bars == []  # nothing fed is actually <= decision_now yet
+
+    result = assess_btc_entry_direction(bars, now=decision_now, max_bar_age_seconds=300.0, feed_source="test")
+    assert result.direction == "neutral"
+    assert result.neutral_reason_code == "insufficient_btc_evidence"

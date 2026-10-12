@@ -567,3 +567,295 @@ If you want to go back to the gated (human-approval-required) posture,
 either set `LIVE_AUTO_EXECUTE=false` in `.env`, or ask — the cron tick's
 prompt can be reverted to stop at `pending_approval` and wait for an
 explicit confirm/reject the same way it did before 2026-08-17.
+
+## Polymarket BTC 15-minute system (`src/polymarket/`)
+
+A second, separate trading system living alongside everything above —
+not a replacement, and not built from the same code. Everything above
+this section is about Robinhood options and is untouched. This one
+trades Polymarket's short-duration Bitcoin up/down binary markets,
+which are a fundamentally different instrument (a YES/NO token pair on
+a central limit order book, settled in USDC on Polygon, no strikes or
+expirations) and run as an **unattended Python process**, not an
+agent-mediated cycle: `src/polymarket/client.py` calls the real
+Polymarket API directly via `polymarket-client` (the current OFFICIAL
+SDK — see below), so `scripts/run_polymarket_bot.py` can poll and
+trade on its own without an agent relaying data each cycle (unlike the
+Robinhood side — see "How the ~5-minute cadence actually works" above
+for why that constraint exists there but not here). This is a
+real-money system: correctness, fail-closed behavior, and verified API
+behavior are prioritized over speed throughout `src/polymarket/`.
+
+**Two venues, two SDKs, selected by `POLYMARKET_VENUE`.** Polymarket US
+(traded via QCX LLC, a CFTC-regulated Designated Contract Market) and
+international polymarket.com are **genuinely different systems**, not
+regional variants of the same CLOB — verified by installing both
+official SDKs directly and inspecting their real source/types (not
+docs, not a blog post, not memory):
+
+| | `POLYMARKET_VENUE=international` (default) | `POLYMARKET_VENUE=us` |
+|---|---|---|
+| Client module | `src/polymarket/client.py` | `src/polymarket/us_client.py` |
+| SDK (PyPI / import) | `polymarket-client` / `polymarket` | `polymarket-us` / `polymarket_us` |
+| Supersedes | `py-clob-client` (ARCHIVED — its own GitHub README says so) | — |
+| Auth | EVM private key, EIP-712 order signing | Ed25519 `key_id`+`secret_key` API pair — **no wallet/private key at all** |
+| Market model | ERC-1155 YES/NO token pair, own order book each | ONE contract per `marketSlug`; YES/NO = BUY_LONG/BUY_SHORT on the same contract |
+| Settled in | USDC on Polygon | USD cash balance (brokerage-style account) |
+| Python | `>=3.11` | `>=3.10` |
+
+Both are declared as the optional `polymarket` extra in `pyproject.toml`
+(`pip install -e ".[polymarket]"`), not a hard dependency — only
+`client.py`/`us_client.py` import their respective SDK, and both do so
+lazily (`_sdk()`), so every other module (`models`, `risk`, `strategy`,
+`gateway`, `positions`, `reconciliation`, `settings`, and their tests)
+runs without either installed. `src/polymarket/client.py`'s
+`get_polymarket_client(settings)` is the one factory every script uses
+— it returns whichever client matches `POLYMARKET_VENUE`, and
+`engine.py`/`gateway.py`/`reconciliation.py` never need to know or care
+which one they got, since both implement the identical method surface.
+See `client.py`'s and `us_client.py`'s module docstrings for the full
+primary-source verification trail on each venue.
+
+**A US-based trader must set `POLYMARKET_VENUE=us` explicitly** — it
+defaults to `international` for backward compatibility with any
+existing config that predates the US venue work. Two things are NOT
+yet confirmed for the US venue and must be checked against the live
+API before trusting it with real funds (see `us_client.py`'s module
+docstring for the full list): whether a Bitcoin **15-minute recurring**
+up/down market actually exists in the real catalog (Bitcoin markets as
+a category are confirmed — Polymarket US's own bundled SDK README uses
+`"btc-100k"` as its canonical order example — but not specifically this
+short-duration recurring product), and the exact pricing mechanics of
+a "bet NO" (`BUY_SHORT`) order, which this codebase maps onto the same
+ceiling-price logic as "bet YES" (`BUY_LONG`) as the most defensible
+reading of the SDK's types, not a confirmed one.
+
+**"Placed" is never treated as "filled" (the single most important
+correctness property here).** A submitted order becoming a position
+purely because the exchange *accepted* it is exactly the bug a
+real-money system can't afford. This codebase enforces the split at
+the type level:
+
+- `SubmissionOutcome` (from `gateway.py`/`client.py`) — what the
+  exchange said about *accepting* the order. Never implies a fill.
+- `FillResult` (from `reconciliation.py`'s `client.get_fill_status()`
+  lookup) — the ONLY type a position may be built from, and only ever
+  produced by a fresh, authoritative re-query of the order's real
+  state, never derived from the submission response.
+- Orders default to **FOK** (fill-or-kill): a new entry either fills
+  completely at a price no worse than `max_price`, or nothing happens
+  at all — this removes the ambiguous "market order partially filled"
+  case for new entries by construction. FAK is supported for callers
+  that want partial fills instead; reconciliation handles either
+  correctly.
+- An exchange response this system can't confidently interpret becomes
+  `FillResult(status="unknown")`, which `FillResult.is_fill` always
+  treats as "not filled" — never fabricated as a fill.
+
+**`src/polymarket/reconciliation.py` is the only path from "submitted"
+to "position exists"**, and it closes the specific gap where a pending
+order gets approved and placed (`confirm_and_place()`, possibly in a
+separate process, possibly after a restart) with nothing guaranteeing
+the position ledger ever gets updated from that:
+
+- `reconcile_order()` — reconciles one `PendingLiveOrder` against a
+  fresh fill lookup. Idempotent by two independent, disk-persisted
+  guards: `PendingLiveOrder.fill_reconciled` (primary) and
+  `PolymarketPositionStore.add_if_absent()` keyed on `client_order_id`
+  (secondary) — reconciling the same order twice, including across a
+  restart, can never create two positions.
+- `reconcile_pending_orders()` — sweeps every pending order that
+  reached the exchange but wasn't yet reconciled. `engine.py`'s
+  `run_cycle()` calls this first, every cycle, before proposing
+  anything new, so a restart never loses track of an order placed in a
+  prior process. `scripts/confirm_polymarket_order.py` also calls
+  `reconcile_order()` immediately after placing, so a human running it
+  manually sees the real outcome (filled / partial / rejected /
+  cancelled — never an assumed fill), not just "submitted."
+
+**Order-book liquidity is enforced, not just configured.**
+`POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD` has a precise, executable
+meaning (`models.OrderBookSnapshot.executable_liquidity_usd()`): USD
+notional summed across book levels priced at or below the order's
+`max_price`, on the specific side of the SPECIFIC outcome token being
+bought — never an aggregate across both outcomes, never NO inferred as
+`1 - YES`. `risk.py`'s `check_order_book_liquidity()` refuses entry
+outright when the book can't actually absorb the trade near the
+ceiling price; `engine.py` fetches that exact outcome's own order book
+before every risk check.
+
+**Same safety philosophy as the Robinhood side, reimplemented, not
+reused** (the two systems share no options-specific code, but
+`src/execution/emergency_stop.py`'s `EmergencyStopStore` is generic and
+is imported as-is):
+
+- `POLYMARKET_TRADING_MODE` defaults to `paper` — no real order is ever
+  placed.
+- `POLYMARKET_LIVE_TRADING_CONFIRMED` is a second, independent switch;
+  `LivePolymarketGateway` refuses to even construct without it.
+- `POLYMARKET_LIVE_AUTO_EXECUTE` (default `false`) controls whether a
+  risk-cleared order places immediately (then is reconciled
+  immediately within the same cycle) or stops at `pending_approval` for
+  a separate `scripts/confirm_polymarket_order.py` call.
+- The emergency-stop file defaults to **STOPPED** with no file present
+  — a real order cannot place until someone explicitly clears it.
+- Deterministic risk gates before every new entry: max bet size, max
+  daily loss, max open positions, cooldown after an exit, data
+  staleness, max spread, order-book liquidity, and an entry cutoff
+  before a market's close — see `src/polymarket/risk.py`.
+- Credentials fail closed (`settings.py`): `POLYMARKET_PRIVATE_KEY` is
+  ALWAYS required for live trading (every order is signed by it; the
+  API-key triple below can never substitute), and
+  `POLYMARKET_API_KEY`/`SECRET`/`PASSPHRASE` must be all-set or
+  all-unset — a partial triple is rejected at startup as a
+  configuration mistake, not guessed at.
+
+**Not independently verified against the real API.** This was built in
+an environment whose network egress policy blocks both
+`*.polymarket.com` and `*.polymarket.us` outright (confirmed directly —
+`curl`'s own CONNECT-tunnel attempt is refused with a 403 from the
+sandbox's own proxy, not a response from Polymarket), so none of the
+live-network code paths in `client.py`/`us_client.py` have actually run
+against either venue — everything is instead verified against each
+SDK's real, current, installed source code and type definitions.
+Before trusting this with real funds, from a network-enabled machine:
+
+**Windows (PowerShell), the expected live environment:**
+
+```powershell
+git clone https://github.com/Mustafa-ibrar-prog/HOOD.git
+cd HOOD
+git checkout claude/tender-cerf-e1t6ie   # or main, once this is merged
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -m pip install -e ".[polymarket]"
+copy .env.polymarket.example .env
+notepad .env   # fill in POLYMARKET_VENUE=us, POLYMARKET_US_KEY_ID, POLYMARKET_US_SECRET_KEY
+py scripts\verify_polymarket_setup.py
+```
+
+**macOS/Linux, equivalently:**
+
+```bash
+git clone https://github.com/Mustafa-ibrar-prog/HOOD.git
+cd HOOD
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[polymarket]"
+cp .env.polymarket.example .env
+$EDITOR .env
+python3 scripts/verify_polymarket_setup.py
+```
+
+Then:
+
+1. Read `scripts/verify_polymarket_setup.py`'s output carefully — it
+   prints an explicit `PASS`/`FAIL`/`SKIPPED` line per check (API
+   connectivity, BTC market discovery, each outcome's own order book
+   and executable liquidity, resolution metadata, authentication,
+   balance) and exits non-zero if anything required failed. Do not
+   proceed past a `FAIL`.
+2. Only once every required check is a real, live `PASS`: run
+   `python3 scripts/run_polymarket_bot.py --once`, inspect
+   `logs/polymarket/decisions.jsonl`, then a short multi-cycle run
+   (`--max-cycles 20`) before leaving it running unattended — still in
+   `POLYMARKET_TRADING_MODE=paper`.
+3. Only after that: consider `POLYMARKET_TRADING_MODE=live` with
+   `POLYMARKET_LIVE_AUTO_EXECUTE=false` (keep it false for the first
+   real trade) and the emergency stop still active. Approve or reject
+   the one resulting pending order by hand with
+   `scripts/confirm_polymarket_order.py` / `scripts/reject_polymarket_order.py`
+   — never auto-execute a venue's first-ever real order.
+
+**Manual market test mode / the first live test.**
+`scripts/manual_polymarket_us_test.py`'s behavior is selected ENTIRELY
+by `POLYMARKET_TRADING_MODE` — never by a flag:
+
+- **`POLYMARKET_TRADING_MODE=paper`** (the default): a dry run of the
+  full pipeline (discovery → order book → risk → preview → simulated
+  fill → reconciliation → position ledger), safe to run any time, any
+  number of times.
+- **`POLYMARKET_TRADING_MODE=live`**: prints a consolidated **LIVE
+  PREFLIGHT** block (API/auth/balance, the current market, best
+  bid/ask, spread, liquidity, entry cutoff, risk, preview, emergency
+  stop, open positions, pending orders) and a **READY FOR FIRST $&lt;N&gt;
+  LIVE TEST: YES/NO** verdict, then STOPS — no order, paper or real, is
+  placed by this preflight-only run. Only a SECOND, separate invocation
+  with `--confirm-live` goes on to actually submit, and only if that
+  preflight said YES.
+
+`--market-slug` is OPTIONAL. Omit it to use the normal, automatic BTC
+15m discovery (the mode for a real production live test — the current
+BTC market changes every 15 minutes and nothing here should require
+pasting a fresh slug each cycle). Give it an exact market/event slug
+copied from the Polymarket US app (e.g. `btc-updown-15m-2026-10-06-1745z`)
+to test one specific market instead — no search, no "closest
+available," no fallback; see `POLYMARKET_US_MARKET_SLUG` in
+`.env.polymarket.example`.
+
+Every existing safety control (bet-size/daily-loss/open-position/
+cooldown/stale-data/spread/liquidity/entry-cutoff risk checks, the
+emergency stop, the live-trading-confirmation switches, actual-fill
+reconciliation) applies in both modes, plus two LIVE-only gates: no
+existing open position, and no pending order already awaiting
+approval — this is a ONE-position integration test, never an
+averaging-down tool. Nothing here bypasses `risk.py` or `gateway.py`.
+If a fill ever comes back `status="unknown"`, the script stops and
+reports it rather than assuming a fill either way, and never submits a
+second order to compensate.
+
+**The emergency stop is never cleared by any script.**
+`scripts/emergency_stop_control.py` is the one, human-operated way to
+check/trip/clear it:
+```powershell
+py scripts\emergency_stop_control.py status
+py scripts\emergency_stop_control.py clear --authorized-by "YourName" --reason "cleared for the first $5 live test"
+py scripts\emergency_stop_control.py activate --reason "done testing"
+```
+`clear` requires a real identity (it rejects anything starting with
+`system:`) — there is no code path anywhere in this codebase that
+clears a stop on its own.
+
+**The first $5 live test, step by step:**
+
+1. Read-only verification first — never places an order (works with or
+   without `--market-slug`):
+   ```powershell
+   py scripts\verify_polymarket_setup.py
+   ```
+   (macOS/Linux: `python3 scripts/verify_polymarket_setup.py`.) Do not
+   proceed past a `FAIL`.
+2. In `.env`, set `POLYMARKET_TRADING_MODE=live`,
+   `POLYMARKET_LIVE_TRADING_CONFIRMED=true`, and keep
+   `POLYMARKET_LIVE_AUTO_EXECUTE=false` — leave the emergency stop
+   ACTIVE for now.
+3. Run the preflight (no `--confirm-live`, so nothing is submitted):
+   ```powershell
+   py scripts\manual_polymarket_us_test.py --outcome YES --amount 5 --max-price 0.60
+   ```
+   Review the **LIVE PREFLIGHT** block. It will say `READY: NO` as
+   long as the emergency stop is active — that's expected.
+4. Only once every other line is clean, clear the emergency stop
+   yourself (step above), then re-run the SAME preflight command and
+   confirm it now says `READY FOR FIRST $5 LIVE TEST: YES`.
+5. Only now, re-run the EXACT same command with `--confirm-live`
+   added. This is the one real order:
+   ```powershell
+   py scripts\manual_polymarket_us_test.py --outcome YES --amount 5 --max-price 0.60 --confirm-live
+   ```
+6. Read the **LIVE ORDER** block (order id, submission result, fill
+   status, filled shares, avg fill price, whether a position was
+   created, reconciliation, error). Re-activate the emergency stop
+   afterward (`scripts/emergency_stop_control.py activate ...`) and do
+   NOT set `POLYMARKET_LIVE_AUTO_EXECUTE=true` until you've separately
+   watched this one position through resolution → settlement →
+   realized P&L → removal → cooldown.
+
+The momentum-continuation strategy in `src/polymarket/strategy.py` is a
+v1 starting point (reads the market's own implied-probability trend
+since it opened, not an external BTC price feed), not a validated edge
+— tune `MomentumConfig` once you can see it trade against real markets.
+Position handling is deliberately "buy and hold to resolution" for v1;
+selling back into the order book before a market resolves is a real
+Polymarket feature and a natural v2, not built here (see
+`src/polymarket/positions.py`'s module docstring).
