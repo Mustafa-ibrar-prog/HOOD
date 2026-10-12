@@ -225,6 +225,32 @@ def test_qualifying_setup_skipped_when_outcome_book_has_no_liquidity(tmp_path):
     assert harness["position_store"].load() == []
 
 
+def test_stale_market_quote_blocks_entry_even_with_a_qualifying_model_edge(tmp_path):
+    """Round F fail-closed requirement: a stale Polymarket quote/book
+    must block entry regardless of the predictive model's own edge.
+    This is PRE-EXISTING infrastructure (risk.py's check_data_freshness,
+    reused unchanged from the old favored-side strategy -- see
+    risk_manager.evaluate_new_trade(), called identically from
+    engine.py's predictive entry path) -- never a second, independently
+    -written staleness check. Deliberately distinct from
+    test_stale_btc_feed_never_enters_even_with_a_trained_model_and_qualifying_book:
+    THIS test's BTC feed is fine; it is the Polymarket MARKET quote
+    itself (market.fetched_at/data_age_seconds) that is stale."""
+    now = datetime.now(timezone.utc)
+    stale_fetched_at = now - timedelta(seconds=60)  # default POLYMARKET_STALE_DATA_MAX_SECONDS is 20.0
+    market = _market(
+        yes_bid=0.78, yes_ask=0.80, window_start=_window_start_for(now), fetched_at=stale_fetched_at,
+    )
+    harness = _harness(tmp_path, market=market)
+    harness["model"] = _confident_model("UP")
+    _seed_sufficient_btc_history(harness["btc_price_store"], now=now)
+
+    report = run_cycle(**harness, now=now)
+
+    assert not report.entered
+    assert harness["position_store"].load() == []
+
+
 def test_max_open_positions_blocks_a_second_entry(tmp_path):
     now = datetime.now(timezone.utc)
     market = _market(yes_bid=0.78, yes_ask=0.80, window_start=_window_start_for(now))

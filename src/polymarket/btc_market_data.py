@@ -73,6 +73,18 @@ being reported as current evidence forever. See compute_feed_status()
 below and btc_intelligence.assess_btc_market()'s own max_bar_age_seconds
 gate — a bar older than that is treated as equivalent to "no bar,"
 forcing INSUFFICIENT_DATA exactly like a feed that was never fed.
+
+UPDATE 3 — real HISTORICAL (not just recent) candles: training the BTC
+direction model (btc_direction_model.py/btc_training_data.py) needs far
+more history than the live feed/refresh path above ever accumulates on
+its own (that path only ever keeps a rolling few hours — see
+retention_seconds above). CoinbaseBtcQuoteSource.get_historical_candles()
+(btc_coinbase_source.py) is a SEPARATE method for exactly this: given an
+arbitrary [start, end) range (days/weeks/months), it paginates Coinbase's
+own documented per-request cap and returns every real 1-minute candle in
+that range, oldest first. See scripts/download_btc_historical_bars.py
+for the command-line tool that calls it and saves the result to a local
+JSON file the backtest script's --bars-file can load directly.
 """
 
 from __future__ import annotations

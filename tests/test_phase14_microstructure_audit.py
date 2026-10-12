@@ -92,6 +92,7 @@ def test_no_order_book_or_trade_direction_code_exists_anywhere_in_src_or_scripts
         REPO_ROOT / "src" / "data" / "source_profile.py",
         REPO_ROOT / "scripts" / "phase15_data_architecture_audit.py",
         REPO_ROOT / "scripts" / "run_polymarket_bot.py",
+        REPO_ROOT / "scripts" / "run_paper_trading.py",
         REPO_ROOT / "scripts" / "verify_polymarket_setup.py",
         REPO_ROOT / "scripts" / "manual_polymarket_us_test.py",
         # Same reasoning as the three Polymarket scripts above: these

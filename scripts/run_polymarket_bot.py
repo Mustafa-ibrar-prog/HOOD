@@ -53,13 +53,15 @@ from src.polymarket.state import DailyPnlStateStore  # noqa: E402
 from src.polymarket.strategy import BtcMomentumStrategy  # noqa: E402
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
-    parser.add_argument("--max-cycles", type=int, default=None, help="Stop after N cycles (default: run forever)")
-    args = parser.parse_args()
-
-    settings = PolymarketSettings.from_env()
+def run_bot(settings: PolymarketSettings, *, once: bool = False, max_cycles: int | None = None) -> int:
+    """The bot's full bootstrap + unattended loop, given an already-
+    constructed settings object -- factored out of main() so a second
+    entry point (scripts/run_paper_trading.py) can run the EXACT same
+    code path with ONE difference: a settings object whose trading_mode
+    has been forced to "paper" regardless of what the environment says,
+    guaranteeing no live order can ever be submitted from that command.
+    main() below is just this function plus argv parsing and the
+    ordinary PolymarketSettings.from_env() load."""
     client = get_polymarket_client(settings)
     strategy = BtcMomentumStrategy()
     risk_manager = PolymarketRiskManager(settings)
@@ -87,8 +89,8 @@ def main() -> int:
     # higher implied probability") is DELETED, not merely unused.
     # Every open position is then actively managed by a configurable
     # +10% take-profit AND a configurable -20% stop-loss (take_profit.py;
-    # both settings, see settings.py's simple_take_profit_pct/
-    # simple_stop_loss_pct) -- UNCHANGED position-management
+    # both settings, see settings.py's take_profit_pct/
+    # stop_loss_pct) -- UNCHANGED position-management
     # infrastructure, not strategy. engine.run_cycle() still does not
     # call btc_entry_signal.py/btc_intelligence.py (the EARLIER,
     # qualitative evidence-cascade approach) or
@@ -221,12 +223,22 @@ def main() -> int:
                 f"cycle {cycles}: ran={report.ran} market={report.market_question!r} entered={report.entered} "
                 f"settled={report.settled_count} reconciled={report.reconciled_count} exits_submitted={report.exits_submitted}"
             )
-            if args.once or (args.max_cycles is not None and cycles >= args.max_cycles):
+            if once or (max_cycles is not None and cycles >= max_cycles):
                 break
             time.sleep(settings.poll_interval_seconds)
     except KeyboardInterrupt:
         print("Stopped.")
     return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    parser.add_argument("--max-cycles", type=int, default=None, help="Stop after N cycles (default: run forever)")
+    args = parser.parse_args()
+
+    settings = PolymarketSettings.from_env()
+    return run_bot(settings, once=args.once, max_cycles=args.max_cycles)
 
 
 if __name__ == "__main__":

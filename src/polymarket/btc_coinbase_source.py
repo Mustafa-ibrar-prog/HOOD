@@ -33,6 +33,19 @@ APIs. All tests for this module use a deterministic fake HTTP
 transport (see tests/test_polymarket_btc_coinbase_source.py), never a
 real network call.
 
+HISTORICAL DOWNLOADS: get_recent_candles() above only ever looks
+backward from `now` by `limit` candles — it is the live feed/refresh
+path's own method, not a historical-dataset tool. get_historical_candles()
+(below) is a SEPARATE method for pulling an arbitrary, possibly large
+[start, end) range (days/weeks/months) for training the BTC direction
+model (see btc_training_data.py/scripts/backtest_btc_direction_model.py).
+Coinbase's public candles endpoint caps every single request at 300
+returned rows (documented, long-stable limit) — get_historical_candles()
+pages through the requested range in <= 300-candle chunks itself, so a
+caller never has to think about that limit. See
+scripts/download_btc_historical_bars.py for the command-line tool built
+on top of this.
+
 LIVE INCIDENT, FIXED: a real run showed the newest returned candle
 frozen at the EXACT same timestamp across several real, one-minute-
 apart refreshes (BtcFeedRefresher.maybe_refresh() calling this once a
@@ -62,6 +75,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -77,6 +91,11 @@ _EXPECTED_ROW_LENGTH = 6  # [time, low, high, open, close, volume] -- Coinbase's
 # provider so the requested window isn't razor-thin against exactly
 # `limit` candles actually existing in it.
 _REQUEST_WINDOW_BUFFER_CANDLES = 5
+# Coinbase's own documented, long-stable per-request cap on this
+# endpoint: a request spanning more than this many candles is rejected
+# (400) rather than silently truncated -- get_historical_candles() below
+# never requests a window wider than this many candles at once.
+_MAX_CANDLES_PER_REQUEST = 300
 
 _logger = logging.getLogger(__name__)
 
@@ -157,6 +176,104 @@ class CoinbaseBtcQuoteSource:
             params["start"], params["end"],
         )
         return trimmed
+
+    def get_historical_candles(
+        self, *, start: datetime, end: datetime, request_delay_seconds: float = 0.0,
+    ) -> list[PriceBar]:
+        """Returns EVERY real 1-minute candle Coinbase has in
+        [start, end), oldest first -- for building a historical training
+        dataset (btc_training_data.py), not for the live feed/refresh
+        path (that's get_recent_candles, above). Real open/high/low/
+        close/volume and exact provider timestamps throughout, exactly
+        like get_recent_candles -- nothing here is interpolated or
+        fabricated.
+
+        Paginates in <= _MAX_CANDLES_PER_REQUEST-candle chunks (see that
+        constant's docstring) -- a caller never has to think about
+        Coinbase's own per-request cap. Chunk boundaries are requested
+        with a small overlap-tolerant exact split (`chunk_end` of one
+        chunk is `chunk_start` of the next), and results are deduplicated
+        by timestamp before being returned, so a provider that happens to
+        include a boundary candle in both of two adjacent chunk responses
+        never produces a duplicate row.
+
+        `request_delay_seconds` (default 0 -- tests never sleep) inserts
+        a real time.sleep() between chunk requests. Pulling weeks/months
+        of history means many chunk requests to a public, unauthenticated
+        endpoint -- a nonzero delay here keeps that polite; a short range
+        (a handful of chunks) doesn't need one.
+
+        Raises CoinbaseBtcQuoteSourceError on ANY chunk's transport/HTTP/
+        parse failure and on an invalid (start >= end) range -- a
+        historical download that silently stopped partway through would
+        leave an undetected gap in the saved dataset, which is worse than
+        a loud failure the caller can retry or resume.
+        """
+        if start >= end:
+            raise ValueError("start must be before end")
+        start = _as_utc_dt(start)
+        end = _as_utc_dt(end)
+        chunk_span = timedelta(seconds=_GRANULARITY_SECONDS * _MAX_CANDLES_PER_REQUEST)
+
+        bars_by_time: dict[datetime, PriceBar] = {}
+        chunk_start = start
+        chunk_index = 0
+        while chunk_start < end:
+            if chunk_index > 0 and request_delay_seconds > 0:
+                time.sleep(request_delay_seconds)
+            chunk_end = min(chunk_start + chunk_span, end)
+            params = {"granularity": str(_GRANULARITY_SECONDS), "start": chunk_start.isoformat(), "end": chunk_end.isoformat()}
+            url = f"{_CANDLES_URL_TEMPLATE.format(product_id=self._product_id)}?{urllib.parse.urlencode(params)}"
+            request = urllib.request.Request(url, headers={"User-Agent": "polymarket-btc-feed/1.0"})
+            _logger.info(
+                "coinbase historical candles chunk request: product=%s chunk=%d params=%s",
+                self._product_id, chunk_index, params,
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                    status = getattr(response, "status", None)
+                    raw = response.read()
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                _logger.warning(
+                    "coinbase historical candles chunk request failed: product=%s chunk=%d params=%s error=%s",
+                    self._product_id, chunk_index, params, exc,
+                )
+                raise CoinbaseBtcQuoteSourceError(f"Coinbase historical candles chunk {chunk_index} request failed: {exc}") from exc
+
+            try:
+                rows = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                _logger.warning("coinbase historical candles chunk response was not valid JSON: status=%s error=%s", status, exc)
+                raise CoinbaseBtcQuoteSourceError(f"Coinbase historical candles chunk {chunk_index} response was not valid JSON: {exc}") from exc
+            if not isinstance(rows, list):
+                _logger.warning(
+                    "coinbase historical candles chunk response was not a list: status=%s type=%s", status, type(rows).__name__,
+                )
+                raise CoinbaseBtcQuoteSourceError(
+                    f"Coinbase historical candles chunk {chunk_index} response was not a list: {type(rows).__name__}"
+                )
+
+            chunk_bars = [_row_to_bar(row) for row in rows]
+            for bar in chunk_bars:
+                bars_by_time[bar.start_time] = bar
+            _logger.info(
+                "coinbase historical candles chunk response: status=%s chunk=%d rows=%d chunk_start=%s chunk_end=%s",
+                status, chunk_index, len(rows), params["start"], params["end"],
+            )
+            chunk_start = chunk_end
+            chunk_index += 1
+
+        bars = sorted(bars_by_time.values(), key=lambda b: b.start_time)
+        in_range = [b for b in bars if start <= _as_utc_dt(b.start_time) < end]
+        _logger.info(
+            "coinbase historical candles complete: product=%s requested_start=%s requested_end=%s chunks=%d bars=%d",
+            self._product_id, start.isoformat(), end.isoformat(), chunk_index, len(in_range),
+        )
+        return in_range
+
+
+def _as_utc_dt(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 def _row_to_bar(row: object) -> PriceBar:

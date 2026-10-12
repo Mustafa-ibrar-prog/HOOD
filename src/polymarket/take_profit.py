@@ -24,8 +24,8 @@ RSI, MACD, EMA, BTC momentum, confidence, or historical learning):
      which is itself already persisted on the position -- so both are
      automatically persistent across a restart with no separate
      stored field to go stale or drift. take_profit_pct/stop_loss_pct
-     are themselves SETTINGS (settings.simple_take_profit_pct /
-     settings.simple_stop_loss_pct -- defaults +10% / -20%, see
+     are themselves SETTINGS (settings.take_profit_pct /
+     settings.stop_loss_pct -- defaults +10% / -20%, see
      settings.py), never hard-coded constants -- either can change
      without touching this module's logic.
   2. Strictly between the two: HOLD. Never sells merely because the
@@ -74,7 +74,7 @@ from src.polymarket.trade_learning import CompletedTradeStore
 
 # Fallback defaults for evaluate_take_profit()'s own keyword params and
 # for settings.py's from_env() -- production ALWAYS passes
-# settings.simple_take_profit_pct/simple_stop_loss_pct explicitly (see
+# settings.take_profit_pct/stop_loss_pct explicitly (see
 # check_and_execute_take_profits below), so these are never a second,
 # independently-tuned production constant; they only matter for a
 # direct unit-test call that doesn't care about either value.
@@ -114,7 +114,7 @@ def evaluate_take_profit(
     token; None (no bid liquidity at all right now) is always HOLD,
     never a guess. `take_profit_pct`/`stop_loss_pct` are fractions
     (0.10 == +10%, 0.20 == -20%) -- production always passes
-    settings.simple_take_profit_pct/simple_stop_loss_pct explicitly
+    settings.take_profit_pct/stop_loss_pct explicitly
     (see check_and_execute_take_profits). target_price and
     stop_loss_price never cross for any take_profit_pct > -1 and
     0 < stop_loss_pct < 1 (both already validated at settings-load
@@ -286,8 +286,8 @@ def check_and_execute_take_profits(
       3. otherwise, a FRESH order book is fetched for this position's
          own token and evaluate_take_profit() decides HOLD/SELL from
          ONLY this position's own avg_fill_price and the current
-         executable bid, using settings.simple_take_profit_pct/
-         simple_stop_loss_pct -- both configurable, never hard-coded.
+         executable bid, using settings.take_profit_pct/
+         stop_loss_pct -- both configurable, never hard-coded.
 
     `skip_client_order_ids` mirrors the DELAYED-ENTRY GRACE parameter
     the earlier exit systems in this package already use -- a position
@@ -359,7 +359,7 @@ def check_and_execute_take_profits(
 
         decision = evaluate_take_profit(
             current, executable_bid=order_book.best_bid,
-            take_profit_pct=settings.simple_take_profit_pct, stop_loss_pct=settings.simple_stop_loss_pct,
+            take_profit_pct=settings.take_profit_pct, stop_loss_pct=settings.stop_loss_pct,
         )
 
         if decision.action == _ACTION_HOLD:

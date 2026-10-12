@@ -267,13 +267,19 @@ class PolymarketSettings:
     # Automatic exit targets (see take_profit.py) -- BOTH configurable,
     # never hard-coded constants, so either can change without touching
     # strategy code. Fractions of the position's own ACTUAL average
-    # fill price: target_price = avg_fill_price * (1 + simple_take_profit_pct);
-    # stop_loss_price = avg_fill_price * (1 - simple_stop_loss_pct).
+    # fill price: target_price = avg_fill_price * (1 + take_profit_pct);
+    # stop_loss_price = avg_fill_price * (1 - stop_loss_pct).
     # Defaults match this round's governing spec: +10% / -20%. Position
     # management is infrastructure, not strategy -- unchanged by the
-    # predictive-model rewrite.
-    simple_take_profit_pct: float
-    simple_stop_loss_pct: float
+    # predictive-model rewrite. RENAMED from simple_take_profit_pct/
+    # simple_stop_loss_pct (POLYMARKET_SIMPLE_TAKE_PROFIT_PCT/
+    # POLYMARKET_SIMPLE_STOP_LOSS_PCT) -- the "simple" prefix referred to
+    # the now-deleted favored-side strategy (simple_entry_signal.py);
+    # keeping it on the ONLY position-management settings this system
+    # has was itself misleading, since it implied a connection to a
+    # strategy that no longer exists.
+    take_profit_pct: float
+    stop_loss_pct: float
 
     # --- Minimum MODEL edge (see btc_model_entry_signal.py) -- NOT the
     # old simple_min_entry_edge (a gap between Polymarket's own two
@@ -522,11 +528,11 @@ class PolymarketSettings:
             raise PolymarketConfigError("POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD must be >= 0")
         if not 0 <= self.max_price_slippage_pct < 1:
             raise PolymarketConfigError("POLYMARKET_MAX_PRICE_SLIPPAGE_PCT must be between 0 and 1 (exclusive of 1)")
-        if self.simple_take_profit_pct <= 0:
-            raise PolymarketConfigError("POLYMARKET_SIMPLE_TAKE_PROFIT_PCT must be > 0")
-        if not 0 < self.simple_stop_loss_pct < 1:
+        if self.take_profit_pct <= 0:
+            raise PolymarketConfigError("POLYMARKET_TAKE_PROFIT_PCT must be > 0")
+        if not 0 < self.stop_loss_pct < 1:
             raise PolymarketConfigError(
-                "POLYMARKET_SIMPLE_STOP_LOSS_PCT must be between 0 and 1 (exclusive) — a stop-loss price "
+                "POLYMARKET_STOP_LOSS_PCT must be between 0 and 1 (exclusive) — a stop-loss price "
                 "(avg_fill_price * (1 - pct)) must stay strictly positive"
             )
         if not 0 <= self.model_min_edge < 1:
@@ -756,8 +762,8 @@ class PolymarketSettings:
             min_order_book_liquidity_usd=_get_float(env, "POLYMARKET_MIN_ORDER_BOOK_LIQUIDITY_USD", 10.0),
             max_price_slippage_pct=_get_float(env, "POLYMARKET_MAX_PRICE_SLIPPAGE_PCT", 0.03),
             simple_entry_size_usd=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_SIZE_USD", 20.0),
-            simple_take_profit_pct=_get_float(env, "POLYMARKET_SIMPLE_TAKE_PROFIT_PCT", 0.10),
-            simple_stop_loss_pct=_get_float(env, "POLYMARKET_SIMPLE_STOP_LOSS_PCT", 0.20),
+            take_profit_pct=_get_float(env, "POLYMARKET_TAKE_PROFIT_PCT", 0.10),
+            stop_loss_pct=_get_float(env, "POLYMARKET_STOP_LOSS_PCT", 0.20),
             model_min_edge=_get_float(env, "POLYMARKET_MODEL_MIN_EDGE", 0.05),
             model_fee_pct=_get_float(env, "POLYMARKET_MODEL_FEE_PCT", 0.0),
             model_slippage_pct=_get_float(env, "POLYMARKET_MODEL_SLIPPAGE_PCT", 0.01),

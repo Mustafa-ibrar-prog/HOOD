@@ -60,11 +60,15 @@ class ModelEntrySignal:
     that went into the decision (even on a NO-TRADE result) for full
     auditability in the decision log. Field names match this round's
     required log vocabulary: MARKET_UP_PROBABILITY,
-    MARKET_DOWN_PROBABILITY, UP_EDGE, DOWN_EDGE, SELECTED_OUTCOME,
-    EXECUTABLE_ENTRY_PRICE, DECISION, REASON (BTC_PRICE/PRICE_TO_BEAT/
-    DISTANCE_TO_BEAT/TIME_REMAINING/MODEL_UP_PROBABILITY/
-    MODEL_DOWN_PROBABILITY come from the prediction/features objects
-    themselves -- see their own to_log_fields())."""
+    MARKET_DOWN_PROBABILITY, UP_ASK, DOWN_ASK, UP_EDGE, DOWN_EDGE,
+    SELECTED_OUTCOME, EXECUTABLE_ENTRY_PRICE, DECISION, REASON
+    (BTC_PRICE/PRICE_TO_BEAT/DISTANCE_TO_BEAT/TIME_REMAINING/
+    MODEL_UP_PROBABILITY/MODEL_DOWN_PROBABILITY come from the
+    prediction/features objects themselves -- see their own
+    to_log_fields()). UP_ASK/DOWN_ASK are logged on EVERY outcome,
+    including NO_TRADE -- the per-side executable ask is what makes a
+    NO_TRADE decision's REASON auditable after the fact (e.g. "edge too
+    small"), not just the eventual trade's own EXECUTABLE_ENTRY_PRICE."""
 
     outcome: str | None  # "YES" (UP) | "NO" (DOWN) | None -- SELECTED_OUTCOME
     decision: str  # "TRADE" | "NO_TRADE"
@@ -84,6 +88,7 @@ class ModelEntrySignal:
     def to_log_fields(self) -> dict[str, float | str | None]:
         return {
             "MARKET_UP_PROBABILITY": self.market_up_probability, "MARKET_DOWN_PROBABILITY": self.market_down_probability,
+            "UP_ASK": self.up_ask, "DOWN_ASK": self.down_ask,
             "UP_EDGE": self.up_edge, "DOWN_EDGE": self.down_edge, "SELECTED_OUTCOME": self.outcome,
             "EXECUTABLE_ENTRY_PRICE": self.executable_entry_price, "DECISION": self.decision, "REASON": self.reason,
         }

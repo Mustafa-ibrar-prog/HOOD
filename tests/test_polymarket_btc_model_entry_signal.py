@@ -217,6 +217,8 @@ def test_f_to_log_fields_carries_the_required_vocabulary():
         has_minimum_feature_data=True, min_model_edge=0.05,
     )
     fields = signal.to_log_fields()
-    for key in ("MARKET_UP_PROBABILITY", "MARKET_DOWN_PROBABILITY", "UP_EDGE", "DOWN_EDGE", "SELECTED_OUTCOME",
-                "EXECUTABLE_ENTRY_PRICE", "DECISION", "REASON"):
+    for key in ("MARKET_UP_PROBABILITY", "MARKET_DOWN_PROBABILITY", "UP_ASK", "DOWN_ASK", "UP_EDGE", "DOWN_EDGE",
+                "SELECTED_OUTCOME", "EXECUTABLE_ENTRY_PRICE", "DECISION", "REASON"):
         assert key in fields
+    assert fields["UP_ASK"] == pytest.approx(0.57)
+    assert fields["DOWN_ASK"] == pytest.approx(0.44)
