@@ -549,10 +549,12 @@ def test_scenario_13_settlement_fallback_handles_resolution_before_dynamic_exit(
         filled_shares=10.0, avg_fill_price=0.5, opened_at=past_close - timedelta(minutes=15), close_time=past_close,
     ))
 
+    from src.polymarket.btc_direction_model import BtcDirectionModel
     report = run_cycle(
         settings=settings, client=client, strategy=strategy, risk_manager=risk_manager, gateway=gateway,
         decision_logger=decision_logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        model=BtcDirectionModel.untrained(), now=now,
     )
 
     assert report.settled_count == 1

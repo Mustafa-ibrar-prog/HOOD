@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.execution.emergency_stop import EmergencyStopStore  # noqa: E402
 from src.polymarket.btc_coinbase_source import CoinbaseBtcQuoteSource  # noqa: E402
+from src.polymarket.btc_direction_model import BtcDirectionModel  # noqa: E402
 from src.polymarket.btc_intelligence import DEFAULT_MIN_BARS_FOR_INDICATORS  # noqa: E402
 from src.polymarket.btc_market_data import BtcFeedRefresher, BtcPriceHistoryStore, bootstrap_btc_price_history  # noqa: E402
 from src.polymarket.client import get_polymarket_client  # noqa: E402
@@ -71,35 +72,53 @@ def main() -> int:
     # gateway.py's PaperPolymarketGateway — it never calls place_order).
     pending_store = PolymarketPendingOrderStore(Path(settings.pending_orders_file))
     history = MarketHistory()
-    # NOTE: as of this round, the production strategy is fully
-    # autonomous and deliberately simple: entry is evaluated across
-    # the full 15-minute market, at any point while it's open, with NO
-    # fixed probability threshold -- direction is whichever side the
-    # market currently favors, gated by a configurable MINIMUM EDGE
-    # (settings.simple_min_entry_edge, default 0.10 -- the gap between
-    # the two sides' own implied probabilities) and a configurable
-    # PERSISTENCE requirement (settings.simple_entry_persistence_required,
-    # default 3 consecutive qualifying cycles) before entering (see
-    # simple_entry_signal.py / engine.MarketHistory.observe_entry_candidate).
+    # NOTE: as of this round, the production strategy is PREDICTIVE,
+    # not favored-side: a real BTC direction model
+    # (btc_direction_model.py) estimates P(UP)/P(DOWN) for the CURRENT
+    # 15-minute contract from the live BTC bars this bootstrap/refresh
+    # plumbing feeds (see below -- this data is now the SOURCE OF
+    # DIRECTION, never "kept running harmlessly and unread" the way an
+    # earlier round's comment here used to say). The entry decision
+    # compares the model's own probability against what Polymarket
+    # currently charges to buy each side, net of fees/slippage, and
+    # only trades when that edge clears settings.model_min_edge (see
+    # btc_model_entry_signal.py). simple_entry_signal.py (the OLD
+    # favored-side strategy -- "whichever Polymarket side has the
+    # higher implied probability") is DELETED, not merely unused.
     # Every open position is then actively managed by a configurable
     # +10% take-profit AND a configurable -20% stop-loss (take_profit.py;
     # both settings, see settings.py's simple_take_profit_pct/
-    # simple_stop_loss_pct) -- engine.run_cycle() no longer calls
-    # btc_entry_signal.py or exit_manager.check_and_execute_dynamic_exits()
-    # at all (see engine.py's own module docstring). The BTC bootstrap/
-    # feed-refresh plumbing below is kept running harmlessly (feeding
-    # btc_price_store, never read by the live decision) so Coinbase
-    # BTC intelligence stays warm and ready to re-enable later without
-    # any further setup. CoinbaseBtcQuoteSource is a DIRECT, unattended
-    # HTTPS source (no agent/MCP) -- construction alone makes no
-    # network call; bootstrap/refresh below are what actually call it,
-    # and both fail safe (never raise, never crash this bot) on any
-    # provider outage -- see btc_market_data.py's module docstring.
+    # simple_stop_loss_pct) -- UNCHANGED position-management
+    # infrastructure, not strategy. engine.run_cycle() still does not
+    # call btc_entry_signal.py/btc_intelligence.py (the EARLIER,
+    # qualitative evidence-cascade approach) or
+    # exit_manager.check_and_execute_dynamic_exits() (see engine.py's
+    # own module docstring). CoinbaseBtcQuoteSource is a DIRECT,
+    # unattended HTTPS source (no agent/MCP) -- construction alone
+    # makes no network call; bootstrap/refresh below are what actually
+    # call it, and both fail safe (never raise, never crash this bot)
+    # on any provider outage -- see btc_market_data.py's module
+    # docstring. A provider outage now means the model degrades to
+    # NO_TRADE (insufficient feature data), never a crash and never a
+    # guess.
     btc_price_store = BtcPriceHistoryStore(Path(settings.btc_price_history_file))
     btc_source = CoinbaseBtcQuoteSource()
     btc_bootstrapped = bootstrap_btc_price_history(
         btc_price_store, btc_source, min_bars=DEFAULT_MIN_BARS_FOR_INDICATORS,
     )
+    model_weights_path = Path(settings.model_weights_file) if settings.model_weights_file else None
+    model = BtcDirectionModel.load_or_untrained(model_weights_path)
+    if model.is_trained:
+        print(
+            f"BTC direction model loaded: trained_at={model.trained_at} "
+            f"examples={model.training_example_count} data_source={model.data_source}"
+        )
+    else:
+        print(
+            "BTC direction model is UNTRAINED (no POLYMARKET_MODEL_WEIGHTS_FILE configured, or the file "
+            "doesn't exist yet) -- every cycle will be NO_TRADE until a real model is trained and configured. "
+            "Run scripts/backtest_btc_direction_model.py to train one."
+        )
     print(f"BTC price history bootstrap: {btc_bootstrapped} candle(s) recorded from {btc_source.name}")
     btc_refresher = BtcFeedRefresher(btc_price_store, btc_source)
 
@@ -195,7 +214,7 @@ def main() -> int:
                 settings=settings, client=client, strategy=strategy, risk_manager=risk_manager,
                 gateway=gateway, decision_logger=decision_logger, state_store=state_store,
                 position_store=position_store, pending_store=pending_store, history=history,
-                btc_price_store=btc_price_store, btc_feed_source=btc_source.name,
+                btc_price_store=btc_price_store, model=model, btc_feed_source=btc_source.name,
             )
             cycles += 1
             print(

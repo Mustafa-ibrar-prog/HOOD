@@ -295,11 +295,10 @@ def test_run_cycle_does_not_crash_on_exhausted_rate_limit_and_places_no_order(tm
     """Requirements 2, 5, 7, 9 (run_cycle never crashes / safe no-trade
     / no order placement during recovery)."""
     now = datetime.now(timezone.utc)
-    # ask=0.80 >= the 0.70 threshold and close_time within the 300s
-    # window (see simple_entry_signal.py) -- the ONLY production
-    # entry-direction logic as of this round; otherwise clearly
-    # qualifies for an entry, so this test actually reaches the
-    # rate-limited order-book fetch it exists to exercise.
+    # The rate-limited book fetch raises before the predictive entry
+    # decision is even reached -- the market/model values here don't
+    # otherwise need to qualify for anything; this test exercises the
+    # rate-limit retry/degrade path, not the entry decision itself.
     market = _market(yes_bid=0.78, yes_ask=0.80, close_time=now + timedelta(seconds=200))
     settings = _settings(POLYMARKET_LOG_DIR=str(tmp_path))
     client = _RateLimitedOrderBookClient(market)
@@ -316,10 +315,12 @@ def test_run_cycle_does_not_crash_on_exhausted_rate_limit_and_places_no_order(tm
     history.observe(market)
     btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
 
+    from src.polymarket.btc_direction_model import BtcDirectionModel
     report = run_cycle(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        model=BtcDirectionModel.untrained(), now=now,
     )
 
     assert report.ran is True  # never crashed

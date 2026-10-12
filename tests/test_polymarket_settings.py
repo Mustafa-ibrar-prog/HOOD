@@ -103,47 +103,62 @@ def test_take_profit_and_stop_loss_are_configurable_via_env():
     assert settings.simple_stop_loss_pct == pytest.approx(0.15)
 
 
-def test_min_entry_edge_and_persistence_defaults_match_the_governing_spec():
-    """Change 2/Change 3 of this round: a configurable minimum
-    probability edge (default 0.10) and a configurable consecutive-
-    observation persistence requirement (default 3), both settings,
-    never hard-coded constants -- see simple_entry_signal.py/engine.py."""
+def test_old_favored_side_settings_no_longer_exist():
+    """simple_entry_signal.py (the old "whichever Polymarket side has
+    the higher implied probability" strategy), simple_min_entry_edge
+    (a gap between Polymarket's own two sides), and
+    simple_entry_persistence_required are all DELETED this round, not
+    merely unused -- see engine.py's module docstring."""
     settings = PolymarketSettings.from_env(env={})
-    assert settings.simple_min_entry_edge == pytest.approx(0.10)
-    assert settings.simple_entry_persistence_required == 3
+    assert not hasattr(settings, "simple_min_entry_edge")
+    assert not hasattr(settings, "simple_entry_persistence_required")
 
 
-def test_min_entry_edge_and_persistence_are_configurable_via_env():
+def test_model_min_edge_and_costs_default_match_the_governing_spec():
+    """The predictive model's own settings (see btc_model_entry_signal.py):
+    a configurable minimum NET edge (model probability minus the real
+    executable ask, minus fee/slippage), never hard-coded."""
+    settings = PolymarketSettings.from_env(env={})
+    assert settings.model_min_edge == pytest.approx(0.05)
+    assert settings.model_fee_pct == pytest.approx(0.0)
+    assert settings.model_slippage_pct == pytest.approx(0.01)
+    assert settings.model_weights_file is None
+
+
+def test_model_settings_are_configurable_via_env():
     settings = PolymarketSettings.from_env(env={
-        "POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": "0.20", "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "5",
+        "POLYMARKET_MODEL_MIN_EDGE": "0.08", "POLYMARKET_MODEL_FEE_PCT": "0.02",
+        "POLYMARKET_MODEL_SLIPPAGE_PCT": "0.015", "POLYMARKET_MODEL_WEIGHTS_FILE": "logs/polymarket/model.json",
     })
-    assert settings.simple_min_entry_edge == pytest.approx(0.20)
-    assert settings.simple_entry_persistence_required == 5
+    assert settings.model_min_edge == pytest.approx(0.08)
+    assert settings.model_fee_pct == pytest.approx(0.02)
+    assert settings.model_slippage_pct == pytest.approx(0.015)
+    assert settings.model_weights_file == "logs/polymarket/model.json"
 
 
-def test_min_entry_edge_of_zero_is_allowed_disables_the_filter():
-    settings = PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": "0"})
-    assert settings.simple_min_entry_edge == pytest.approx(0.0)
+def test_model_min_edge_of_zero_is_allowed():
+    settings = PolymarketSettings.from_env(env={"POLYMARKET_MODEL_MIN_EDGE": "0"})
+    assert settings.model_min_edge == pytest.approx(0.0)
 
 
-def test_min_entry_edge_of_one_or_more_is_rejected():
+def test_model_min_edge_of_one_or_more_is_rejected():
     with pytest.raises(PolymarketConfigError):
-        PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": "1"})
+        PolymarketSettings.from_env(env={"POLYMARKET_MODEL_MIN_EDGE": "1"})
 
 
-def test_negative_min_entry_edge_is_rejected():
+def test_negative_model_min_edge_is_rejected():
     with pytest.raises(PolymarketConfigError):
-        PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_MIN_ENTRY_EDGE": "-0.01"})
+        PolymarketSettings.from_env(env={"POLYMARKET_MODEL_MIN_EDGE": "-0.01"})
 
 
-def test_persistence_required_of_one_is_allowed_disables_the_filter():
-    settings = PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "1"})
-    assert settings.simple_entry_persistence_required == 1
-
-
-def test_persistence_required_below_one_is_rejected():
+def test_negative_model_fee_pct_is_rejected():
     with pytest.raises(PolymarketConfigError):
-        PolymarketSettings.from_env(env={"POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "0"})
+        PolymarketSettings.from_env(env={"POLYMARKET_MODEL_FEE_PCT": "-0.01"})
+
+
+def test_negative_model_slippage_pct_is_rejected():
+    with pytest.raises(PolymarketConfigError):
+        PolymarketSettings.from_env(env={"POLYMARKET_MODEL_SLIPPAGE_PCT": "-0.01"})
 
 
 def test_non_positive_take_profit_pct_rejected():

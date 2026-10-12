@@ -248,15 +248,17 @@ class PolymarketSettings:
     # either fills at an acceptable price or doesn't happen."
     max_price_slippage_pct: float
 
-    # --- Simple price-based strategy (see simple_entry_signal.py/
-    # take_profit.py) -- the ONLY production entry/exit logic as of
-    # this round. Coinbase/Chainlink/confidence/historical-learning
-    # modules remain in the codebase (with their own tests) but are no
-    # longer called from engine.run_cycle(). Entry is evaluated
-    # continuously across the full 15-minute market, at ANY point while
-    # it is open -- there is no time-remaining window setting and NO
-    # probability-threshold setting any more (see simple_entry_signal.py:
-    # direction is simply whichever side the market currently favors).
+    # --- Predictive BTC direction model strategy (see btc_features.py/
+    # btc_direction_model.py/btc_model_entry_signal.py) -- the ONLY
+    # production entry/exit logic as of this round. simple_entry_signal.py
+    # (direction = whichever Polymarket side currently has the higher
+    # implied probability) and its own minimum-edge/persistence
+    # settings are DELETED, not merely unused -- that was following the
+    # market, never predicting BTC. Coinbase/Chainlink/confidence/
+    # historical-learning modules remain in the codebase (with their
+    # own tests) but are not called from engine.run_cycle(). Entry is
+    # evaluated continuously across the full 15-minute market, at ANY
+    # point while it is open.
     # ------------------------------------------------------------------
     # Fixed entry size for every approved trade -- minimum == maximum
     # == $20 (validated below); max_bet_usd (the risk manager's own
@@ -267,33 +269,41 @@ class PolymarketSettings:
     # strategy code. Fractions of the position's own ACTUAL average
     # fill price: target_price = avg_fill_price * (1 + simple_take_profit_pct);
     # stop_loss_price = avg_fill_price * (1 - simple_stop_loss_pct).
-    # Defaults match this round's governing spec: +10% / -20%.
+    # Defaults match this round's governing spec: +10% / -20%. Position
+    # management is infrastructure, not strategy -- unchanged by the
+    # predictive-model rewrite.
     simple_take_profit_pct: float
     simple_stop_loss_pct: float
 
-    # --- Minimum entry edge (see simple_entry_signal.py) -- a SECOND,
-    # independent filter layered on top of the threshold-free favored-
-    # side rule above, never a reintroduction of the old fixed ">=0.70"
-    # gate: that gate was an ABSOLUTE floor on one side's own
-    # probability; this is a RELATIVE gap requirement BETWEEN the two
-    # sides. edge = abs(yes_implied_probability - no_implied_probability);
-    # a candidate is only eligible when edge >= simple_min_entry_edge.
-    # Example: YES 60% / NO 40% -> edge 0.20, eligible at the 0.10
-    # default. An exact tie or missing book data were ALREADY no-trade
-    # before this setting existed (see simple_entry_signal.py) and stay
-    # that way regardless of this value.
-    simple_min_entry_edge: float
-    # --- Entry persistence (see engine.MarketHistory.observe_entry_candidate)
-    # -- do not enter on a single snapshot. The SAME favored outcome
-    # (already edge-qualified above) must be the chosen candidate on
-    # this many CONSECUTIVE strategy evaluations, for the SAME market,
-    # before a submission is allowed. The favored side flipping, the
-    # edge falling back below simple_min_entry_edge, a tie, or missing
-    # book data all reset the counter (collapsed into one "outcome is
-    # None this cycle" case -- see simple_entry_signal.py). 1 disables
-    # this filter entirely (every qualifying cycle is immediately
-    # eligible, the pre-this-round behavior).
-    simple_entry_persistence_required: int
+    # --- Minimum MODEL edge (see btc_model_entry_signal.py) -- NOT the
+    # old simple_min_entry_edge (a gap between Polymarket's own two
+    # sides, removed along with simple_entry_signal.py). This is the
+    # model's own predicted probability for a side, MINUS that side's
+    # real executable ask, MINUS fee_pct and slippage_pct below -- the
+    # actual, cost-accounted edge the model believes it has over the
+    # market. A side only becomes a trade candidate once this net edge
+    # clears this minimum; a tiny theoretical edge that doesn't survive
+    # execution costs is NO TRADE, same as no edge at all.
+    model_min_edge: float
+    # Assumed trading fee as a fraction of notional, subtracted from
+    # the net edge above. No published Polymarket US fee schedule is
+    # verified anywhere in this codebase -- 0.0 is a placeholder, not a
+    # researched value; set this from Polymarket US's actual published
+    # fee schedule before relying on this for real money.
+    model_fee_pct: float
+    # Assumed execution slippage as a fraction of notional, subtracted
+    # from the net edge above -- a SEPARATE concept from
+    # max_price_slippage_pct (which bounds the order's own max_price
+    # ceiling for submission, never used as a cost estimate).
+    model_slippage_pct: float
+    # Where the trained model's weights are loaded from (see
+    # btc_direction_model.BtcDirectionModel.load_or_untrained()) --
+    # None/missing degrades to an untrained model (always a flat 50/50,
+    # never a fabricated confident number), which
+    # btc_model_entry_signal.py's hard gate turns into NO TRADE
+    # regardless of model_min_edge. Run
+    # scripts/backtest_btc_direction_model.py to train and write one.
+    model_weights_file: str | None
 
     # --- Entry retry guard (see entry_guard.py) — an IDEMPOTENCY/safety
     # gate, not a risk threshold: after a live incident showed
@@ -519,16 +529,15 @@ class PolymarketSettings:
                 "POLYMARKET_SIMPLE_STOP_LOSS_PCT must be between 0 and 1 (exclusive) — a stop-loss price "
                 "(avg_fill_price * (1 - pct)) must stay strictly positive"
             )
-        if not 0 <= self.simple_min_entry_edge < 1:
+        if not 0 <= self.model_min_edge < 1:
             raise PolymarketConfigError(
-                "POLYMARKET_SIMPLE_MIN_ENTRY_EDGE must be between 0 (inclusive -- disables the filter) and "
-                "1 (exclusive -- a probability gap can never reach 1)"
+                "POLYMARKET_MODEL_MIN_EDGE must be between 0 (inclusive -- any positive net edge qualifies) and "
+                "1 (exclusive -- a probability-minus-price edge can never reach 1)"
             )
-        if self.simple_entry_persistence_required < 1:
-            raise PolymarketConfigError(
-                "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED must be >= 1 (1 disables the filter -- every "
-                "qualifying cycle is immediately eligible)"
-            )
+        if not 0 <= self.model_fee_pct < 1:
+            raise PolymarketConfigError("POLYMARKET_MODEL_FEE_PCT must be between 0 and 1 (exclusive)")
+        if not 0 <= self.model_slippage_pct < 1:
+            raise PolymarketConfigError("POLYMARKET_MODEL_SLIPPAGE_PCT must be between 0 and 1 (exclusive)")
         if self.simple_entry_size_usd != 20.0:
             raise PolymarketConfigError("POLYMARKET_SIMPLE_ENTRY_SIZE_USD must be exactly $20 (minimum == maximum == $20)")
         # Deliberately NOT cross-validated against max_bet_usd here: a
@@ -749,8 +758,10 @@ class PolymarketSettings:
             simple_entry_size_usd=_get_float(env, "POLYMARKET_SIMPLE_ENTRY_SIZE_USD", 20.0),
             simple_take_profit_pct=_get_float(env, "POLYMARKET_SIMPLE_TAKE_PROFIT_PCT", 0.10),
             simple_stop_loss_pct=_get_float(env, "POLYMARKET_SIMPLE_STOP_LOSS_PCT", 0.20),
-            simple_min_entry_edge=_get_float(env, "POLYMARKET_SIMPLE_MIN_ENTRY_EDGE", 0.10),
-            simple_entry_persistence_required=_get_int(env, "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED", 3),
+            model_min_edge=_get_float(env, "POLYMARKET_MODEL_MIN_EDGE", 0.05),
+            model_fee_pct=_get_float(env, "POLYMARKET_MODEL_FEE_PCT", 0.0),
+            model_slippage_pct=_get_float(env, "POLYMARKET_MODEL_SLIPPAGE_PCT", 0.01),
+            model_weights_file=_get_optional_str(env, "POLYMARKET_MODEL_WEIGHTS_FILE"),
             entry_retry_cooldown_seconds=_get_float(env, "POLYMARKET_ENTRY_RETRY_COOLDOWN_SECONDS", 120.0),
             entry_retry_min_price_change=_get_float(env, "POLYMARKET_ENTRY_RETRY_MIN_PRICE_CHANGE", 0.02),
             exit_retry_cooldown_seconds=_get_float(env, "POLYMARKET_EXIT_RETRY_COOLDOWN_SECONDS", 90.0),

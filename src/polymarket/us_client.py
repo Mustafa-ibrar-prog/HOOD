@@ -798,8 +798,9 @@ class PolymarketUSClient:
         window = _parse_btc_updown_window_from_slug(
             event_slug, market_duration_minutes=self._settings.market_duration_minutes,
         )
+        window_start: datetime | None = None
         if window is not None:
-            close_time = window[1]
+            window_start, close_time = window
         else:
             close_time = _parse_dt(event.get("endTime"))
             if close_time is None:
@@ -810,6 +811,10 @@ class PolymarketUSClient:
                     "scripts/verify_polymarket_setup.py --market-slug <slug> --debug-exact-slug to "
                     "see the real response shape."
                 )
+            # window_start stays None here -- a manually-overridden,
+            # non-BTC-pattern slug has no confirmed schedule to derive
+            # it from, and guessing would feed a wrong price-to-beat
+            # anchor into btc_features.py silently.
 
         yes_bid = yes_ask = None
         try:
@@ -821,7 +826,7 @@ class PolymarketUSClient:
         return BinaryMarket(
             condition_id=event_slug, question=event.get("title") or market.get("title") or "",
             token_id_yes=market_slug, token_id_no=market_slug,
-            close_time=close_time, fetched_at=now, yes_bid=yes_bid, yes_ask=yes_ask,
+            close_time=close_time, fetched_at=now, window_start=window_start, yes_bid=yes_bid, yes_ask=yes_ask,
         )
 
     def refresh(self, market: BinaryMarket) -> BinaryMarket:

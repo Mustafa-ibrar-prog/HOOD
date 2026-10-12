@@ -1,7 +1,11 @@
-"""Tests for btc_entry_signal.py — Coinbase BTC evidence as the
-PRIMARY entry-direction signal, replacing Polymarket YES-mid price
-movement (strategy.py's old BtcMomentumStrategy, no longer the live
-trigger — see engine.py's run_cycle()).
+"""Tests for btc_entry_signal.py — an EARLIER, qualitative Coinbase-
+evidence-cascade entry-direction signal (bullish/bearish/neutral +
+signal counts, never a calibrated probability), superseded first by
+simple_entry_signal.py's favored-side rule and now by the PREDICTIVE
+BTC direction model (btc_direction_model.py/btc_model_entry_signal.py
+— see engine.py's own module docstring). btc_entry_signal.py itself
+stays dormant in the codebase, unmodified, with its own tests intact,
+in case it's wanted again later; nothing here resurrects it.
 
 Three layers:
   - UNIT tests against assess_btc_entry_direction()/classify_btc_direction()
@@ -14,13 +18,10 @@ Three layers:
     Polymarket-quote mapping step, including the "thesis is directional
     but the book is unusable" case.
   - A couple of full end-to-end run_cycle() tests confirming the
-    CURRENT production entry path (simple_entry_signal.py's own
-    Polymarket-price threshold) never even reads btc_entry_signal.py
-    or any fed BTC evidence: a qualifying Polymarket ask alone DOES
-    create an entry (that's the whole point of the current strategy),
-    and a non-qualifying one does not, regardless of what Coinbase
-    evidence would have said under the superseded Coinbase-driven
-    strategy this module implements.
+    CURRENT production entry path (the predictive model) never enters
+    on a qualifying-looking Polymarket book alone, with or without
+    this module's own evidence present — see test_g/test_h's own
+    docstrings for exactly what changed here this round.
 
 Never places a real order — every client/gateway here is paper mode or
 a local fake.
@@ -257,28 +258,29 @@ def test_j_bearish_thesis_with_unusable_no_book_yields_no_candidate():
     assert build_entry_candidate(market, assessment, size_usd=5.0) is None
 
 
-# --- G/H: a Polymarket price move, alone, can never create an entry -------
-# Full run_cycle() end to end, with ZERO BTC bars fed (the harness's
-# btc_price_store is always empty here) -- only Polymarket's own
-# yes_bid/yes_ask/history.mids move; btc_entry_signal.py never reads
-# any of it. The CURRENT production entry path (simple_entry_signal.py)
-# decides purely from whichever side the market currently favors --
-# there is no probability threshold any more, so a favored ask DOES
-# enter (test_g) and only a genuinely, exactly tied market does not
-# (test_h) -- in neither case does btc_entry_signal.py or any BTC
-# evidence ever factor in.
+# --- G/H: a Polymarket price move, ALONE, can never create an entry --
+# as of THIS round's rewrite (the predictive-model strategy), this is
+# true for the OPPOSITE reason the old module docstring here used to
+# give: it is no longer that "the current simple_entry_signal.py
+# strategy follows Polymarket's own price and ignores BTC evidence" --
+# simple_entry_signal.py is DELETED. It is now that the predictive
+# strategy requires a TRAINED model AND real BTC feature data
+# (btc_model_entry_signal.py's own hard gates) REGARDLESS of how
+# favorable Polymarket's own book looks -- see
+# test_polymarket_engine.py's test_untrained_model_never_enters_even_with_a_qualifying_book
+# and test_missing_btc_history_never_enters_even_with_a_trained_model_and_qualifying_book
+# for the focused versions of this. The two tests below confirm the
+# SAME holds true specifically when btc_entry_signal.py's own bars
+# (fed via this file's _feed() fixtures elsewhere) are the ONLY BTC
+# data present -- a qualifying Polymarket book alone, with Coinbase
+# momentum evidence present but with NO price-to-beat (window_start
+# unset) and no trained model, still never enters.
 
 def _engine_harness(tmp_path: Path, market: BinaryMarket):
     from tests.test_polymarket_engine import _FakeClient
+    from src.polymarket.btc_direction_model import BtcDirectionModel
 
-    # POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED=1 -- this harness's
-    # tests are about whether BTC evidence is consulted at all, not
-    # about the (separate) persistence filter, so a single qualifying
-    # cycle should be immediately eligible, exactly as before that
-    # filter existed.
-    settings = PolymarketSettings.from_env(env={
-        "POLYMARKET_LOG_DIR": str(tmp_path), "POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED": "1",
-    })
+    settings = PolymarketSettings.from_env(env={"POLYMARKET_LOG_DIR": str(tmp_path)})
     client = _FakeClient(market)
     strategy = BtcMomentumStrategy()
     risk = PolymarketRiskManager(settings)
@@ -293,40 +295,37 @@ def _engine_harness(tmp_path: Path, market: BinaryMarket):
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
         pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        model=BtcDirectionModel.untrained(),
     )
 
 
-def test_g_a_qualifying_polymarket_ask_alone_enters_with_zero_btc_evidence(tmp_path):
-    """YES ask >= the 0.70 threshold, with zero Coinbase BTC evidence
-    fed and a big (irrelevant) Polymarket mid move in history -- DOES
-    enter under the current simple_entry_signal.py strategy; proves
-    btc_entry_signal.py's evidence (there is none here) was never
-    consulted to reach that decision."""
+def test_g_a_qualifying_polymarket_ask_alone_never_enters_without_a_trained_model(tmp_path):
+    """A heavily-favored YES ask, with an untrained model and no BTC
+    feature data -- NEVER enters under the predictive strategy,
+    regardless of how favorable Polymarket's own book looks. This is
+    the OPPOSITE premise from this test's pre-rewrite version (which
+    proved the OLD favored-side strategy didn't need BTC evidence);
+    simple_entry_signal.py is deleted, so there is no favored-side path
+    left to take at all."""
     market = _market(yes_bid=0.78, yes_ask=0.80)
     harness = _engine_harness(tmp_path, market)
     harness["history"].observe(market)
-    harness["history"].mids = [0.50, 0.60, 0.70]  # a big rising Polymarket move -- irrelevant either way
+    harness["history"].mids = [0.50, 0.60, 0.70]  # irrelevant -- nothing in production reads history.mids any more
 
     report = run_cycle(**harness)
 
-    assert report.entered is True
-    positions = harness["position_store"].load()
-    assert len(positions) == 1
-    assert positions[0].outcome == "YES"
+    assert report.entered is False
+    assert harness["position_store"].load() == []
 
 
-def test_h_an_exactly_tied_market_alone_never_enters(tmp_path):
-    """There is no probability threshold any more -- even a market
-    barely favoring one side enters (see test_g). The one case that
-    still correctly produces no trade is an EXACT tie (yes_bid ==
-    yes_ask == 0.50, so both sides' implied probabilities are exactly
-    0.50): neither side is favored, and this is never resolved by
-    guessing. The falling Polymarket mid history is irrelevant either
-    way, same as the rising one in test_g."""
+def test_h_an_exactly_tied_market_also_never_enters(tmp_path):
+    """Same hard gates apply regardless of whether Polymarket's book
+    happens to be tied or lopsided -- an untrained model with no BTC
+    feature data is NO TRADE either way."""
     market = _market(yes_bid=0.50, yes_ask=0.50)
     harness = _engine_harness(tmp_path, market)
     harness["history"].observe(market)
-    harness["history"].mids = [0.50, 0.45, 0.40]  # a big falling Polymarket move -- irrelevant either way
+    harness["history"].mids = [0.50, 0.45, 0.40]
 
     report = run_cycle(**harness)
 

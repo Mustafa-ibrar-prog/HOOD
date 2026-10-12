@@ -225,6 +225,17 @@ class BinaryMarket:
     token_id_no: str
     close_time: datetime
     fetched_at: datetime
+    # The 15-minute window's OPENING instant -- real metadata, derived
+    # the SAME way close_time already is (from the event slug's own
+    # confirmed btc-updown-<cadence>-YYYY-MM-DD-HHMMz schedule, see
+    # us_client._parse_btc_updown_window_from_slug), never guessed and
+    # never read off the order book. None only for a manually-overridden
+    # non-BTC-pattern slug, where no such schedule is confirmed. This is
+    # what btc_features.py anchors the contract's price-to-beat to (the
+    # BTC reference price AT this instant) -- see that module's
+    # docstring for why this is a proxy, not Polymarket's own
+    # Chainlink-based settlement source (paid-only, no free tier).
+    window_start: datetime | None = None
     # Best bid/ask for the YES token, in dollars (0.00-1.00), used ONLY
     # by strategy.py's directional signal. NO's own real book
     # (OrderBookSnapshot, fetched separately for the specific outcome

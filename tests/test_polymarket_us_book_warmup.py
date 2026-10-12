@@ -317,10 +317,12 @@ def test_3_persistent_not_found_through_the_entire_warmup_is_a_safe_no_trade(tmp
     history.observe(market)
     btc_price_store = BtcPriceHistoryStore(tmp_path / "btc.json")
 
+    from src.polymarket.btc_direction_model import BtcDirectionModel
     report = run_cycle(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
-        pending_store=pending_store, history=history, btc_price_store=btc_price_store, now=now,
+        pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        model=BtcDirectionModel.untrained(), now=now,
     )
 
     assert report.ran is True  # never crashed

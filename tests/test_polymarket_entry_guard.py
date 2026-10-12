@@ -22,12 +22,15 @@ individual tests here, in-process, to exercise the code path.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from src.execution.emergency_stop import EmergencyStopStore
+from src.market.models import PriceBar
+from src.polymarket.btc_direction_model import BtcDirectionModel
 from src.polymarket.client import NoActiveMarketError
 from src.polymarket.engine import MarketHistory, run_cycle
 from src.polymarket.entry_guard import check_entry_retry_guard
@@ -40,7 +43,6 @@ from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.strategy import BtcMomentumStrategy
-from tests.test_polymarket_dynamic_exit_replay import _strengthening_closes, _ticks_from_minute_closes
 
 _VALID_KEY = "0x" + "a" * 64
 # Fixed, fictional base for the UNIT tests below (check_entry_retry_guard
@@ -53,38 +55,38 @@ _VALID_KEY = "0x" + "a" * 64
 _NOW = datetime(2026, 10, 9, 18, 0, tzinfo=timezone.utc)
 
 
-def _feed_bullish_btc_near(btc_price_store, *, now: datetime) -> None:
-    """Feeds the same real, STRENGTHENING-when-framed-bullish BTC
-    price pattern test_polymarket_dynamic_exit_replay.py uses
-    (`_strengthening_closes`/seed=5), SHIFTED so its last tick lands
-    just before `now` -- unlike that module's own tests (which use a
-    fixed historical base time throughout), these scenario tests must
-    keep `now` anchored to the REAL wall clock: LivePolymarketGateway.
-    submit_order() always stamps a new PendingLiveOrder's created_at
-    from the real clock (gateway.py, never a test-injected `now` --
-    see its own call site), so entry_guard.py's cooldown-elapsed
-    arithmetic (`now - pending.created_at`) only means anything when
-    this test's own `now` tracks real time too. Shifting the fixed
-    fixture to end near whatever `now` the test is actually using
-    satisfies BOTH that constraint AND assess_btc_entry_direction's
-    own freshness gate.
+def _confident_model(favor: str = "UP") -> BtcDirectionModel:
+    """TEST-ONLY fixture (see test_polymarket_engine.py's identical
+    helper): an intercept-only model that ignores every feature and
+    always predicts strongly toward `favor`, so these scenario tests
+    get a qualifying predictive-entry candidate by construction,
+    without depending on any particular BTC price shape -- these
+    tests are about entry_guard.py's own idempotency behavior, not
+    about the model's predictive quality."""
+    intercept = 8.0 if favor == "UP" else -8.0
+    return BtcDirectionModel(
+        coefficients={}, intercept=intercept, feature_means={}, feature_stdevs={}, is_trained=True,
+        trained_at="test-fixture", training_example_count=1, data_source="synthetic",
+    )
 
-    The shift is rounded to a WHOLE number of minutes, deliberately --
-    a sub-minute shift would move every tick off the :00/:15/:30/:45-
-    second marks the fixture was generated on, re-bucketing some ticks
-    across BtcPriceHistoryStore.get_bars()'s own 60s-bucket boundaries
-    (anchored to the Unix epoch, not to this fixture). That changes
-    the resulting RSI/MACD/EMA values right at this fixture's own
-    margin (exactly min_strengthening_signals=2 fired signals) --
-    a real, observed flake (intermittent, real-wall-clock-second-
-    dependent test failures) this avoids entirely by preserving the
-    EXACT bucket alignment the fixture was verified under, regardless
-    of what real second `now` happens to land on."""
-    ticks, end_t = _ticks_from_minute_closes(_strengthening_closes(), seed=5)
-    whole_minutes = (now - end_t - timedelta(seconds=1)) // timedelta(minutes=1)
-    shift = timedelta(minutes=whole_minutes)
-    for price, at in ticks:
-        btc_price_store.record_quote(price, at=at + shift)
+
+def _window_start_for(now: datetime) -> datetime:
+    return (now - timedelta(minutes=12)).replace(second=0, microsecond=0)
+
+
+def _seed_sufficient_btc_history(btc_price_store, *, now: datetime, price: float = 65_000.0) -> None:
+    """Feeds a flat 1-minute bar series covering more than 15 minutes
+    before `now`, including one exactly at _window_start_for(now) --
+    enough for btc_features.BtcFeatureVector.has_minimum_data to be
+    True and for btc_features.resolve_price_to_beat() to resolve
+    cleanly (see test_polymarket_engine.py's identical helper)."""
+    window_start = _window_start_for(now)
+    bars = []
+    cursor = window_start - timedelta(minutes=10)
+    while cursor < now:
+        bars.append(PriceBar(start_time=cursor, open=price, high=price, low=price, close=price, volume=10.0))
+        cursor += timedelta(minutes=1)
+    btc_price_store.record_bars(bars)
 
 
 def _order(**overrides) -> OrderRequest:
@@ -356,14 +358,16 @@ def _market(**overrides) -> BinaryMarket:
     the unit tests above, BinaryMarket.data_age_seconds/seconds_to_close
     (read by risk.py's freshness/cutoff checks, exercised end to end by
     the run_cycle() scenario tests below) always compare against REAL
-    datetime.now(timezone.utc) internally, never a test-injected `now`."""
+    datetime.now(timezone.utc) internally, never a test-injected `now`.
+    window_start defaults to None here (callers that need an entry to
+    actually happen pass one explicitly, matching whatever `now`
+    _live_harness() below is using -- see that function's own
+    docstring on why this is computed once and threaded through,
+    never re-derived independently per market)."""
     now = datetime.now(timezone.utc)
     defaults = dict(
         condition_id="c1", question="Will BTC be up?", token_id_yes="y", token_id_no="n",
-        # close_time within the simple-entry 300s window, and yes_ask
-        # >= the 0.70 threshold (see simple_entry_signal.py) -- the
-        # ONLY production entry-direction logic as of this round. A
-        # tight 2-cent spread so risk.py's own check_spread never
+        # A tight 2-cent spread so risk.py's own check_spread never
         # independently blocks these (unrelated to what each test
         # actually exercises).
         close_time=now + timedelta(seconds=200), fetched_at=now, yes_bid=0.72, yes_ask=0.74,
@@ -372,22 +376,18 @@ def _market(**overrides) -> BinaryMarket:
     return BinaryMarket(**defaults)
 
 
-def _live_harness(tmp_path: Path, market: BinaryMarket, placer: _FakePlacer, *, now: datetime | None = None, **settings_overrides):
+def _live_harness(tmp_path: Path, market: BinaryMarket, placer: _FakePlacer, *, now: datetime | None = None, model: BtcDirectionModel | None = None, **settings_overrides):
     now = now or datetime.now(timezone.utc)
+    window_start = _window_start_for(now)
+    market = replace(market, window_start=window_start)
     env = dict(
         POLYMARKET_LOG_DIR=str(tmp_path), POLYMARKET_TRADING_MODE="live", POLYMARKET_PRIVATE_KEY=_VALID_KEY,
         POLYMARKET_LIVE_TRADING_CONFIRMED="true", POLYMARKET_LIVE_AUTO_EXECUTE="true",
-        # These tests are about the entry retry guard's own idempotency
-        # behavior (unknown/rejected results, cooldowns, price-change
-        # overrides), not the persistence filter -- required=1 so a
-        # single qualifying cycle is immediately eligible, exactly as
-        # before that filter existed. The persistence filter has its
-        # own dedicated tests in test_polymarket_engine.py.
-        POLYMARKET_SIMPLE_ENTRY_PERSISTENCE_REQUIRED="1",
     )
     env.update(settings_overrides)
     settings = PolymarketSettings.from_env(env=env)
     client = _FakeLiveClient(market)
+    client.window_start = window_start  # test convenience -- never unpacked into run_cycle()
     strategy = BtcMomentumStrategy()
     risk = PolymarketRiskManager(settings)
     logger = PolymarketDecisionLogger(tmp_path / "decisions.jsonl", also_console=False)
@@ -402,21 +402,17 @@ def _live_harness(tmp_path: Path, market: BinaryMarket, placer: _FakePlacer, *, 
     btc_price_store_path = tmp_path / "btc.json"
     from src.polymarket.btc_market_data import BtcPriceHistoryStore
     btc_price_store = BtcPriceHistoryStore(btc_price_store_path)
-    # engine.run_cycle()'s entry path is now driven by Coinbase BTC
-    # evidence (see btc_entry_signal.py), not Polymarket mid-price
-    # history -- feed real, materially-bullish BTC bars, shifted to end
-    # near THIS harness's own `now` (see _feed_bullish_btc_near), so
-    # every test below gets a qualifying YES candidate by default,
-    # exactly like the old `history.mids` seed used to provide. A test
-    # that needs a materially DIFFERENT price point (scenario 3) still
-    # mutates `history.mids`/the market's own book for THAT purpose --
-    # unrelated to entry direction now, but still read by
-    # exit_manager's Polymarket microstructure signal.
-    _feed_bullish_btc_near(btc_price_store, now=now)
+    # A confident (test-fixture) model + enough real BTC bar history
+    # for the predictive pipeline's own hard gates to clear -- see
+    # _confident_model()/_seed_sufficient_btc_history() above. These
+    # tests are about entry_guard.py's own idempotency behavior, not
+    # the model's predictive quality.
+    _seed_sufficient_btc_history(btc_price_store, now=now)
     return dict(
         settings=settings, client=client, strategy=strategy, risk_manager=risk, gateway=gateway,
         decision_logger=logger, state_store=state_store, position_store=position_store,
         pending_store=pending_store, history=history, btc_price_store=btc_price_store,
+        model=model or _confident_model("UP"),
     )
 
 
@@ -474,8 +470,7 @@ def test_scenario_3_a_materially_changed_price_permits_a_later_retry(tmp_path):
 
     # The market moves meaningfully -- a real new ask, well past the
     # min_price_change threshold, still within the long cooldown window.
-    harness["client"].set_market(_market(yes_bid=0.80, yes_ask=0.82))
-    harness["history"].mids = [0.50, 0.65, 0.80]
+    harness["client"].set_market(_market(yes_bid=0.80, yes_ask=0.82, window_start=harness["client"].window_start))
 
     second = run_cycle(**harness, now=now + timedelta(seconds=15))
     assert len(placer.place_order_calls) == 2  # the retry was allowed through
@@ -500,10 +495,12 @@ def test_scenario_4_a_genuinely_new_market_is_not_blocked_by_the_previous_market
 
     # A genuinely new 15-minute market -- same price/signal shape, but a
     # DIFFERENT condition_id -- must never be blocked by market-a's guard.
-    market_b = _market(condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.72, yes_ask=0.74)
+    market_b = _market(
+        condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.72, yes_ask=0.74,
+        window_start=harness["client"].window_start,
+    )
     harness["client"].set_market(market_b)
     harness["history"].observe(market_b)  # resets the mid-price buffer for the new market
-    harness["history"].mids = [0.50, 0.55, 0.60]
 
     second = run_cycle(**harness, now=now + timedelta(seconds=15))
     assert len(placer.place_order_calls) == 2  # market-b's entry was never blocked by market-a's guard
@@ -662,13 +659,15 @@ def test_two_distinct_markets_can_both_occupy_the_max_open_positions_limit(tmp_p
     assert first.entered is True
     assert len(harness["position_store"].load()) == 1
 
-    market_b = _market(condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.72, yes_ask=0.74)
+    market_b = _market(
+        condition_id="market-b", token_id_yes="yb", token_id_no="nb", yes_bid=0.72, yes_ask=0.74,
+        window_start=harness["client"].window_start,
+    )
     harness["client"].set_market(market_b)
     harness["client"].set_fill_result("ex-b", FillResult(
         order_id="ex-b", status="filled", requested_shares=7.0, filled_shares=7.0, avg_fill_price=0.62,
     ))
     harness["history"].observe(market_b)
-    harness["history"].mids = [0.50, 0.55, 0.60]
 
     second = run_cycle(**harness, now=now + timedelta(seconds=15))
     assert second.entered is True  # market-b's entry succeeded too -- at the cap, not over it

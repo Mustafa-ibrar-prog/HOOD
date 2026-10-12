@@ -4,35 +4,37 @@ by scripts/run_polymarket_bot.py's loop rather than per-cycle by an
 external scheduler, since nothing here needs an agent to relay data
 (client.py calls the real API directly).
 
-PRODUCTION STRATEGY (as of this round): a deliberately simple,
-Polymarket-price-only, fully autonomous strategy -- see
-simple_entry_signal.py (entry) and take_profit.py (exit: a
-configurable +10% take-profit AND a configurable -20% stop-loss, both
-settings-driven, never hard-coded). Entry is evaluated continuously
-across the FULL 15-minute market, at ANY point while it is open --
-there is no "only in the final N minutes" restriction, and there is NO
-fixed implied-probability threshold either: the bot simply takes
-whichever side the market currently favors, autonomously, with no
-manual YES/NO selection required for normal operation. Two further,
-independent filters sit on top of that favored-side rule, both
-settings-driven (see simple_entry_signal.py and MarketHistory below):
-  - A MINIMUM EDGE: the gap between the two sides' own implied
-    probabilities must be at least settings.simple_min_entry_edge
-    (default 0.10) -- never a reintroduction of the old fixed ">=0.70"
-    floor on one side, always a RELATIVE gap requirement between both.
-  - PERSISTENCE: the same favored, edge-qualified outcome must hold
-    for settings.simple_entry_persistence_required (default 3)
-    CONSECUTIVE cycles, for the SAME market, before a submission is
-    allowed -- never a single noisy snapshot. A flipped favored side,
-    an edge that falls back below the minimum, a tie, or missing book
-    data all reset this counter.
-Coinbase BTC intelligence (btc_entry_signal.py), the settlement-
-reference divergence check (reference_divergence.py), confidence
-scoring (entry_confidence.py), and historical self-learning
-(trade_learning.py's adjustment machinery) are NOT CALLED from
-run_cycle() at all -- they remain in the codebase, with their own
-tests, in case they're wanted again later, but none of them
-influences a live entry or exit decision any more. trade_learning.
+PRODUCTION STRATEGY (as of this round): a PREDICTIVE strategy -- a
+real BTC direction model (btc_direction_model.py) estimates P(UP)/
+P(DOWN) for the CURRENT 15-minute contract from live BTC market data
+(btc_features.py), and the entry decision comes from that model's
+EDGE over what Polymarket currently charges to buy each side
+(btc_model_entry_signal.py), never from which side Polymarket itself
+currently favors. THIS REPLACES THE OLD FAVORED-SIDE STRATEGY ENTIRELY:
+simple_entry_signal.py (direction = whichever side has the higher
+Polymarket-implied probability), its minimum-edge filter
+(simple_min_entry_edge -- a gap between the two Polymarket sides, not
+a model's edge over the market) and its persistence filter
+(simple_entry_persistence_required) are all DELETED, not merely
+unused -- that module, its settings, and MarketHistory's old
+persistence-tracking fields no longer exist in this codebase. There is
+exactly ONE authoritative production entry decision now; see
+btc_model_entry_signal.assess_model_entry()'s own docstring for its
+exact formula and hard gates (untrained model, insufficient feature
+data, missing book data all fail closed to NO_TRADE).
+
+take_profit.py (exit: a configurable +10% take-profit AND a
+configurable -20% stop-loss, both settings-driven, never hard-coded)
+is UNCHANGED by this round -- position management is infrastructure,
+not strategy, and stays exactly as it was. Coinbase BTC intelligence
+(btc_entry_signal.py/btc_intelligence.py -- the EARLIER, qualitative
+evidence-cascade approach, never probabilistic and already dormant
+since before this round), the settlement-reference divergence check
+(reference_divergence.py), confidence scoring (entry_confidence.py),
+and historical self-learning (trade_learning.py's adjustment
+machinery) remain NOT CALLED from run_cycle() -- they stay in the
+codebase, with their own tests, in case wanted again later, but none
+of them influences a live entry or exit decision. trade_learning.
 CompletedTradeStore is still used, but only for its RECORD-KEEPING
 role (record_completed_trade at settlement/exit) -- never for its
 historical-adjustment role, which this module never calls.
@@ -53,7 +55,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from src.polymarket import reconciliation
-from src.polymarket.btc_market_data import BtcPriceHistoryStore
+from src.polymarket.btc_direction_model import BtcDirectionModel
+from src.polymarket.btc_features import compute_btc_features, resolve_price_to_beat
+from src.polymarket.btc_market_data import BtcPriceHistoryStore, compute_feed_status
+from src.polymarket.btc_model_entry_signal import assess_model_entry
 from src.polymarket.client import NoActiveMarketError, PolymarketClient
 from src.polymarket.entry_guard import check_entry_retry_guard
 from src.polymarket.gateway import ExecutionGateway
@@ -63,12 +68,11 @@ from src.polymarket.pending import PolymarketPendingOrderStore
 from src.polymarket.positions import PolymarketPositionStore
 from src.polymarket.risk import PolymarketRiskManager
 from src.polymarket.settings import PolymarketSettings
-from src.polymarket.simple_entry_signal import assess_simple_entry
 from src.polymarket.single_book import is_single_book_market, to_no_perspective
 from src.polymarket.state import DailyPnlStateStore
 from src.polymarket.strategy import BtcMomentumStrategy
 from src.polymarket.take_profit import check_and_execute_take_profits
-from src.polymarket.trade_learning import CompletedTradeStore, STRATEGY_ID_SIMPLE_PRICE_THRESHOLD, record_completed_trade
+from src.polymarket.trade_learning import CompletedTradeStore, STRATEGY_ID_BTC_PREDICTIVE_MODEL, record_completed_trade
 
 
 @dataclass
@@ -85,57 +89,27 @@ class CycleReport:
 @dataclass
 class MarketHistory:
     """In-memory only, by design: a restart losing a few minutes of this
-    particular market's own price history is an acceptable cost (the
-    strategy just waits for min_samples again), far cheaper than adding
-    another file-backed store for data that's only ever useful within
-    one 15-minute window.
-
-    Also the home of the ENTRY PERSISTENCE tracker (Change 3 of this
-    round's strategy update): the same per-market, in-memory,
-    restart-losable lifecycle already proven for `mids` above is
-    exactly what persistence needs too -- see observe_entry_candidate()
-    below. Both reset together, on the same condition_id change, by
-    the same observe() call -- there is deliberately no separate
-    "reset persistence" call site anywhere else."""
+    particular market's own price history is an acceptable cost, far
+    cheaper than adding another file-backed store for data that's only
+    ever useful within one 15-minute window. Harmless bookkeeping --
+    nothing in the production path reads history.mids any more (the
+    predictive model reads btc_price_store's own BTC bar history
+    instead, keyed by real timestamp, not by this per-market list) --
+    kept purely in case a future strategy wants a per-market Polymarket
+    mid-price trail again. An EARLIER round's entry-persistence tracker
+    lived here too; it was deleted along with simple_entry_signal.py
+    (see engine.py's module docstring) rather than kept as dead code."""
 
     condition_id: str | None = None
     mids: list[float] = field(default_factory=list)
-    persistent_outcome: str | None = None
-    consecutive_qualifying_observations: int = 0
 
     def observe(self, market: BinaryMarket) -> list[float]:
         if market.condition_id != self.condition_id:
             self.condition_id = market.condition_id
             self.mids = []
-            self.persistent_outcome = None
-            self.consecutive_qualifying_observations = 0
         if market.yes_mid is not None:
             self.mids.append(market.yes_mid)
         return list(self.mids)
-
-    def observe_entry_candidate(self, outcome: str | None, *, required: int) -> bool:
-        """Call exactly once per cycle, for THIS market (after
-        observe() above has already run this cycle), with
-        simple_entry_signal.SimpleEntrySignal.outcome -- the favored
-        side AFTER the minimum-edge filter already applied, so `None`
-        here uniformly covers every reset condition at once: a tied
-        market, missing book data, OR an edge that fell below the
-        configured minimum (see simple_entry_signal.py). Returns True
-        only once the SAME outcome has been observed on `required`
-        CONSECUTIVE calls for this market; a different outcome (the
-        favored side flipped) restarts the count at 1 rather than 0,
-        since THIS cycle still qualifies -- it just starts a new run
-        for the new side."""
-        if outcome is None:
-            self.persistent_outcome = None
-            self.consecutive_qualifying_observations = 0
-            return False
-        if outcome != self.persistent_outcome:
-            self.persistent_outcome = outcome
-            self.consecutive_qualifying_observations = 1
-        else:
-            self.consecutive_qualifying_observations += 1
-        return self.consecutive_qualifying_observations >= max(1, required)
 
 
 def settle_resolved_positions(
@@ -190,6 +164,7 @@ def run_cycle(
     pending_store: PolymarketPendingOrderStore,
     history: MarketHistory,
     btc_price_store: BtcPriceHistoryStore,
+    model: BtcDirectionModel,
     btc_feed_source: str = "manual",
     trade_store: CompletedTradeStore | None = None,
     reference_price_store: BtcPriceHistoryStore | None = None,
@@ -263,23 +238,23 @@ def run_cycle(
 
     # The now-aware computation, NEVER BinaryMarket.seconds_to_close
     # (which reads real wall-clock time and would make this
-    # non-deterministic under a test's fixed `now`) -- kept purely for
-    # logging/record-keeping (trade_learning.py's seconds_remaining_at_entry
-    # bucketing). There is no "too early to evaluate" gate any more:
-    # the simple entry signal is evaluated every cycle across the FULL
-    # 15-minute market, not only its final minutes.
+    # non-deterministic under a test's fixed `now`) -- used for both
+    # logging and the model's own time_remaining feature. There is no
+    # "too early to evaluate" gate: the model is evaluated every cycle
+    # across the FULL 15-minute market, not only its final minutes.
     close_time = market.close_time if market.close_time.tzinfo else market.close_time.replace(tzinfo=timezone.utc)
     seconds_remaining = (close_time - now).total_seconds()
 
-    # --- CHECK REAL YES/NO IMPLIED PROBABILITY (see simple_entry_signal.py
-    # and single_book.py). On a genuinely TWO-book venue (international
-    # Polymarket), YES's and NO's own real, independent order books are
-    # both fetched. On a SINGLE-book venue (Polymarket US -- detected
-    # structurally via token_id_yes == token_id_no, never a venue name
-    # or setting), there is only ONE real book to fetch: fetching
-    # "NO's own book" a second time would return the exact same data
-    # under a different name and misread it as a second, independent
-    # price (the exact bug this round fixes -- identical YES_ASK/NO_ASK
+    # --- FETCH THE REAL UP(YES)/DOWN(NO) ORDER BOOKS (see
+    # single_book.py) -- UNCHANGED infrastructure from earlier rounds.
+    # On a genuinely TWO-book venue (international Polymarket), YES's
+    # and NO's own real, independent order books are both fetched. On
+    # a SINGLE-book venue (Polymarket US -- detected structurally via
+    # token_id_yes == token_id_no, never a venue name or setting),
+    # there is only ONE real book to fetch: fetching "NO's own book" a
+    # second time would return the exact same data under a different
+    # name and misread it as a second, independent price (the
+    # original pricing bug this fixes -- identical YES_ASK/NO_ASK
     # readings in the logs). single_book.to_no_perspective() derives
     # NO's own economically-correct view of that SAME one real book
     # instead -- never a second fetch.
@@ -301,65 +276,71 @@ def run_cycle(
             exits_submitted=exits_submitted,
         )
 
-    signal = assess_simple_entry(
-        yes_order_book=yes_order_book, no_order_book=no_order_book, min_entry_edge=settings.simple_min_entry_edge,
+    # --- THE PREDICTIVE ENTRY DECISION (see btc_features.py/
+    # btc_direction_model.py/btc_model_entry_signal.py's own
+    # docstrings for the full formula and hard gates) -- the ONLY
+    # production entry logic as of this round. price_to_beat is a
+    # PROXY anchored to market.window_start (real metadata from the
+    # event's own confirmed slug schedule), never Polymarket's own
+    # order book and never hardcoded -- see btc_features.
+    # resolve_price_to_beat()'s own docstring for exactly why.
+    #
+    # STALENESS: reuses the EXISTING compute_feed_status() gate
+    # (btc_market_data.py, already proven under btc_intelligence.py/
+    # btc_entry_signal.py) rather than a second, independently-written
+    # check -- a feed that built real history and then went silent
+    # (provider outage) must degrade to "no usable bars," never keep
+    # feeding an increasingly-stale price into a confident-looking
+    # prediction.
+    btc_bars = btc_price_store.get_bars(interval_seconds=60, now=now)
+    feed_status = compute_feed_status(btc_bars, max_bar_age_seconds=settings.btc_max_bar_age_seconds, source=btc_feed_source, now=now)
+    fresh_bars = btc_bars if feed_status.status == "FRESH" else []
+    price_to_beat = (
+        resolve_price_to_beat(bars=fresh_bars, raw_samples=btc_price_store.load(), window_start=market.window_start)
+        if market.window_start is not None else None
     )
+    features = compute_btc_features(fresh_bars, at=now, price_to_beat=price_to_beat, close_time=close_time)
+    prediction = model.predict(features)
+
     decision_logger.log_decision(
-        kind="simple_entry_signal",
+        kind="btc_model_prediction",
         reason=(
-            f"YES_BID={signal.yes_bid} YES_ASK={signal.yes_ask} MARKET_MIDPOINT={signal.market_midpoint} "
-            f"YES_IMPLIED_PROBABILITY={signal.yes_implied_probability} "
-            f"NO_IMPLIED_PROBABILITY={signal.no_implied_probability} EDGE={signal.edge} "
-            f"MIN_ENTRY_EDGE={settings.simple_min_entry_edge} SELECTED_OUTCOME={signal.outcome} "
-            f"EXECUTABLE_ENTRY_PRICE={signal.executable_entry_price} "
-            f"REMAINING_SECONDS={seconds_remaining:.0f} {signal.reason}"
+            f"BTC_PRICE={features.current_price} PRICE_TO_BEAT={features.price_to_beat} "
+            f"DISTANCE_TO_BEAT={features.distance_from_price_to_beat} TIME_REMAINING={seconds_remaining:.0f} "
+            f"MODEL_UP_PROBABILITY={prediction.predicted_up_probability:.4f} "
+            f"MODEL_DOWN_PROBABILITY={prediction.predicted_down_probability:.4f} "
+            f"MODEL_IS_TRAINED={prediction.is_trained} BAR_COUNT={features.bar_count} "
+            f"BTC_FEED_STATUS={feed_status.status}"
         ),
         evidence={
-            "condition_id": market.condition_id, "single_book_market": single_book_market,
-            "yes_bid": signal.yes_bid, "yes_ask": signal.yes_ask, "market_midpoint": signal.market_midpoint,
-            "yes_implied_probability": signal.yes_implied_probability,
-            "no_implied_probability": signal.no_implied_probability, "edge": signal.edge,
-            "min_entry_edge": settings.simple_min_entry_edge, "outcome": signal.outcome,
-            "executable_entry_price": signal.executable_entry_price, "remaining_seconds": seconds_remaining,
+            "condition_id": market.condition_id, **features.to_log_fields(), **prediction.to_log_fields(),
+            "has_minimum_feature_data": features.has_minimum_data, "bar_count": features.bar_count,
+            "btc_feed_status": feed_status.status, "btc_feed_source": feed_status.source,
+            "btc_bar_age_seconds": feed_status.bar_age_seconds,
         },
     )
 
-    # Entry PERSISTENCE (Change 3): called every cycle, regardless of
-    # outcome, so a tie/missing-data/insufficient-edge cycle correctly
-    # resets the counter too (see MarketHistory.observe_entry_candidate's
-    # own docstring) -- never only called on the "would otherwise
-    # qualify" path, which would silently let a flip-flopping signal
-    # keep a stale count alive across a cycle that should have reset it.
-    persistence_satisfied = history.observe_entry_candidate(
-        signal.outcome, required=settings.simple_entry_persistence_required,
+    signal = assess_model_entry(
+        prediction=prediction, up_order_book=yes_order_book, down_order_book=no_order_book,
+        has_minimum_feature_data=features.has_minimum_data, min_model_edge=settings.model_min_edge,
+        fee_pct=settings.model_fee_pct, slippage_pct=settings.model_slippage_pct,
+    )
+    decision_logger.log_decision(
+        kind="btc_model_entry_signal",
+        reason=(
+            f"MARKET_UP_PROBABILITY={signal.market_up_probability} MARKET_DOWN_PROBABILITY={signal.market_down_probability} "
+            f"UP_EDGE={signal.up_edge} DOWN_EDGE={signal.down_edge} SELECTED_OUTCOME={signal.outcome} "
+            f"EXECUTABLE_ENTRY_PRICE={signal.executable_entry_price} DECISION={signal.decision} REASON={signal.reason}"
+        ),
+        evidence={"condition_id": market.condition_id, "single_book_market": single_book_market, **signal.to_log_fields()},
     )
 
     if signal.outcome is None:
         decision_logger.log_decision(
             kind="no_trade", reason=signal.reason,
             evidence={
-                "question": market.question, "rejection_reason": "no_qualifying_probability",
-                "remaining_seconds": seconds_remaining, "yes_implied_probability": signal.yes_implied_probability,
-                "no_implied_probability": signal.no_implied_probability, "edge": signal.edge,
-            },
-        )
-        return CycleReport(
-            ran=True, market_question=market.question, settled_count=settled, reconciled_count=reconciled,
-            exits_submitted=exits_submitted,
-        )
-
-    if not persistence_satisfied:
-        decision_logger.log_decision(
-            kind="entry_persistence_pending",
-            reason=(
-                f"{signal.outcome} on {market.condition_id} is favored and edge-qualified "
-                f"({history.consecutive_qualifying_observations}/{settings.simple_entry_persistence_required} "
-                "consecutive observations) -- waiting for persistence before entering"
-            ),
-            evidence={
-                "condition_id": market.condition_id, "outcome": signal.outcome, "edge": signal.edge,
-                "consecutive_qualifying_observations": history.consecutive_qualifying_observations,
-                "persistence_required": settings.simple_entry_persistence_required,
+                "question": market.question, "rejection_reason": "no_model_edge",
+                "remaining_seconds": seconds_remaining, **signal.to_log_fields(),
             },
         )
         return CycleReport(
@@ -371,10 +352,9 @@ def run_cycle(
     token_id = market.token_id_for(outcome)
     # The SAME order book already fetched above for this outcome --
     # never re-fetched, never inferred from the other side. best_ask is
-    # guaranteed not-None here: assess_simple_entry only ever returns a
-    # non-None outcome when that side's own midpoint was favored over
-    # the other's, which is itself only possible when both bid and ask
-    # (and so best_ask) exist.
+    # guaranteed not-None here: assess_model_entry only ever returns a
+    # non-None outcome when that side's own real ask was available and
+    # its net edge cleared the configured minimum.
     order_book = yes_order_book if outcome == "YES" else no_order_book
 
     # Hard ceiling the exchange will not cross, anchored to the REAL
@@ -424,37 +404,39 @@ def run_cycle(
     decision_logger.log_decision(
         kind="entry_allowed",
         reason=(
-            f"SELECTED_OUTCOME={outcome} MARKET_MIDPOINT={signal.market_midpoint} "
-            f"YES_IMPLIED_PROBABILITY={signal.yes_implied_probability} "
-            f"NO_IMPLIED_PROBABILITY={signal.no_implied_probability} EDGE={signal.edge} "
-            f"PERSISTENCE={history.consecutive_qualifying_observations}/{settings.simple_entry_persistence_required} "
+            f"SELECTED_OUTCOME={outcome} MODEL_UP_PROBABILITY={prediction.predicted_up_probability:.4f} "
+            f"MODEL_DOWN_PROBABILITY={prediction.predicted_down_probability:.4f} "
+            f"UP_EDGE={signal.up_edge} DOWN_EDGE={signal.down_edge} "
             f"EXECUTABLE_ENTRY_PRICE={signal.executable_entry_price} SIZE=${size_usd:.2f} "
             f"REMAINING_SECONDS={seconds_remaining:.0f} ENTRY_DECISION=ALLOW"
         ),
         evidence={
             "condition_id": market.condition_id, "selected_outcome": outcome,
-            "yes_implied_probability": signal.yes_implied_probability,
-            "no_implied_probability": signal.no_implied_probability, "edge": signal.edge,
-            "consecutive_qualifying_observations": history.consecutive_qualifying_observations,
-            "executable_entry_price": signal.executable_entry_price,
+            **prediction.to_log_fields(), **signal.to_log_fields(),
             "actual_allowed_size_usd": size_usd, "remaining_seconds": seconds_remaining,
             "entry_price": order_book.best_ask, "spread": market.yes_spread_pct, "liquidity": entry_liquidity_usd,
             "decision": "ALLOW",
         },
     )
 
-    # Snapshot of exactly what this cycle's own simple entry pipeline
+    # Snapshot of exactly what this cycle's own predictive pipeline
     # computed -- attached to the resulting OpenPosition (see
     # positions.py) so trade_learning.py's RECORD-KEEPING (never its
     # historical-adjustment machinery, which this module never calls)
     # can still journal this decision, whatever is actually available.
     entry_context = {
-        "strategy_id": STRATEGY_ID_SIMPLE_PRICE_THRESHOLD,
+        "strategy_id": STRATEGY_ID_BTC_PREDICTIVE_MODEL,
         "market_question": market.question,
-        "yes_implied_probability_at_entry": signal.yes_implied_probability,
-        "no_implied_probability_at_entry": signal.no_implied_probability,
-        "edge_at_entry": signal.edge,
-        "consecutive_qualifying_observations_at_entry": history.consecutive_qualifying_observations,
+        "model_up_probability_at_entry": prediction.predicted_up_probability,
+        "model_down_probability_at_entry": prediction.predicted_down_probability,
+        "model_version_at_entry": prediction.model_version,
+        "model_data_source_at_entry": prediction.data_source,
+        "btc_price_at_entry": features.current_price,
+        "price_to_beat_at_entry": features.price_to_beat,
+        "market_up_probability_at_entry": signal.market_up_probability,
+        "market_down_probability_at_entry": signal.market_down_probability,
+        "up_edge_at_entry": signal.up_edge,
+        "down_edge_at_entry": signal.down_edge,
         "executable_entry_price_at_entry": signal.executable_entry_price,
         "polymarket_yes_bid": market.yes_bid,
         "polymarket_yes_ask": market.yes_ask,
@@ -466,7 +448,10 @@ def run_cycle(
     order = OrderRequest(
         condition_id=market.condition_id, token_id=token_id, outcome=outcome, side="BUY",
         size_usd=size_usd, max_price=max_price, close_time=market.close_time,
-        reason=f"simple_entry: market currently favors {outcome}",
+        reason=(
+            f"btc_model_entry: model P({outcome})={prediction.predicted_up_probability if outcome == 'YES' else prediction.predicted_down_probability:.4f} "
+            f"net edge {signal.up_edge if outcome == 'YES' else signal.down_edge:.4f}"
+        ),
         order_type=settings.default_order_type, single_book_market=single_book_market,
     )
     result = gateway.submit_order(order)
