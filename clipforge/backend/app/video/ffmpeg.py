@@ -28,7 +28,7 @@ def ffmpeg_available() -> bool:
     return shutil.which(settings.ffmpeg_bin) is not None and shutil.which(settings.ffprobe_bin) is not None
 
 
-def run(args: Sequence[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+def run(args: Sequence[str], timeout: Optional[int] = None, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     """Run a command, raising FFmpegError with the tail of stderr on failure."""
     log.debug("exec: %s", " ".join(map(str, args)))
     try:
@@ -38,6 +38,7 @@ def run(args: Sequence[str], timeout: Optional[int] = None) -> subprocess.Comple
             stderr=subprocess.PIPE,
             timeout=timeout or settings.ffmpeg_timeout_seconds,
             check=False,
+            cwd=str(cwd) if cwd else None,
         )
     except subprocess.TimeoutExpired as e:
         raise FFmpegError(f"{Path(str(args[0])).name} timed out after {e.timeout}s") from e

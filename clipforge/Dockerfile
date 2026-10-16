@@ -10,6 +10,8 @@ FROM python:3.12-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg fonts-inter fonts-dejavu-core fontconfig \
  && rm -rf /var/lib/apt/lists/*
+# yt-dlp needs a JavaScript runtime (Deno >= 2.3) to solve YouTube's player challenges
+COPY --from=denoland/deno:bin-2.4.0 /deno /usr/local/bin/deno
 WORKDIR /app/backend
 COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

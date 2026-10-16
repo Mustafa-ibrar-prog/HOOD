@@ -16,7 +16,7 @@ from .config import public_config, settings
 from .ingest.url_validation import UrlValidationError, parse_youtube_url
 from .jobs import executor, new_job_id, store
 from .models import CreateJobRequest, Job, JobOptions, JobStatus, UpdateClipRequest
-from .pipeline import apply_clip_edit, captions_for, clip_bounds_valid, load_units, process_job, render_one
+from .pipeline import _unlink_quietly, apply_clip_edit, captions_for, clip_bounds_valid, load_units, process_job, render_one
 from .storage import storage
 from .video.ffmpeg import ffmpeg_available
 
@@ -197,7 +197,7 @@ def delete_clip(job_id: str, clip_id: str) -> Job:
     clips_dir = store.dir(job_id) / "clips"
     for f in (clip.file, clip.thumbnail):
         if f:
-            (clips_dir / f).unlink(missing_ok=True)
+            _unlink_quietly(clips_dir / f)
 
     def upd(j: Job) -> None:
         j.clips = [c for c in j.clips if c.id != clip_id]
@@ -262,7 +262,7 @@ def download_zip(job_id: str, background: BackgroundTasks):
             )
         title = job.source.title if job.source else job.request_url
         zf.writestr("clips.txt", f"{title}\n{job.request_url}\n\n" + "\n".join(lines))
-    background.add_task(lambda: zpath.unlink(missing_ok=True))
+    background.add_task(_unlink_quietly, zpath)
     return FileResponse(zpath, media_type="application/zip", filename=f"clips_{_safe_name(title, 40)}.zip")
 
 

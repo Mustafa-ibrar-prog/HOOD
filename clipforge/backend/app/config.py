@@ -46,7 +46,8 @@ MAX_CLIP_SECONDS = 60.0
 
 @dataclass
 class Settings:
-    data_dir: Path = field(default_factory=lambda: Path(_env("CLIPFORGE_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))))
+    # Resolved to an absolute path: ffmpeg is run with cwd set to job folders, so relative paths would break.
+    data_dir: Path = field(default_factory=lambda: Path(_env("CLIPFORGE_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))).resolve())
     storage_backend: str = field(default_factory=lambda: _env("STORAGE_BACKEND", "local"))  # local | s3
     s3_bucket: str = field(default_factory=lambda: _env("S3_BUCKET"))
     s3_prefix: str = field(default_factory=lambda: _env("S3_PREFIX", "clipforge/"))

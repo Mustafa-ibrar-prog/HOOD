@@ -8,6 +8,7 @@ source title says SAMPLE.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from .config import settings
@@ -58,6 +59,11 @@ SAMPLE_SCRIPT: list[str] = [
 ]
 
 
+def drawtext_font_arg(path: Path) -> str:
+    """``fontfile='C\\:/Windows/Fonts/arial.ttf':`` — drive-letter colon escaped for ffmpeg's option parser."""
+    return "fontfile='" + path.as_posix().replace(":", "\\:") + "':"
+
+
 def _scripted_transcript() -> Transcript:
     segments: list[Segment] = []
     t = 1.0
@@ -82,9 +88,12 @@ def sample_assets() -> tuple[Path, Transcript, SourceInfo]:
     if not video.exists():
         tmp = out_dir / "sample_v1.tmp.mp4"
         label = "SAMPLE VIDEO  -  synthetic demo  -  no real footage"
+        # Windows FFmpeg builds often can't resolve a default font for drawtext; point at Arial explicitly.
+        win_font = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arial.ttf"
+        font = drawtext_font_arg(win_font) if os.name == "nt" and win_font.exists() else ""
         vf = (
-            f"drawtext=text='{label}':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=h*0.12:box=1:boxcolor=black@0.5:boxborderw=14,"
-            "drawtext=text='%{pts\\:hms}':fontcolor=white:fontsize=56:x=(w-text_w)/2:y=h*0.45"
+            f"drawtext={font}text='{label}':fontcolor=white:fontsize=34:x=(w-text_w)/2:y=h*0.12:box=1:boxcolor=black@0.5:boxborderw=14,"
+            f"drawtext={font}text='%{{pts\\:hms}}':fontcolor=white:fontsize=56:x=(w-text_w)/2:y=h*0.45"
         )
         run([
             settings.ffmpeg_bin, "-y", "-v", "error",

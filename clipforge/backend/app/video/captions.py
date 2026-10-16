@@ -5,8 +5,10 @@ the ffmpeg filter graph — no extra dependencies.
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
+from typing import Optional, Sequence
 
 from ..models import CaptionLine, CaptionStyle, Word
 
@@ -42,6 +44,27 @@ def build_caption_lines(words: list[Word], clip_start: float, clip_end: float, w
         nxt = lines[i + 1].start if i + 1 < len(lines) else dur
         ln.end = round(min(max(ln.end, ln.start + 0.3), nxt if nxt - ln.end < 0.8 else ln.end + 0.3, dur), 3)
     return lines
+
+
+def windows_font_dirs() -> list[Path]:
+    dirs = [Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"]
+    if os.environ.get("LOCALAPPDATA"):
+        dirs.append(Path(os.environ["LOCALAPPDATA"]) / "Microsoft" / "Windows" / "Fonts")
+    return [d for d in dirs if d.is_dir()]
+
+
+def resolve_font(name: str, font_dirs: Optional[Sequence[Path]] = None, windows: Optional[bool] = None) -> str:
+    """On Windows, libass in common FFmpeg builds can't fall back to another font, so a
+    missing font means invisible captions. Use the requested font only if a file for it
+    is installed; otherwise use Arial (always present on Windows)."""
+    if not (os.name == "nt" if windows is None else windows):
+        return name
+    key = re.sub(r"[^a-z0-9]", "", name.lower())
+    for d in (windows_font_dirs() if font_dirs is None else font_dirs):
+        for f in d.iterdir():
+            if f.suffix.lower() in {".ttf", ".otf", ".ttc"} and re.sub(r"[^a-z0-9]", "", f.stem.lower()).startswith(key):
+                return name
+    return "Arial"
 
 
 def _ass_color(hex_rgb: str, alpha: int = 0) -> str:
@@ -96,7 +119,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,{style.font},{font_size},{primary},{highlight},{outline_c},&H80000000,-1,0,0,0,100,100,0,0,1,{outline},{round(2*scale,1)},{align},{margin_lr},{margin_lr},{margin_v},1
+Style: Cap,{resolve_font(style.font)},{font_size},{primary},{highlight},{outline_c},&H80000000,-1,0,0,0,100,100,0,0,1,{outline},{round(2*scale,1)},{align},{margin_lr},{margin_lr},{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

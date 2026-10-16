@@ -25,7 +25,17 @@ from .url_validation import UrlValidationError, parse_youtube_url
 log = logging.getLogger(__name__)
 
 # (regex on yt-dlp error text, user-facing message, code, retryable)
+_JS_HELP = ("Install Deno (Windows: winget install DenoLand.Deno · macOS: brew install deno · Linux: see deno.com), "
+            "run  pip install -U \"yt-dlp[default]\"  and restart the ClipForge server.")
+
 _ERROR_MAP: list[tuple[str, str, str, bool]] = [
+    (r"no supported javascript runtime|signature solving failed|n challenge solving failed|challenge solver|\bejs\b",
+     "yt-dlp could not solve YouTube's player challenge because no JavaScript runtime is available. " + _JS_HELP,
+     "ytdlp_js_runtime", False),
+    (r"requested format is not available|no video formats found",
+     "YouTube offered no downloadable video format. This usually means yt-dlp couldn't solve YouTube's player "
+     "challenge (" + _JS_HELP + ") or that yt-dlp is out of date (pip install -U \"yt-dlp[default]\").",
+     "no_formats", False),
     (r"private video", "This video is private. Only public videos can be processed.", "video_private", False),
     (r"members[- ]only|join this channel", "This video is restricted to channel members.", "video_members_only", False),
     (r"sign in to confirm your age|age[- ]restricted|inappropriate for some users",
@@ -50,10 +60,34 @@ _ERROR_MAP: list[tuple[str, str, str, bool]] = [
 
 def map_ytdlp_error(text: str) -> IngestError:
     low = text.lower()
+    detail = text.strip()[-1500:]
     for pattern, message, code, retryable in _ERROR_MAP:
         if re.search(pattern, low):
-            return IngestError(message, code, retryable)
-    return IngestError(f"Could not access this video: {text.strip()[:300]}", "ingest_failed", False)
+            return IngestError(message, code, retryable, detail)
+    return IngestError(f"Could not access this video: {text.strip()[:300]}", "ingest_failed", False, detail)
+
+
+class _CollectingLogger:
+    """Keeps yt-dlp's warnings (they explain *why* an extraction failed) without printing them."""
+
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    def debug(self, msg: str) -> None:
+        pass
+
+    info = debug
+
+    def warning(self, msg: str) -> None:
+        self.warnings.append(msg)
+
+    def error(self, msg: str) -> None:
+        self.warnings.append(msg)
+
+
+def _ingest_error(e: Exception, logger: "_CollectingLogger") -> IngestError:
+    # Warnings first: "no JavaScript runtime" is only ever a warning, followed by a generic error.
+    return map_ytdlp_error("\n".join(logger.warnings[-5:] + [str(e)]))
 
 
 def _ydl_base_opts() -> dict[str, Any]:
@@ -87,13 +121,12 @@ class YouTubeProvider(VideoProvider):
     def _extract(self, url: str) -> dict:
         import yt_dlp  # imported lazily so tests don't need it
 
+        logger = _CollectingLogger()
         try:
-            with yt_dlp.YoutubeDL({**_ydl_base_opts(), "skip_download": True}) as ydl:
+            with yt_dlp.YoutubeDL({**_ydl_base_opts(), "skip_download": True, "logger": logger}) as ydl:
                 info = ydl.extract_info(url, download=False)
-        except yt_dlp.utils.DownloadError as e:  # type: ignore[attr-defined]
-            raise map_ytdlp_error(str(e)) from e
-        except Exception as e:  # pragma: no cover - defensive
-            raise map_ytdlp_error(str(e)) from e
+        except Exception as e:  # DownloadError and anything unexpected
+            raise _ingest_error(e, logger) from e
         if not info:
             raise IngestError("YouTube returned no information for this video.", "video_unavailable")
         return info
@@ -241,11 +274,13 @@ class YouTubeProvider(VideoProvider):
             "ffmpeg_location": None if settings.ffmpeg_bin == "ffmpeg" else str(Path(settings.ffmpeg_bin).parent),
             "concurrent_fragment_downloads": 4,
         }
+        logger = _CollectingLogger()
+        opts["logger"] = logger
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([source.url])
-        except yt_dlp.utils.DownloadError as e:  # type: ignore[attr-defined]
-            raise map_ytdlp_error(str(e)) from e
+        except Exception as e:
+            raise _ingest_error(e, logger) from e
         candidates = [p for p in workdir.glob("source.*") if p.suffix in {".mp4", ".mkv", ".webm", ".mov"}]
         if not candidates:
             raise IngestError("The download finished but no video file was produced.", "download_failed", True)

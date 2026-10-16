@@ -108,6 +108,15 @@ def source_video_path(job_id: str) -> Optional[Path]:
     return None
 
 
+def _unlink_quietly(p: Path) -> None:
+    """Delete a file, tolerating Windows' refusal to delete files another process
+    (e.g. a browser streaming the old preview) still has open."""
+    try:
+        p.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("could not delete %s (%s); it will be removed by cleanup", p, e)
+
+
 # ---------------------------------------------------------------------------- rendering
 def render_one(job_id: str, clip_id: str) -> None:
     """Render (or re-render) a single clip, with a safe-layout retry on failure."""
@@ -153,7 +162,7 @@ def render_one(job_id: str, clip_id: str) -> None:
                    version=version, error=("; ".join(res.notes) or None))
         for f in old_files:  # remove superseded renders
             if f and f != res.path.name and f != res.thumbnail.name:
-                (clips_dir / f).unlink(missing_ok=True)
+                _unlink_quietly(clips_dir / f)
     except (RenderError, FFmpegError, OSError) as e:
         log.exception("render failed")
         set_status("failed", error=f"Rendering failed: {str(e)[:400]}")
@@ -256,7 +265,7 @@ def process_job(job_id: str) -> None:
         if not ok:
             raise RenderError("Every clip failed to render. See the clip errors for details.")
         if audio_path:
-            audio_path.unlink(missing_ok=True)  # transcript is saved; audio no longer needed
+            _unlink_quietly(audio_path)  # transcript is saved; audio no longer needed
 
         def done(j: Job) -> None:
             j.status, j.stage, j.progress = JobStatus.completed, "done", 100.0

@@ -79,13 +79,81 @@ URL ─▶ metadata & access checks ─▶ download (≤1080p) ─▶ timestampe
 
 ---
 
-## Setup
+## Windows quick start (PowerShell)
+
+These steps were written for Windows but **haven't been run on a Windows machine yet.** The Windows-specific code paths (font handling, FFmpeg path escaping, file locking) are unit-tested on Linux only. If a step fails, run `python scripts\doctor.py` and share its output and `doctor_report.json`.
+
+```powershell
+# 1. Tools (one time). Close and reopen PowerShell afterwards so PATH updates.
+winget install -e --id Git.Git
+winget install -e --id Python.Python.3.12
+winget install -e --id OpenJS.NodeJS.LTS
+winget install -e --id Gyan.FFmpeg          # full build: libass (captions) + libx264
+winget install -e --id DenoLand.Deno        # yt-dlp needs Deno >= 2.3 to download from YouTube
+
+# 2. Code
+git clone https://github.com/mustafa-ibrar-prog/hood.git
+cd hood
+git checkout claude/hopeful-hypatia-15ezib
+
+# 3. Web UI (built once; FastAPI then serves it)
+cd clipforge\frontend
+npm install
+npm run build
+
+# 4. Backend
+cd ..\backend
+py -3.12 -m venv .venv
+# If activation is blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements-dev.txt
+Copy-Item .env.example .env
+
+# 5. Check the setup, then the offline tests
+python scripts\doctor.py
+python -m pytest -m "not slow"
+
+# 6. Start the app, then open http://localhost:8000
+uvicorn app.main:app --port 8000
+```
+
+### Testing a real YouTube URL
+
+1. With the venv active in `clipforge\backend`, probe the URL first. This checks access and formats without downloading anything:
+   ```powershell
+   python scripts\doctor.py --url "https://www.youtube.com/watch?v=VIDEO_ID"
+   ```
+2. Run the full pipeline. This downloads the video, gets a transcript, analyses it, renders clips, and verifies every MP4 (duration ≤ 60 s, 9:16, audio, caption events, preview streaming, download, ZIP):
+   ```powershell
+   python scripts\doctor.py --url "https://www.youtube.com/watch?v=VIDEO_ID" --e2e --authorized
+   ```
+3. Then do the same in the browser: start `uvicorn app.main:app --port 8000`, open http://localhost:8000, paste the URL, tick the authorisation box, and click **Generate clips**.
+
+Pick a 5–20 minute public video **that has captions** for the first test (a talk or podcast clip). Without paid keys or faster-whisper, captions are the only transcript source. For videos without captions, run `pip install faster-whisper` (the first run downloads ~500 MB of model weights) or set `OPENAI_API_KEY`.
+
+### If YouTube ingestion fails
+
+The job and `doctor.py` report a specific code, plus yt-dlp's raw error (`doctor.py` prints the raw text):
+
+| Code | Meaning | Fix |
+|---|---|---|
+| `ytdlp_js_runtime` / `no_formats` | yt-dlp couldn't solve YouTube's player challenge | Install Deno ≥ 2.3, run `pip install -U "yt-dlp[default]"`, then open a new terminal |
+| `platform_bot_check` | YouTube wants to verify this IP isn't a bot (common on VPNs and cloud servers) | Turn off the VPN or proxy, or run from a home connection. ClipForge does not use cookies or logins to get around it |
+| `video_private` / `video_members_only` / `video_age_restricted` / `video_geo_blocked` / `video_drm` | Access-controlled video | Not supported, by design |
+| `network_error` | Can't reach YouTube | Check firewall or proxy settings |
+| `rate_limited` | HTTP 429 | Wait a few minutes |
+
+**Compliant alternative for your own videos when ingestion is blocked:** download the original file from YouTube Studio (Content → ⋮ → *Download*), which YouTube provides to channel owners. ClipForge doesn't have a local-file upload input yet. It would be a small addition: one new ingestion provider (the provider design already allows it).
+
+## Setup (macOS / Linux)
 
 Requirements: **Python 3.10+**, **Node 18+**, **FFmpeg** (with libass and libx264; standard distro builds have both).
 
 ```bash
-# 1. FFmpeg
-sudo apt install ffmpeg        # macOS: brew install ffmpeg   Windows: winget install ffmpeg
+# 1. FFmpeg + Deno (yt-dlp needs Deno >= 2.3 for YouTube)
+sudo apt install ffmpeg        # macOS: brew install ffmpeg deno
+curl -fsSL https://deno.land/install.sh | sh
 
 # 2. Backend
 cd clipforge/backend
@@ -156,15 +224,19 @@ What the tests cover:
 
 ## Status: what's verified and what isn't
 
-Verified in the development sandbox:
-- The full pipeline in demo mode: analysis, scoring, captions, all framing layouts, MP4 output, ZIP, editing and regeneration (`88+` tests passing).
-- Every frontend screen in Chromium, at desktop and mobile widths.
+Verified in the Linux development sandbox:
+- **Demo mode end to end**: analysis, scoring, captions, all framing layouts, MP4 output, ZIP, editing and regeneration. Also through a running server started with the `.env.example` settings.
+- **The non-demo URL path end to end**: YouTube is replaced by a local stand-in provider that returns real json3 auto-caption data. The run goes caption parsing → transcript strategy → analysis → 1080×1920 renders, and `doctor.py --e2e` verifies the outputs (`tests/test_url_pipeline.py`).
+- **Ingestion failure diagnosis**: in the sandbox, `doctor.py --url` reports YouTube as unreachable (`network_error`, raw cause: the proxy returns `Tunnel connection failed: 403 Forbidden`).
+- **Windows path handling** for FFmpeg filters (escaped drive-letter colons, fonts folder), checked with simulated paths.
+- 102 backend tests; frontend typecheck and build.
 
-**Not verified there:**
-- **Live YouTube ingestion.** The sandbox's network blocks youtube.com, so yt-dlp download and caption fetching were not exercised against real videos. The code uses yt-dlp's documented API, and the error mapping is unit-tested. Verify on a machine with internet access before relying on it. YouTube changes frequently, so keep `yt-dlp` updated (`pip install -U yt-dlp`). Some networks (for example datacenter IPs) get YouTube "confirm you're not a bot" checks; ClipForge reports that error clearly rather than working around it.
-- **Live LLM and STT calls.** No API keys were available. The Anthropic request is checked through the real SDK against a mock transport, but the live API was not called. The OpenAI-compatible analyser, OpenAI STT and faster-whisper were not run (Hugging Face model downloads were also blocked).
-- **Face tracking on real footage.** The tracking maths and the FFmpeg crop expression are tested, but OpenCV detection was only run on synthetic frames, which contain no faces. Speaker detection is a lightweight mouth-motion heuristic, not an audio-visual active-speaker model.
-- **S3 storage and the Docker image** were not built or exercised here.
+**Not verified yet:**
+- **A real YouTube download.** The sandbox can't reach YouTube. Run `doctor.py --url … --e2e --authorized` on a normal internet connection to verify it.
+- **Running on Windows itself.**
+- **Live LLM and STT calls.** No keys were available, and Hugging Face downloads were blocked.
+- **Face tracking on real faces.** The detection pipeline has only seen synthetic frames.
+- **S3 storage and the Docker image.**
 
 ## Layout
 

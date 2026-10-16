@@ -1,5 +1,6 @@
 """FFmpeg utilities, captions/ASS, reframing maths and real renders (needs ffmpeg)."""
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -177,3 +178,34 @@ def test_render_video_without_audio(tmp_path):
                     "-c:v", "libx264", "-preset", "ultrafast", str(src)], check=True)
     res = render_clip(src, 0, 5, [], RenderOptions(layout="blur"), tmp_path / "o.mp4")
     assert not probe(res.path).has_audio and res.duration <= 5.1
+
+
+# ---------------------------------------------------------------- Windows font handling (logic only; not run on Windows here)
+def test_resolve_font_windows_substitution(tmp_path):
+    from app.video.captions import resolve_font
+
+    (tmp_path / "arial.ttf").write_bytes(b"")
+    (tmp_path / "Montserrat-Bold.ttf").write_bytes(b"")
+    assert resolve_font("Inter", [tmp_path], windows=True) == "Arial"
+    assert resolve_font("Montserrat", [tmp_path], windows=True) == "Montserrat"
+    assert resolve_font("Inter", [tmp_path], windows=False) == "Inter"
+
+
+@needs_ffmpeg
+def test_subtitles_fontsdir_with_drive_letter_style_path(tmp_path):
+    """The exact filter syntax used on Windows (escaped colon in fontsdir) must parse and render."""
+    import shutil as sh
+
+    from app.video.render import _escape_filter_path
+
+    src_font = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+    if not src_font.exists():
+        pytest.skip("needs a Linux-style font path (simulates a Windows drive letter)")
+    fonts = tmp_path / "C:" / "Fonts"
+    fonts.mkdir(parents=True)
+    sh.copy(src_font, fonts / "arial.ttf")
+    ass = write_ass([CaptionLine(start=0, end=1, text="Hi", words=[])], CaptionStyle(font="Arial"), 360, 640, tmp_path / "c.ass")
+    vf = f"subtitles=filename='{_escape_filter_path(Path(ass.name))}':fontsdir='{_escape_filter_path(fonts)}'"
+    run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=s=360x640:d=1", "-vf", vf, "-frames:v", "1",
+         str(tmp_path / "o.png")], cwd=tmp_path)
+    assert (tmp_path / "o.png").exists()

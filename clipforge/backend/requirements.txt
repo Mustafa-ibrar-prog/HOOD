@@ -2,7 +2,9 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
 python-dotenv>=1.0
-yt-dlp>=2025.1.1
+# [default] adds yt-dlp-ejs, the YouTube challenge solver. It also needs the Deno runtime
+# installed separately (Windows: winget install DenoLand.Deno).
+yt-dlp[default]>=2025.11.12
 # Haar face cascades ship only with opencv < 5
 opencv-python-headless>=4.8,<5
 numpy>=1.26

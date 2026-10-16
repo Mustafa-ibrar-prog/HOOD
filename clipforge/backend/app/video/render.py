@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -9,7 +10,7 @@ from typing import Optional
 from ..config import MAX_CLIP_SECONDS, settings
 from ..models import CaptionLine, RenderOptions
 from . import reframe
-from .captions import write_ass
+from .captions import windows_font_dirs, write_ass
 from .ffmpeg import FFmpegError, MediaInfo, extract_frame, probe, run
 
 log = logging.getLogger(__name__)
@@ -148,7 +149,11 @@ def render_clip(src: Path, start: float, end: float, captions: list[CaptionLine]
     v_label = "vbase"
     if options.captions.enabled and captions:
         ass = write_ass(captions, options.captions, out_w, out_h, out_path.with_suffix(".ass"))
-        graph.append(f"[vbase]subtitles=filename='{_escape_filter_path(ass)}'[vsub]")
+        # Relative filename (ffmpeg runs with cwd=work) avoids Windows drive-letter escaping issues.
+        fontsdir = ""
+        if os.name == "nt" and windows_font_dirs():  # let libass load Windows fonts directly
+            fontsdir = f":fontsdir='{_escape_filter_path(windows_font_dirs()[0])}'"
+        graph.append(f"[vbase]subtitles=filename='{_escape_filter_path(Path(ass.name))}'{fontsdir}[vsub]")
         v_label = "vsub"
     graph.append(f"[{v_label}]format=yuv420p[vout]")
     if info.has_audio:
@@ -157,22 +162,21 @@ def render_clip(src: Path, start: float, end: float, captions: list[CaptionLine]
             f"[0:a]aresample=48000,afade=t=in:st=0:d=0.06,afade=t=out:st={fade_out:.3f}:d=0.25,"
             f"loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]"
         )
-    script = work / f"{out_path.stem}.filter.txt"
-    script.write_text(";\n".join(graph), encoding="utf-8")
     fps = min(info.fps or 30.0, 60.0)
     tmp_out = out_path.with_name(out_path.stem + ".tmp.mp4")
     cmd = [
         settings.ffmpeg_bin, "-y", "-v", "error",
-        "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}",
-        "-filter_complex_script", str(script),
+        "-ss", f"{start:.3f}", "-i", str(src.resolve()), "-t", f"{duration:.3f}",
+        # Passed inline: -filter_complex_script is deprecated in FFmpeg 7.1+.
+        "-filter_complex", ";".join(graph),
         "-map", "[vout]",
         *(["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"] if info.has_audio else []),
         "-c:v", "libx264", "-preset", settings.x264_preset, "-crf", str(settings.x264_crf),
         "-profile:v", "high", "-r", f"{fps:.3f}",
-        "-movflags", "+faststart", "-t", f"{duration:.3f}", str(tmp_out),
+        "-movflags", "+faststart", "-t", f"{duration:.3f}", str(tmp_out.resolve()),
     ]
     try:
-        run(cmd)
+        run(cmd, cwd=work)
     except FFmpegError as e:
         tmp_out.unlink(missing_ok=True)
         raise RenderError(f"{e}: {e.stderr[-600:]}") from e

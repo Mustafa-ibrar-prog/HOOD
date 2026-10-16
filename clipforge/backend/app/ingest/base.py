@@ -19,10 +19,11 @@ ProgressFn = Callable[[float, str], None]  # (fraction 0..1, message)
 class IngestError(Exception):
     """User-facing ingestion failure with a stable machine code."""
 
-    def __init__(self, message: str, code: str = "ingest_failed", retryable: bool = False):
+    def __init__(self, message: str, code: str = "ingest_failed", retryable: bool = False, detail: str = ""):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.detail = detail  # raw underlying error text, for diagnostics
 
 
 class VideoProvider(ABC):
