@@ -42,9 +42,9 @@ class FasterWhisperSTT(SpeechToText):
     name = "faster_whisper"
 
     def available(self) -> tuple[bool, str]:
-        try:
-            import faster_whisper  # noqa: F401  (availability check)
-        except ImportError:
+        import importlib.util
+
+        if importlib.util.find_spec("faster_whisper") is None:
             return False, "faster-whisper is not installed (pip install faster-whisper)"
         return True, ""
 

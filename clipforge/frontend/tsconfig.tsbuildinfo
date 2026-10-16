@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/util.ts","./src/vite-env.d.ts","./src/components/CaptionEditor.tsx","./src/components/ClipCard.tsx","./src/components/Home.tsx","./src/components/JobPage.tsx","./src/components/StyleEditor.tsx"],"version":"5.6.3"}
