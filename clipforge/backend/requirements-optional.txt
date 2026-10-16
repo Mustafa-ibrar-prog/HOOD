@@ -1,0 +1,4 @@
+# Local speech-to-text (CPU/GPU). Downloads Whisper weights from Hugging Face on first use.
+faster-whisper>=1.0
+# S3 / S3-compatible storage adapter (STORAGE_BACKEND=s3)
+boto3>=1.34

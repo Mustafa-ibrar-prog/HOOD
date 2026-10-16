@@ -1,0 +1,9 @@
+[project]
+name = "clipforge-backend"
+version = "1.0.0"
+description = "ClipForge: turn long-form videos into ranked, captioned vertical short clips."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: end-to-end tests that render real video"]
